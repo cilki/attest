@@ -102,8 +102,13 @@ fn find_line_in_source(source: &str, function_name: &str, needle: &str) -> Optio
     let mut in_function = false;
     let mut brace_depth: i32 = 0;
     let mut func_start_line: usize = 0;
+    // Byte offset of the current line in `source`, tracked incrementally so we
+    // don't rescan the whole source on every candidate match.
+    let mut line_byte_start: usize = 0;
 
     for (line_idx, line) in source.lines().enumerate() {
+        let byte_start = line_byte_start;
+        line_byte_start += line.len() + 1; // +1 for newline
         let trimmed = line.trim();
 
         if !in_function {
@@ -122,17 +127,10 @@ fn find_line_in_source(source: &str, function_name: &str, needle: &str) -> Optio
             brace_depth -= trimmed.matches('}').count() as i32;
 
             if trimmed.trim_end_matches(';') == needle {
-                // Calculate byte offsets in source
-                let byte_start = source
-                    .lines()
-                    .take(line_idx)
-                    .map(|l| l.len() + 1) // +1 for newline
-                    .sum::<usize>();
-                let line_content = source.lines().nth(line_idx).unwrap();
                 // Find the trimmed content within the line
-                let indent = line_content.len() - line_content.trim_start().len();
+                let indent = line.len() - line.trim_start().len();
                 let span_start = byte_start + indent;
-                let span_end = byte_start + line_content.len();
+                let span_end = byte_start + line.len();
 
                 // Find the function end by continuing to scan
                 let mut func_end_line = line_idx;
