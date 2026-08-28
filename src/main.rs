@@ -293,10 +293,16 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    // Honor RUST_LOG when set; `--debug` forces full debug logging. Otherwise
+    // default to showing warnings — messages like "overlayfs unavailable; tests
+    // run without filesystem isolation" are `warn!`s, and the stock ERROR-only
+    // default would hide the fact that tests are silently touching the real
+    // filesystem.
     let env_filter = if cli.debug {
         tracing_subscriber::EnvFilter::new("attest=debug")
     } else {
-        tracing_subscriber::EnvFilter::from_default_env()
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("attest=warn"))
     };
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
