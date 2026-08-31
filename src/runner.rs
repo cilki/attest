@@ -73,9 +73,7 @@ impl XtraceStreamer {
         let mut buf = Vec::new();
         if f.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
             self.offset += buf.len() as u64;
-            let _ = write!(std::io::stderr(), "\x1b[2m");
-            let _ = std::io::stderr().write_all(&buf);
-            let _ = write!(std::io::stderr(), "\x1b[0m");
+            write_dimmed(&buf);
         }
     }
 
@@ -102,6 +100,16 @@ impl XtraceStreamer {
     }
 }
 
+/// Write `bytes` to stderr wrapped in the dim SGR escape, taking the stderr
+/// lock once so the escape codes and payload can't interleave with output from
+/// the status-bar ticker thread.
+fn write_dimmed(bytes: &[u8]) {
+    let mut err = std::io::stderr().lock();
+    let _ = err.write_all(b"\x1b[2m");
+    let _ = err.write_all(bytes);
+    let _ = err.write_all(b"\x1b[0m");
+}
+
 /// Print a test's full xtrace.log, dimmed, under a `--- xtrace: <name> ---`
 /// header. Silent if the log is missing or empty.
 fn dump_xtrace_log(name: &str, context: &Path) {
@@ -109,9 +117,7 @@ fn dump_xtrace_log(name: &str, context: &Path) {
         && !content.is_empty()
     {
         eprintln!("\x1b[2m--- xtrace: {name} ---\x1b[0m");
-        let _ = write!(std::io::stderr(), "\x1b[2m");
-        let _ = std::io::stderr().write_all(&content);
-        let _ = write!(std::io::stderr(), "\x1b[0m");
+        write_dimmed(&content);
     }
 }
 
