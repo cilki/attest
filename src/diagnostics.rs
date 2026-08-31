@@ -121,6 +121,12 @@ struct SourceMatch {
     func_end_line: usize,
 }
 
+/// Byte offset where line `idx` (0-based) begins in the original source,
+/// assuming single-byte `\n` separators (which is what `str::lines` splits on).
+fn line_start_byte(lines: &[&str], idx: usize) -> usize {
+    lines[..idx].iter().map(|l| l.len() + 1).sum()
+}
+
 /// Count how many earlier lines in `function_name`'s body (within the
 /// reconstructed functions.sh) share the failing command's text. The result is
 /// the 0-based rank of the occurrence at `target_lineno`, used to disambiguate a
@@ -179,12 +185,13 @@ fn find_line_in_source(
     needle: &str,
     occurrence: usize,
 ) -> Option<SourceMatch> {
+    let lines: Vec<&str> = source.lines().collect();
     let mut in_function = false;
     let mut brace_depth: i32 = 0;
     let mut func_start_line: usize = 0;
     let mut matches_seen: usize = 0;
 
-    for (line_idx, line) in source.lines().enumerate() {
+    for (line_idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
 
         if !in_function {
@@ -212,13 +219,7 @@ fn find_line_in_source(
                     continue;
                 }
                 // Calculate byte offsets in source
-                let byte_start = source
-                    .lines()
-                    .take(line_idx)
-                    .map(|l| l.len() + 1) // +1 for newline
-                    .sum::<usize>();
-                // Find the trimmed content within the line (`line` is the
-                // current iteration's slice, identical to `lines().nth(line_idx)`).
+                let byte_start = line_start_byte(&lines, line_idx);
                 let indent = line.len() - line.trim_start().len();
                 let span_start = byte_start + indent;
                 let span_end = byte_start + line.len();
@@ -226,7 +227,7 @@ fn find_line_in_source(
                 // Find the function end by continuing to scan
                 let mut func_end_line = line_idx;
                 let mut depth = brace_depth;
-                for (i, l) in source.lines().enumerate().skip(line_idx + 1) {
+                for (i, l) in lines.iter().enumerate().skip(line_idx + 1) {
                     let t = l.trim();
                     depth += t.matches('{').count() as i32;
                     depth -= t.matches('}').count() as i32;
@@ -284,10 +285,7 @@ fn render_snippet(
         .min(func_end_line + 1);
 
     // Byte offset where the window starts in the original source
-    let window_byte_start: usize = lines[..window_start]
-        .iter()
-        .map(|l| l.len() + 1) // +1 for newline
-        .sum();
+    let window_byte_start = line_start_byte(&lines, window_start);
 
     let window_source: String = lines[window_start..window_end].join("\n");
     let adj_start = byte_start - window_byte_start;
