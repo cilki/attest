@@ -317,20 +317,31 @@ pub fn run_all_tests(
         std::fs::create_dir_all(save_dir)?;
     }
 
+    // Spawn one test from an iterator tuple, deriving its context dir from the
+    // unique display name. Used to seed the initial batch and to refill a slot
+    // as each test completes.
+    let spawn = |(display_name, fn_name, all_functions, source_path): (
+        &str,
+        &str,
+        &[FunctionDefinition],
+        &Path,
+    )| {
+        spawn_test(
+            display_name,
+            fn_name,
+            all_functions,
+            source_path,
+            contexts_dir.join(display_name),
+            config,
+            &env,
+        )
+    };
+
     // Seed the initial batch up to max_parallel.
     while pending_list.len() < max_parallel {
-        if let Some((display_name, fn_name, all_functions, source_path)) = test_iter.next() {
-            pending_list.push(spawn_test(
-                display_name,
-                fn_name,
-                all_functions,
-                source_path,
-                contexts_dir.join(display_name),
-                config,
-                &env,
-            )?);
-        } else {
-            break;
+        match test_iter.next() {
+            Some(test) => pending_list.push(spawn(test)?),
+            None => break,
         }
     }
 
@@ -469,18 +480,8 @@ pub fn run_all_tests(
             }
             results.push(result);
 
-            if !bail_flag
-                && let Some((display_name, fn_name, all_functions, source_path)) = test_iter.next()
-            {
-                pending_list.push(spawn_test(
-                    display_name,
-                    fn_name,
-                    all_functions,
-                    source_path,
-                    contexts_dir.join(display_name),
-                    config,
-                    &env,
-                )?);
+            if !bail_flag && let Some(test) = test_iter.next() {
+                pending_list.push(spawn(test)?);
             }
         }
 
