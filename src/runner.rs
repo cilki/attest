@@ -623,8 +623,13 @@ fn spawn_test(
         crate::cgroup::TestCgroup::try_create(display_name)
     };
 
-    let runner_content =
-        build_runner_script(fn_name, &script_path, &context, &config.bin_dirs, &config.strace);
+    let runner_content = build_runner_script(
+        fn_name,
+        &script_path,
+        &context,
+        &config.bin_dirs,
+        &config.strace,
+    );
     // <shell> -c <script> <source_path>: passing source_path as argv[0]
     // makes $0 inside the test functions refer to the original script.
     let source_str = source_path_owned.to_str().unwrap_or("bash").to_string();

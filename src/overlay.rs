@@ -74,7 +74,11 @@ fn cstr(path: &Path) -> anyhow::Result<CString> {
 /// Build the overlay mount option string, adding `userxattr` for unprivileged
 /// mounts (a user namespace cannot set `trusted.*` xattrs).
 fn overlay_opts(lower: &Path, upper: &Path, work: &Path, mode: Mode) -> anyhow::Result<CString> {
-    let userxattr = if mode == Mode::Userns { ",userxattr" } else { "" };
+    let userxattr = if mode == Mode::Userns {
+        ",userxattr"
+    } else {
+        ""
+    };
     let opts = format!(
         "lowerdir={},upperdir={},workdir={}{userxattr}",
         lower.display(),
@@ -106,8 +110,7 @@ unsafe fn enter_namespace(mode: Mode, uid_map: &CStr, gid_map: &CStr) -> bool {
         match mode {
             Mode::Privileged => libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWUTS) == 0,
             Mode::Userns => {
-                if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWUTS)
-                    != 0
+                if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWUTS) != 0
                 {
                     return false;
                 }
@@ -564,7 +567,10 @@ mod tests {
     #[test]
     fn unescape_preserves_non_ascii_bytes() {
         // Raw multibyte UTF-8 passes through untouched...
-        assert_eq!(unescape_octal("/na\u{ef}ve".as_bytes()), "/na\u{ef}ve".as_bytes());
+        assert_eq!(
+            unescape_octal("/na\u{ef}ve".as_bytes()),
+            "/na\u{ef}ve".as_bytes()
+        );
         // ...and escaped high bytes decode to the byte, not a mangled char.
         assert_eq!(unescape_octal(b"/x\\303\\257y"), b"/x\xc3\xafy");
     }
@@ -622,7 +628,13 @@ mod tests {
         let paths: Vec<&Path> = plan.iter().map(|s| s.source.as_path()).collect();
         assert!(!paths.contains(&Path::new("/proc/sys/fs/binfmt_misc")));
         assert!(paths.contains(&Path::new("/workspace/nested")));
-        assert!(!plan.iter().find(|s| s.source == Path::new("/workspace/nested")).unwrap().ephemeral);
+        assert!(
+            !plan
+                .iter()
+                .find(|s| s.source == Path::new("/workspace/nested"))
+                .unwrap()
+                .ephemeral
+        );
     }
 
     #[test]
@@ -635,7 +647,10 @@ mod tests {
             p != Path::new("/etc/resolv.conf")
         });
         // /a appears once, before /a/b would (which is pruned as a live child).
-        assert_eq!(plan.iter().filter(|s| s.source == Path::new("/a")).count(), 1);
+        assert_eq!(
+            plan.iter().filter(|s| s.source == Path::new("/a")).count(),
+            1
+        );
         for pair in plan.windows(2) {
             assert!(
                 pair[0].source.components().count() <= pair[1].source.components().count(),

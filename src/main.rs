@@ -157,7 +157,10 @@ fn display_base(
     taken: &mut std::collections::HashSet<String>,
 ) -> String {
     let base = if duplicated {
-        let file_name = file.file_name().map(|f| f.to_string_lossy()).unwrap_or_default();
+        let file_name = file
+            .file_name()
+            .map(|f| f.to_string_lossy())
+            .unwrap_or_default();
         format!("{file_name}:{name}")
     } else {
         name.to_string()
