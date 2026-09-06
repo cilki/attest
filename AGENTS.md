@@ -100,7 +100,3 @@ implicit assertion - if it exits nonzero, the test fails. Non-test functions
 ## Building and running
 
 Use `cargo run --` to execute the project.
-
-## TODOs
-
-- make sure xtrace line numbers match source code

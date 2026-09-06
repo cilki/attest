@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use brush_parser::ast::FunctionDefinition;
+use brush_parser::ast::{FunctionDefinition, SourceLocation};
 use std::io::Write;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
@@ -545,6 +545,57 @@ fn resolve_shell(shell: &str) -> String {
     }
 }
 
+/// Build the script that the runner sources to define a test's functions.
+///
+/// Each function is emitted verbatim at the same line number it occupies in the
+/// original source, with the gaps between them blanked out. Because bash's
+/// `$LINENO` (used by our xtrace `PS4`) reports the line within the sourced
+/// file, keeping functions at their original offsets makes xtrace line numbers
+/// match the source exactly — so a failing command's trace points straight at
+/// its source line, with no reconstruction or line-mapping heuristics needed on
+/// the diagnostics side.
+///
+/// Only function definitions are emitted (top-level code is dropped), matching
+/// the previous `to_string`-based behavior, so sourcing the script never runs a
+/// test's top-level statements.
+fn build_functions_source(functions: &[FunctionDefinition], source: &str) -> String {
+    let src_lines: Vec<&str> = source.lines().collect();
+    let mut out = String::new();
+    // 1-based line number of the next line to be written to `out`.
+    let mut line = 1usize;
+
+    for func in functions {
+        let Some(span) = func.location() else {
+            // No source location: fall back to the reformatted rendering. This
+            // breaks line alignment for this one function but keeps it runnable.
+            for l in func.to_string().lines() {
+                out.push_str(l);
+                out.push('\n');
+                line += 1;
+            }
+            continue;
+        };
+
+        // Functions are yielded in source order, so this only pads forward.
+        while line < span.start.line {
+            out.push('\n');
+            line += 1;
+        }
+
+        // `end.line` is the line of the closing brace (inclusive here).
+        let last = span.end.line.min(src_lines.len());
+        for idx in span.start.line..=last {
+            if let Some(text) = src_lines.get(idx - 1) {
+                out.push_str(text);
+            }
+            out.push('\n');
+            line += 1;
+        }
+    }
+
+    out
+}
+
 /// Spawn a child process that will run the test. Returns a `PendingTest` that
 /// the caller must reap (or simply drop to kill+clean up). `context` must be
 /// unique per test (the caller derives it from the unique display name).
@@ -577,11 +628,20 @@ fn spawn_test(
     };
 
     let script_path = context.join("functions.sh");
-    let mut script = String::new();
-    for func in all_functions {
-        script.push_str(&func.to_string());
-        script.push('\n');
-    }
+    // Read the original source so functions can be emitted verbatim at their
+    // original line numbers (see build_functions_source). Fall back to the
+    // reformatted AST rendering if the file can't be read.
+    let script = match std::fs::read_to_string(source_path) {
+        Ok(source) => build_functions_source(all_functions, &source),
+        Err(_) => {
+            let mut s = String::new();
+            for func in all_functions {
+                s.push_str(&func.to_string());
+                s.push('\n');
+            }
+            s
+        }
+    };
     std::fs::write(&script_path, &script)?;
 
     if !config.override_cmds.is_empty() {
@@ -1324,5 +1384,48 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(!results[0].passed);
         assert!(results[0].timed_out);
+    }
+
+    #[test]
+    fn functions_source_preserves_line_numbers() {
+        // A helper, a blank line, then a test: every function line must land on
+        // the same line number it has in the source, with the gaps blanked.
+        let source = "helper() {\n  echo setup\n}\n\ntest_foo() {\n  echo a\n  false\n}\n";
+        let tf = {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("t.sh");
+            fs::write(&path, source).unwrap();
+            crate::parser::parse_test_file(&path).unwrap()
+        };
+
+        let generated = build_functions_source(&tf.functions, source);
+        let gen_lines: Vec<&str> = generated.lines().collect();
+        let src_lines: Vec<&str> = source.lines().collect();
+
+        // Function lines match the source exactly; the separator line is blanked.
+        for idx in [0, 1, 2, 4, 5, 6, 7] {
+            assert_eq!(gen_lines[idx], src_lines[idx], "line {idx} differs");
+        }
+        assert_eq!(gen_lines[3], "", "top-level/gap line 3 should be blank");
+    }
+
+    #[test]
+    fn xtrace_line_number_matches_source() {
+        // The failing command sits on source line 7 (1-based). With
+        // line-preserving functions.sh, the xtrace PS4 must report `+7:`.
+        let source = "helper() {\n  echo setup\n}\n\ntest_foo() {\n  echo a\n  false\n}\n";
+        let r = run_inline(source, "test_foo");
+        assert!(!r.passed);
+
+        let xtrace = fs::read_to_string(r.context.join("xtrace.log")).unwrap();
+        // Last non-subshell trace line is the failing command.
+        let last = xtrace
+            .lines()
+            .rfind(|l| l.starts_with('+') && !l.starts_with("++"))
+            .expect("a trace line");
+        assert!(
+            last.starts_with("+7: "),
+            "expected failing command on source line 7, got {last:?}"
+        );
     }
 }

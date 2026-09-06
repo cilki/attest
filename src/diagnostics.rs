@@ -5,7 +5,8 @@ use crate::runner::TestResult;
 
 /// Information extracted from an xtrace log about the failing command.
 struct FailureInfo {
-    /// 1-based line number in functions.sh where the failure occurred.
+    /// 1-based line number where the failure occurred. `functions.sh` preserves
+    /// the source's line numbers, so this is also the line in the source file.
     lineno: usize,
     /// The command text as shown in xtrace (e.g. `'[' ABC = DEF ']'`).
     command: String,
@@ -24,33 +25,17 @@ pub fn print_failure_snippet(result: &TestResult) {
         return;
     };
 
-    let functions_sh = result.context.join("functions.sh");
-    let Ok(functions_source) = std::fs::read_to_string(&functions_sh) else {
+    // The runner emits `functions.sh` so that each function keeps its original
+    // source line numbers, so the xtrace line number (bash's `$LINENO`) indexes
+    // the original source directly — no text matching required.
+    let Ok(source) = std::fs::read_to_string(&result.source_path) else {
         return;
     };
-
-    // Get the failing line text from functions.sh
-    let functions_lines: Vec<&str> = functions_source.lines().collect();
-    let Some(failing_line) = functions_lines.get(failure.lineno.wrapping_sub(1)) else {
+    let lines: Vec<&str> = source.lines().collect();
+    let Some(line_idx) = failure.lineno.checked_sub(1) else {
         return;
     };
-    // brush-parser's to_string() reformats code (e.g., adds semicolons).
-    // Normalize by stripping trailing `;` for matching against original source.
-    let failing_line_trimmed = failing_line.trim().trim_end_matches(';');
-
-    // A command can appear more than once in a test (e.g. an assertion repeated
-    // after mutating state). The line text alone is ambiguous, so count how many
-    // earlier lines in the reconstructed function share it: that rank picks out
-    // the matching occurrence in the original source instead of always the first.
-    let occurrence = occurrence_in_reconstructed(
-        &functions_source,
-        &result.name,
-        failing_line_trimmed,
-        failure.lineno,
-    );
-
-    // Read original source and find the matching line
-    let Ok(original_source) = std::fs::read_to_string(&result.source_path) else {
+    let Some(failing_line) = lines.get(line_idx) else {
         return;
     };
 
@@ -62,22 +47,26 @@ pub fn print_failure_snippet(result: &TestResult) {
         "command failed"
     };
 
-    if let Some(match_info) = find_line_in_source(
-        &original_source,
-        &result.name,
-        failing_line_trimmed,
-        occurrence,
-    ) {
-        render_snippet(
-            title,
-            &result.source_path,
-            &original_source,
-            match_info.byte_start,
-            match_info.byte_end,
-            match_info.func_start_line,
-            match_info.func_end_line,
-        );
-    }
+    // Annotate the failing command, skipping the line's leading indentation.
+    let byte_start = line_start_byte(&lines, line_idx);
+    let indent = failing_line.len() - failing_line.trim_start().len();
+    let span_start = byte_start + indent;
+    let span_end = byte_start + failing_line.len();
+
+    // Clamp the rendered context to the enclosing function so a snippet never
+    // leaks into an adjacent test.
+    let (func_start_line, func_end_line) =
+        enclosing_function_bounds(&lines, line_idx).unwrap_or((line_idx, line_idx));
+
+    render_snippet(
+        title,
+        &result.source_path,
+        &source,
+        span_start,
+        span_end,
+        func_start_line,
+        func_end_line,
+    );
 
     // If the failing command is a `[` expression, show operand details
     if let Some(expr) = parse_bracket_expr(&failure.command) {
@@ -112,145 +101,65 @@ fn parse_xtrace_failure(tmp_dir: &Path) -> Option<FailureInfo> {
     last_match
 }
 
-struct SourceMatch {
-    byte_start: usize,
-    byte_end: usize,
-    /// 0-based line where the function definition starts.
-    func_start_line: usize,
-    /// 0-based line where the function ends (closing brace).
-    func_end_line: usize,
-}
-
 /// Byte offset where line `idx` (0-based) begins in the original source,
 /// assuming single-byte `\n` separators (which is what `str::lines` splits on).
 fn line_start_byte(lines: &[&str], idx: usize) -> usize {
     lines[..idx].iter().map(|l| l.len() + 1).sum()
 }
 
-/// Count how many earlier lines in `function_name`'s body (within the
-/// reconstructed functions.sh) share the failing command's text. The result is
-/// the 0-based rank of the occurrence at `target_lineno`, used to disambiguate a
-/// command that appears more than once when mapping back to the original source.
-fn occurrence_in_reconstructed(
-    functions_src: &str,
-    function_name: &str,
-    needle: &str,
-    target_lineno: usize,
-) -> usize {
-    let mut in_function = false;
-    let mut brace_depth: i32 = 0;
-    let mut rank = 0usize;
-
-    for (line_idx, line) in functions_src.lines().enumerate() {
-        let trimmed = line.trim();
-
-        if !in_function {
-            if trimmed.starts_with(function_name)
-                && trimmed[function_name.len()..].trim_start().starts_with('(')
-            {
-                in_function = true;
-                brace_depth += trimmed.matches('{').count() as i32;
-                brace_depth -= trimmed.matches('}').count() as i32;
-            }
+/// 0-based line range `(start, end)` of the function definition enclosing
+/// `target_line` (0-based), or `None` if the line is not inside a function.
+/// Used to clamp the rendered context window. Brace counting is naive (it does
+/// not account for braces in strings or `${...}`), matching how the rest of the
+/// tool scans shell source.
+fn enclosing_function_bounds(lines: &[&str], target_line: usize) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while i < lines.len() {
+        if !is_function_header(lines[i].trim()) {
+            i += 1;
             continue;
         }
 
-        brace_depth += trimmed.matches('{').count() as i32;
-        brace_depth -= trimmed.matches('}').count() as i32;
-
-        // Stop once we reach the failing line (1-based); count only lines before it.
-        if line_idx + 1 >= target_lineno {
-            break;
-        }
-        if trimmed.trim_end_matches(';') == needle {
-            rank += 1;
-        }
-        // Left the function before reaching the target: a same-named block is not
-        // possible (function names are unique), so restart the count defensively.
-        if brace_depth <= 0 {
-            in_function = false;
-            rank = 0;
-        }
-    }
-
-    rank
-}
-
-/// Find the line matching `needle` inside the named function in the original
-/// source. `occurrence` selects which match to return when the text repeats
-/// (0 = first), so a failure on a later duplicate highlights the right line.
-fn find_line_in_source(
-    source: &str,
-    function_name: &str,
-    needle: &str,
-    occurrence: usize,
-) -> Option<SourceMatch> {
-    let lines: Vec<&str> = source.lines().collect();
-    let mut in_function = false;
-    let mut brace_depth: i32 = 0;
-    let mut func_start_line: usize = 0;
-    let mut matches_seen: usize = 0;
-
-    for (line_idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-
-        if !in_function {
-            // Look for `function_name()` or `function_name ()`
-            if trimmed.starts_with(function_name)
-                && trimmed[function_name.len()..].trim_start().starts_with('(')
-            {
-                in_function = true;
-                func_start_line = line_idx;
-                brace_depth += trimmed.matches('{').count() as i32;
-                brace_depth -= trimmed.matches('}').count() as i32;
-                continue;
+        let start = i;
+        let mut depth: i32 = 0;
+        let mut opened = false;
+        let mut j = i;
+        loop {
+            let trimmed = lines[j].trim();
+            depth += trimmed.matches('{').count() as i32;
+            depth -= trimmed.matches('}').count() as i32;
+            if depth > 0 {
+                opened = true;
             }
-        } else {
-            brace_depth += trimmed.matches('{').count() as i32;
-            brace_depth -= trimmed.matches('}').count() as i32;
-
-            if trimmed.trim_end_matches(';') == needle {
-                // Skip earlier duplicates until we reach the failing occurrence.
-                if matches_seen < occurrence {
-                    matches_seen += 1;
-                    if brace_depth <= 0 {
-                        in_function = false;
-                    }
-                    continue;
-                }
-                // Calculate byte offsets in source
-                let byte_start = line_start_byte(&lines, line_idx);
-                let indent = line.len() - line.trim_start().len();
-                let span_start = byte_start + indent;
-                let span_end = byte_start + line.len();
-
-                // Find the function end by continuing to scan
-                let mut func_end_line = line_idx;
-                let mut depth = brace_depth;
-                for (i, l) in lines.iter().enumerate().skip(line_idx + 1) {
-                    let t = l.trim();
-                    depth += t.matches('{').count() as i32;
-                    depth -= t.matches('}').count() as i32;
-                    func_end_line = i;
-                    if depth <= 0 {
-                        break;
-                    }
-                }
-
-                return Some(SourceMatch {
-                    byte_start: span_start,
-                    byte_end: span_end,
-                    func_start_line,
-                    func_end_line,
-                });
+            if opened && depth <= 0 {
+                break;
             }
-
-            if brace_depth <= 0 {
-                in_function = false;
+            if j + 1 >= lines.len() {
+                break;
             }
+            j += 1;
         }
+
+        if (start..=j).contains(&target_line) {
+            return Some((start, j));
+        }
+        i = j + 1;
     }
     None
+}
+
+/// Whether a trimmed source line opens a shell function definition
+/// (`name()`, `name ()`, or `function name`).
+fn is_function_header(trimmed: &str) -> bool {
+    if let Some(rest) = trimmed.strip_prefix("function ") {
+        return rest
+            .trim_start()
+            .starts_with(|c: char| c.is_alphanumeric() || c == '_');
+    }
+    let name_len = trimmed
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(0);
+    name_len > 0 && trimmed[name_len..].trim_start().starts_with('(')
 }
 
 /// Render an annotate-snippets diagnostic for the failing line with surrounding context,
@@ -450,58 +359,34 @@ mod tests {
     }
 
     #[test]
-    fn find_line_in_function() {
-        let source =
-            "helper() {\n  echo setup\n}\n\ntest_foo() {\n  echo hello\n  [ ABC = DEF ]\n}\n";
-        let m = find_line_in_source(source, "test_foo", "[ ABC = DEF ]", 0).unwrap();
-        assert_eq!(&source[m.byte_start..m.byte_end], "[ ABC = DEF ]");
-        assert_eq!(m.func_start_line, 4); // 0-based: "test_foo() {"
-        assert_eq!(m.func_end_line, 7); // 0-based: "}"
+    fn is_function_header_recognizes_forms() {
+        assert!(is_function_header("test_foo() {"));
+        assert!(is_function_header("test_foo () {"));
+        assert!(is_function_header("function test_foo {"));
+        assert!(is_function_header("function test_foo() {"));
+        assert!(!is_function_header("echo hello"));
+        assert!(!is_function_header("[ 1 = 2 ]"));
+        assert!(!is_function_header("(subshell)"));
     }
 
     #[test]
-    fn find_line_not_in_wrong_function() {
-        let source = "test_a() {\n  echo hello\n}\n\ntest_b() {\n  echo world\n}\n";
-        assert!(find_line_in_source(source, "test_b", "echo hello", 0).is_none());
+    fn enclosing_bounds_finds_containing_function() {
+        // 0-based lines:            0            1              2   3  4              5            6   7
+        let lines: Vec<&str> =
+            "helper() {\n  echo setup\n}\n\ntest_foo() {\n  echo hello\n  false\n}\n"
+                .lines()
+                .collect();
+        // Line 6 (`false`) is inside test_foo (lines 4..=7).
+        assert_eq!(enclosing_function_bounds(&lines, 6), Some((4, 7)));
+        // Line 1 (`echo setup`) is inside helper (lines 0..=2).
+        assert_eq!(enclosing_function_bounds(&lines, 1), Some((0, 2)));
+        // Line 3 (the blank separator) is inside no function.
+        assert_eq!(enclosing_function_bounds(&lines, 3), None);
     }
 
     #[test]
-    fn find_line_selects_requested_occurrence() {
-        // The same command on two lines; occurrence picks which one to highlight.
-        let source = "test_dup() {\n  test -f m\n  rm m\n  test -f m\n}\n";
-        let first = find_line_in_source(source, "test_dup", "test -f m", 0).unwrap();
-        // Second occurrence must map to a later byte offset than the first.
-        let second = find_line_in_source(source, "test_dup", "test -f m", 1).unwrap();
-        assert!(second.byte_start > first.byte_start);
-        assert_eq!(&source[second.byte_start..second.byte_end], "test -f m");
-        // Only two occurrences exist, so a third request finds nothing.
-        assert!(find_line_in_source(source, "test_dup", "test -f m", 2).is_none());
-    }
-
-    #[test]
-    fn occurrence_rank_counts_earlier_duplicates() {
-        // Reconstructed functions.sh as brush renders it: `name ()`, brace on its
-        // own line, one `;`-terminated command per body line.
-        let functions_src = "test_dup () \n{ \n    test -f m;\n    rm m;\n    test -f m\n}\n";
-        // Line 3 is the first `test -f m` (rank 0), line 5 is the second (rank 1).
-        assert_eq!(
-            occurrence_in_reconstructed(functions_src, "test_dup", "test -f m", 3),
-            0
-        );
-        assert_eq!(
-            occurrence_in_reconstructed(functions_src, "test_dup", "test -f m", 5),
-            1
-        );
-    }
-
-    #[test]
-    fn occurrence_rank_ignores_other_functions() {
-        // An identical command in an earlier function must not inflate the rank.
-        let functions_src =
-            "helper () \n{ \n    test -f m\n}\ntest_dup () \n{ \n    test -f m\n}\n";
-        assert_eq!(
-            occurrence_in_reconstructed(functions_src, "test_dup", "test -f m", 7),
-            0
-        );
+    fn enclosing_bounds_handles_brace_on_next_line() {
+        let lines: Vec<&str> = "test_foo ()\n{\n  false\n}\n".lines().collect();
+        assert_eq!(enclosing_function_bounds(&lines, 2), Some((0, 3)));
     }
 }
