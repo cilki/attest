@@ -1,9 +1,11 @@
+use std::collections::HashSet;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use brush_parser::ast::{Command, CompoundCommand, CompoundList, FunctionDefinition, Program};
 use brush_parser::{Parser, ParserOptions};
+use tracing::warn;
 
 /// File containing tests.
 pub struct TestFile {
@@ -117,14 +119,32 @@ pub fn parse_test_file(path: &Path) -> anyhow::Result<TestFile> {
         .map_err(|e| anyhow::anyhow!("parse error in {}: {e}", path.display()))?;
 
     let functions = extract_functions(&program);
-    let tests = functions
-        .iter()
-        .filter(|f| f.fname.value.starts_with("test"))
-        .map(|f| TestCase {
+
+    // A shell function defined more than once in the same file is shadowed:
+    // when the runner sources the file and calls the name, only the last
+    // definition runs. Emit a single test per name (matching what the shell
+    // actually executes) rather than one phantom test per definition — every
+    // one of which would run the same, last body. `functions` still carries
+    // all definitions so the sourced script is unchanged.
+    let mut tests = Vec::new();
+    let mut seen = HashSet::new();
+    for f in &functions {
+        if !f.fname.value.starts_with("test") {
+            continue;
+        }
+        if !seen.insert(f.fname.value.as_str()) {
+            warn!(
+                "test function `{}` is defined more than once in {}; only the last definition runs",
+                f.fname.value,
+                path.display()
+            );
+            continue;
+        }
+        tests.push(TestCase {
             file: path.to_path_buf(),
             name: f.fname.value.clone(),
-        })
-        .collect();
+        });
+    }
 
     Ok(TestFile { tests, functions })
 }
@@ -380,6 +400,25 @@ mod tests {
         let names: Vec<&str> = result.tests.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"test_inside_if"));
         assert!(names.contains(&"test_inside_for"));
+    }
+
+    #[test]
+    fn duplicate_test_name_yields_single_test() {
+        let tmp = TempDir::new().unwrap();
+        // The same test name defined twice: the shell shadows the first, so
+        // only the last definition can ever run. Exactly one test is emitted,
+        // but both definitions remain in `functions` so the sourced script is
+        // unchanged.
+        let path = write_script(
+            tmp.path(),
+            "dup.test",
+            "test_dup() {\n  echo first\n}\n\ntest_dup() {\n  echo second\n}\n",
+        );
+
+        let result = parse_test_file(&path).unwrap();
+        assert_eq!(result.tests.len(), 1);
+        assert_eq!(result.tests[0].name, "test_dup");
+        assert_eq!(result.functions.len(), 2);
     }
 
     #[test]
