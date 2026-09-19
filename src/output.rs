@@ -25,7 +25,7 @@ pub struct StatusDisplay {
 
 impl StatusDisplay {
     pub fn new(total: usize, json: bool) -> Self {
-        if !json && !indicatif::ProgressDrawTarget::stderr().is_hidden() {
+        let bar = (!json && !indicatif::ProgressDrawTarget::stderr().is_hidden()).then(|| {
             let bar = ProgressBar::new(total as u64);
             bar.set_style(
                 ProgressStyle::default_bar()
@@ -33,17 +33,12 @@ impl StatusDisplay {
                     .unwrap(),
             );
             bar.enable_steady_tick(Duration::from_millis(250));
-            Self {
-                bar: Some(bar),
-                total,
-                results: Vec::new(),
-            }
-        } else {
-            Self {
-                bar: None,
-                total,
-                results: Vec::new(),
-            }
+            bar
+        });
+        Self {
+            bar,
+            total,
+            results: Vec::new(),
         }
     }
 

@@ -91,15 +91,6 @@ impl XtraceStreamer {
     fn is_holder(&self, name: &str) -> bool {
         self.holder.as_deref() == Some(name)
     }
-
-    /// Dump the full xtrace log for a test that was never streamed (e.g. it
-    /// finished before the parent could open the file).
-    fn dump_missed(&self, pending: &PendingTest) {
-        if self.is_holder(&pending.name) {
-            return; // Will be flushed via release()
-        }
-        dump_xtrace_log(&pending.name, pending.context.as_ref().unwrap());
-    }
 }
 
 /// Print a test's full xtrace.log, dimmed, under a `--- xtrace: <name> ---`
@@ -430,7 +421,12 @@ pub fn run_all_tests(
                     if xt.is_holder(&pending_list[i].name) {
                         xt.release();
                     } else {
-                        xt.dump_missed(&pending_list[i]);
+                        // Never streamed (finished before we could open the
+                        // file): dump the full log now.
+                        dump_xtrace_log(
+                            &pending_list[i].name,
+                            pending_list[i].context.as_ref().unwrap(),
+                        );
                     }
                 });
             }
@@ -525,8 +521,6 @@ pub fn run_all_tests(
     Ok(results)
 }
 
-/// Resolve a shell name or path to an executable, falling back to `/bin/sh`
-/// when the requested shell is not found.
 /// Whether `shell` names something we can exec: an existing path when it
 /// contains a `/`, or a command resolvable on `PATH` otherwise.
 pub(crate) fn shell_exists(shell: &str) -> bool {
@@ -537,6 +531,8 @@ pub(crate) fn shell_exists(shell: &str) -> bool {
     }
 }
 
+/// Resolve a shell name or path to an executable, falling back to `/bin/sh`
+/// when the requested shell is not found.
 fn resolve_shell(shell: &str) -> String {
     if shell_exists(shell) {
         shell.to_string()
