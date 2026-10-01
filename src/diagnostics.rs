@@ -212,50 +212,168 @@ fn render_snippet(
     println!("{}", renderer.render(report));
 }
 
-/// Parse a `[` or `[[` test command from xtrace output.
-///
-/// Xtrace renders `[ "A" = "B" ]` as `'[' A = B ']'` and
-/// `[[ "A" = "B" ]]` as `[[ A == B ]]` (bash spells `=` as `==` inside `[[`).
-fn parse_bracket_expr(command: &str) -> Option<BracketExpr> {
-    let inner = command
-        .strip_prefix("'[' ")
-        .and_then(|s| s.strip_suffix(" ']'"))
-        .or_else(|| {
-            command
-                .strip_prefix("[[ ")
-                .and_then(|s| s.strip_suffix(" ]]"))
-        })?;
-    let parts: Vec<&str> = inner.splitn(3, ' ').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-
-    let op = parts[1];
-    // Only handle comparison operators (`==` is how `[[` spells `=`).
-    if !matches!(
+/// Comparison operators we know how to render a diff for. `==` is how `[[`
+/// usually spells `=`, though bash echoes back whichever one was written.
+fn is_comparison_op(op: &str) -> bool {
+    matches!(
         op,
         "=" | "==" | "!=" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge"
-    ) {
-        return None;
+    )
+}
+
+/// Parse a `[` or `[[` test command from xtrace output.
+///
+/// Xtrace renders `[ "A" = "B" ]` as `'[' A = B ']'` and `[[ "A" = "B" ]]` as
+/// `[[ A = B ]]`. The two forms need different handling: `[` is an ordinary
+/// command, so each operand is a separately quoted word, whereas `[[` is shell
+/// syntax and its operands are echoed back verbatim with no quoting at all.
+fn parse_bracket_expr(command: &str) -> Option<BracketExpr> {
+    if let Some(inner) = command
+        .strip_prefix("'[' ")
+        .and_then(|s| s.strip_suffix(" ']'"))
+    {
+        let words = split_quoted_words(inner)?;
+        let [left, op, right] = <[String; 3]>::try_from(words).ok()?;
+        if !is_comparison_op(&op) {
+            return None;
+        }
+        return Some(BracketExpr { left, op, right });
     }
 
+    // Unquoted `[[` operands: the operator token is the only thing that marks
+    // the boundary, so an operand that itself looks like an operator makes the
+    // split ambiguous and we decline rather than guess.
+    let inner = command
+        .strip_prefix("[[ ")
+        .and_then(|s| s.strip_suffix(" ]]"))?;
+    let words: Vec<&str> = inner.split(' ').collect();
+    // Each side needs at least one word, so the operator can't be first or last.
+    let interior = 1..words.len().saturating_sub(1);
+    let mut op_idx = None;
+    for (i, word) in words.iter().enumerate() {
+        if !interior.contains(&i) || !is_comparison_op(word) {
+            continue;
+        }
+        if op_idx.is_some() {
+            return None;
+        }
+        op_idx = Some(i);
+    }
+    let i = op_idx?;
     Some(BracketExpr {
-        left: parts[0].to_string(),
-        op: op.to_string(),
-        right: parts[2].to_string(),
+        left: words[..i].join(" "),
+        op: words[i].to_string(),
+        right: words[i + 1..].join(" "),
     })
+}
+
+/// Split an xtrace-rendered argument list back into its original words.
+///
+/// Bash quotes any argument that needs it, so an operand holding a space is
+/// printed as one `'...'` word (with an embedded `'` spelled `'\''`) and one
+/// holding control characters as `$'...'`. Splitting on spaces alone would tear
+/// those apart, so unquote as we go. Returns `None` if the quoting doesn't
+/// parse, in which case the caller renders no diff instead of a wrong one.
+fn split_quoted_words(inner: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' => words.push(std::mem::take(&mut word)),
+            // Literal run: everything up to the closing quote, escapes and all.
+            '\'' => loop {
+                match chars.next()? {
+                    '\'' => break,
+                    ch => word.push(ch),
+                }
+            },
+            // `$'...'`: same, but backslash escapes are interpreted.
+            '$' if chars.peek() == Some(&'\'') => {
+                chars.next();
+                loop {
+                    match chars.next()? {
+                        '\'' => break,
+                        '\\' => word.push(unescape_ansi_c(&mut chars)?),
+                        ch => word.push(ch),
+                    }
+                }
+            }
+            // Outside quotes a backslash escapes the next character.
+            '\\' => word.push(chars.next()?),
+            _ => word.push(c),
+        }
+    }
+    words.push(word);
+    Some(words)
+}
+
+/// Resolve one backslash escape inside a `$'...'` word, with `chars` positioned
+/// just past the backslash. Unrecognized escapes stand for themselves, matching
+/// how the shell reads them back.
+fn unescape_ansi_c(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<char> {
+    let c = chars.next()?;
+    Some(match c {
+        'n' => '\n',
+        't' => '\t',
+        'r' => '\r',
+        'a' => '\x07',
+        'b' => '\x08',
+        'f' => '\x0c',
+        'v' => '\x0b',
+        'e' | 'E' => '\x1b',
+        '0' => '\0',
+        'x' => {
+            // Up to two hex digits.
+            let mut v = 0u32;
+            let mut digits = 0;
+            while digits < 2
+                && let Some(d) = chars.peek().and_then(|c| c.to_digit(16))
+            {
+                v = v * 16 + d;
+                digits += 1;
+                chars.next();
+            }
+            if digits == 0 {
+                return Some('x');
+            }
+            char::from_u32(v)?
+        }
+        other => other,
+    })
+}
+
+/// Make an operand safe to print on a single line, so a value containing
+/// newlines or tabs doesn't scramble the `left`/`right`/`diff` alignment.
+fn escape_for_display(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Render a comparison between bracket expression operands.
 fn render_bracket_diff(expr: &BracketExpr) {
+    let left = escape_for_display(&expr.left);
+    let right = escape_for_display(&expr.right);
+
     println!();
-    println!("  left: \"{}\"", expr.left);
-    println!(" right: \"{}\"", expr.right);
+    println!("  left: \"{left}\"");
+    println!(" right: \"{right}\"");
 
     // For equality operators, show inline diff if values differ
-    if matches!(expr.op.as_str(), "=" | "==" | "!=") && expr.left != expr.right {
+    if matches!(expr.op.as_str(), "=" | "==" | "!=") && left != right {
         use similar::{ChangeTag, TextDiff};
-        let diff = TextDiff::from_chars(&expr.left, &expr.right);
+        let diff = TextDiff::from_chars(&left, &right);
         let mut left_hl = String::new();
         let mut right_hl = String::new();
         for change in diff.iter_all_changes() {
@@ -330,6 +448,81 @@ mod tests {
     #[test]
     fn parse_bracket_not_a_bracket() {
         assert!(parse_bracket_expr("echo hello").is_none());
+    }
+
+    #[test]
+    fn parse_bracket_operands_with_spaces() {
+        // `[ "$a" = "$b" ]` over multi-word values: xtrace quotes each operand,
+        // so the words inside them must not be mistaken for separate arguments.
+        let expr = parse_bracket_expr("'[' 'apple banana cherry' = 'apple banana durian' ']'")
+            .expect("quoted operands should parse");
+        assert_eq!(expr.left, "apple banana cherry");
+        assert_eq!(expr.op, "=");
+        assert_eq!(expr.right, "apple banana durian");
+    }
+
+    #[test]
+    fn parse_bracket_operand_with_embedded_quote() {
+        // A `'` inside a quoted word is spelled `'\''` by xtrace.
+        let expr = parse_bracket_expr(r"'[' 'it'\''s here' = \' ']'").unwrap();
+        assert_eq!(expr.left, "it's here");
+        assert_eq!(expr.right, "'");
+    }
+
+    #[test]
+    fn parse_bracket_empty_operand_is_unquoted() {
+        // `[ foo = "" ]` renders the empty operand as `''`; the quotes belong to
+        // xtrace, not to the value.
+        let expr = parse_bracket_expr("'[' foo = '' ']'").unwrap();
+        assert_eq!(expr.left, "foo");
+        assert_eq!(expr.right, "");
+    }
+
+    #[test]
+    fn parse_bracket_operand_with_control_chars() {
+        // Comparing captured multi-line output renders as `$'...'`.
+        let expr = parse_bracket_expr(r"'[' $'line3\nline2' = $'a\tb\x21' ']'").unwrap();
+        assert_eq!(expr.left, "line3\nline2");
+        assert_eq!(expr.right, "a\tb!");
+    }
+
+    #[test]
+    fn parse_bracket_operand_containing_operator_text() {
+        // `=` as part of a value must not be taken for the comparison operator.
+        let expr = parse_bracket_expr("'[' a=b = 'c = d' ']'").unwrap();
+        assert_eq!(expr.left, "a=b");
+        assert_eq!(expr.op, "=");
+        assert_eq!(expr.right, "c = d");
+    }
+
+    #[test]
+    fn parse_bracket_rejects_unterminated_quote() {
+        assert!(parse_bracket_expr("'[' 'unterminated = x ']'").is_none());
+    }
+
+    #[test]
+    fn parse_double_bracket_operands_with_spaces() {
+        // `[[ ]]` is shell syntax, so bash prints its operands unquoted; the
+        // operator token is the only boundary available.
+        let expr = parse_bracket_expr("[[ apple banana cherry = apple banana durian ]]").unwrap();
+        assert_eq!(expr.left, "apple banana cherry");
+        assert_eq!(expr.op, "=");
+        assert_eq!(expr.right, "apple banana durian");
+    }
+
+    #[test]
+    fn parse_double_bracket_ambiguous_split_declines() {
+        // Two candidate operators: we can't tell which one bash meant.
+        assert!(parse_bracket_expr("[[ a = b = c ]]").is_none());
+    }
+
+    #[test]
+    fn escape_for_display_keeps_values_on_one_line() {
+        assert_eq!(escape_for_display("a\nb\tc"), r"a\nb\tc");
+        assert_eq!(escape_for_display(r"back\slash"), r"back\\slash");
+        assert_eq!(escape_for_display("quote\"d"), r#"quote\"d"#);
+        assert_eq!(escape_for_display("bell\x07"), r"bell\x07");
+        assert_eq!(escape_for_display("plain"), "plain");
     }
 
     #[test]
