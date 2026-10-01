@@ -145,8 +145,8 @@ being tested, the more likely they are maintained over time.
 
 ### Generating tests with AI
 
-Tests are also easy for AIs to write. Use `attest skill` to print the a skill
-which is pre-tuned to produce good tests. Here's an example prompt:
+Tests are also easy for AIs to write. Use `attest skill` to print a skill which
+is pre-tuned to produce good tests. Here's an example prompt:
 
 > Write attest-style tests for the `tac` command.
 
@@ -263,7 +263,14 @@ attest .
 
 # Tests run in parallel by default; use --parallel to limit concurrency
 attest --parallel 1 .
+
+# List the tests that would run, without running them
+attest list .
 ```
+
+By default you get a progress bar while the run is in flight, a summary at the
+end, and a report for each failure. Add `-v` if you also want a PASS/FAIL line
+per test.
 
 Every test runs in a temporary _context directory_ that collects logs and
 temporary files created by the test.
@@ -293,10 +300,10 @@ This works by choosing a subprocess at random and sending `SIGSTOP` followed by
 <summary>Example</summary>
 
 Without `--fuzz`, you might not realize there's a nasty race condition hiding in
-this file:
+this file (`-v` gives us a line per test instead of just the summary):
 
 ```
-❯ attest --parallel 1 --repeat 10 examples/race_condition.test
+❯ attest -v --parallel 1 --repeat 10 examples/race_condition.test
 PASS  testGrepQ#1                              (1.06s)
       cpu=7.8ms+4.8ms  mem=2.8MiB  pids=5
 PASS  testGrepQ#2                              (1.07s)
@@ -322,10 +329,12 @@ Results: 10 passed, 10 total
 Time:   10.69s
 ```
 
-Now let's add some fuzziness to the timing:
+Now let's add some fuzziness to the timing (each `FAIL` is also followed by the
+test's xtrace output and a diagnostic snippet pointing at the failing command,
+elided here):
 
 ```
-❯ attest --parallel 1 --fuzz 0.9 --repeat 10 examples/race_condition.test                                                                                                                                                                10s
+❯ attest -v --parallel 1 --fuzz 0.9 --repeat 10 examples/race_condition.test
 PASS  testGrepQ#1                              (3.47s)
       cpu=5.5ms+7.3ms  mem=2.8MiB  pids=5
 FAIL  testGrepQ#2                              (4.09s)
@@ -370,9 +379,11 @@ When a test fails, you can save its context:
 attest . --save-context ./results
 ```
 
-This directory contains, per test, its xtrace and stdout logs plus every file
-the test created or modified, laid out by absolute path (a write to `/tmp/x`
-shows up at `results/<test>/tmp/x`).
+This directory contains, per test, its xtrace and stdout logs, the test's
+working directory under `cwd/` (so a scratch file written to `$PWD` shows up at
+`results/<test>/cwd/x`), and every file it created or modified elsewhere, laid
+out by absolute path (a write to `/tmp/x` shows up at
+`results/<test>/tmp/x`).
 
 Failed tests always print their xtrace output. You can also stream the xtrace
 output live with the `-vv` flag:
