@@ -80,8 +80,9 @@ implicit assertion - if it exits nonzero, the test fails. Non-test functions
   `-vv` also streams xtrace output live (one test at a time)
 - `--save-context DIR` — for each test, copy the files it created/modified
   (all overlay upper layers merged, laid out by absolute path: a write to
-  `/tmp/x` appears at `DIR/<test>/tmp/x`) plus `stdout.log`/`xtrace.log` to
-  `DIR/<test>/` for debugging
+  `/tmp/x` appears at `DIR/<test>/tmp/x`) plus the test's working directory at
+  `DIR/<test>/cwd/` (it is live-bound, not part of any overlay) and
+  `stdout.log`/`xtrace.log` to `DIR/<test>/` for debugging
 - `--no-overlay` — disable overlayfs isolation; run each test directly in the
   working directory (same as the automatic fallback when overlays are unavailable)
 - `--repeat N` — run each test N times (default: 1); combine with `--fuzz` to
