@@ -525,8 +525,6 @@ pub fn run_all_tests(
     Ok(results)
 }
 
-/// Resolve a shell name or path to an executable, falling back to `/bin/sh`
-/// when the requested shell is not found.
 /// Whether `shell` names something we can exec: an existing path when it
 /// contains a `/`, or a command resolvable on `PATH` otherwise.
 pub(crate) fn shell_exists(shell: &str) -> bool {
@@ -537,6 +535,8 @@ pub(crate) fn shell_exists(shell: &str) -> bool {
     }
 }
 
+/// Resolve a shell name or path to an executable, falling back to `/bin/sh`
+/// when the requested shell is not found.
 fn resolve_shell(shell: &str) -> String {
     if shell_exists(shell) {
         shell.to_string()

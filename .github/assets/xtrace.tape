@@ -8,7 +8,7 @@ Type "alias attest=./target/debug/attest && clear"
 Enter
 Show
 
-Type "attest --xtrace examples/failing.test"
+Type "attest -vv examples/failing.test"
 Enter
 Sleep 10s
 

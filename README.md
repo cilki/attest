@@ -268,6 +268,16 @@ attest --parallel 1 .
 attest list .
 ```
 
+Pointed at a directory, `attest` walks it recursively and scans every shell
+script it finds for test functions: files named `*.test`, `*.sh` or `*.bash`,
+plus any other file whose first line is a shebang naming a shell (`sh`, `bash`,
+`zsh`, `dash`, `ash`, `ksh`). Hidden files and directories are skipped. Pointed
+at a single file, it scans that file whatever it happens to be called.
+
+Each test runs under the shell its file's shebang asks for, falling back to
+`/bin/sh` when that shell isn't installed and to `bash` for files without a
+recognized shebang.
+
 By default you get a progress bar while the run is in flight, a summary at the
 end, and a report for each failure. Add `-v` if you also want a PASS/FAIL line
 per test.
@@ -286,15 +296,18 @@ docker run --rm -v $(which attest):/bin/attest -v $(pwd):/tests <image name> att
 
 ### Fuzz testing
 
-If your application spawns subprocesses, `attest` can randomly inflate the
-timing of those subprocesses at random:
+If your application spawns subprocesses, `attest` can randomly distort their
+timing:
 
 ```sh
 attest --fuzz examples/race_condition.test
 ```
 
-This works by choosing a subprocess at random and sending `SIGSTOP` followed by
-`SIGCONT`. This option also works nicely with `--repeat`.
+While a test runs, `attest` keeps picking one of its descendant processes at
+random and either pausing it with `SIGSTOP` or letting a previously paused one
+go again with `SIGCONT`. A subprocess therefore stays stopped for an
+unpredictable while rather than a fixed delay. This option also works nicely
+with `--repeat`.
 
 <details>
 <summary>Example</summary>
@@ -365,7 +378,9 @@ test. The `grep -q` example above is obviously contrived, but imagine you were
 checking for firewall rules with `iptables | grep -q`.
 
 You'll also notice the test took over 3 times longer. You can adjust how
-aggressive the fuzzer is by passing a higher number to `--fuzz`.
+aggressive the fuzzer is with `--fuzz`'s optional value, which must be strictly
+between 0 and 1 (default `0.5`): the higher it is, the more often a process is
+paused instead of resumed.
 
 </details>
 
