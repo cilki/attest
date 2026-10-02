@@ -820,6 +820,15 @@ fn save_test_context(result: &TestResult, save_dir: &Path, submounts: &[overlay:
     {
         warn!("failed to save cwd for {}: {e}", result.name);
     }
+    // `--strace` logs are written straight into the context dir (not through
+    // any overlay), so they need copying too — otherwise they die with the
+    // temp context and there is no way to read them.
+    let strace = result.context.join("strace");
+    if dir_non_empty(&strace)
+        && let Err(e) = overlay::copy_dir_recursive(&strace, &dst.join("strace"))
+    {
+        warn!("failed to save strace logs for {}: {e}", result.name);
+    }
     for log in ["stdout.log", "xtrace.log"] {
         let src = result.context.join(log);
         if src.exists() {
@@ -923,6 +932,14 @@ fn process_state(pid: u32) -> Option<char> {
 }
 
 fn create_strace_wrappers(working_dir: &Path, commands: &[String]) -> Result<()> {
+    // Resolve strace here rather than leaving `strace` for the wrapper to look
+    // up at run time: a missing strace would otherwise surface as every traced
+    // test failing with `exec: strace: not found` in its xtrace, and an
+    // absolute path also survives tests that rewrite PATH.
+    let strace = which::which("strace").map_err(|_| {
+        anyhow!("--strace: `strace` not found on PATH; install it to trace commands")
+    })?;
+
     let strace_bin = working_dir.join("strace_bin");
     std::fs::create_dir_all(&strace_bin)?;
 
@@ -936,7 +953,8 @@ fn create_strace_wrappers(working_dir: &Path, commands: &[String]) -> Result<()>
         let wrapper = strace_bin.join(cmd);
         let strace_out = strace_dir.join(format!("{cmd}.log"));
         let script = format!(
-            "#!/bin/sh\nexec strace -f -o {} {} \"$@\"\n",
+            "#!/bin/sh\nexec {} -f -o {} {} \"$@\"\n",
+            sh_quote(&strace),
             sh_quote(&strace_out),
             sh_quote(&real_path),
         );
@@ -1221,7 +1239,7 @@ mod tests {
     #[test]
     fn create_strace_wrappers_creates_scripts() {
         // Only run if strace and ls are available
-        if which::which("ls").is_err() {
+        if which::which("ls").is_err() || which::which("strace").is_err() {
             return;
         }
 
@@ -1246,9 +1264,47 @@ mod tests {
 
     #[test]
     fn create_strace_wrappers_unknown_command_errors() {
+        if which::which("strace").is_err() {
+            return; // the missing-strace check would fire first
+        }
+
         let tmp = TempDir::new().unwrap();
-        let result = create_strace_wrappers(tmp.path(), &["nonexistent_cmd_xyz".to_string()]);
-        assert!(result.is_err());
+        let err = create_strace_wrappers(tmp.path(), &["nonexistent_cmd_xyz".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nonexistent_cmd_xyz"), "got {err}");
+    }
+
+    #[test]
+    fn save_context_includes_strace_logs() {
+        // --strace writes its logs into the context dir, which is a temp dir
+        // discarded at exit: --save-context is the only way to read them, so it
+        // must copy them out alongside the other logs.
+        let ctx = TempDir::new().unwrap();
+        fs::create_dir_all(ctx.path().join("strace")).unwrap();
+        fs::write(ctx.path().join("strace/ls.log"), "execve(\"/bin/ls\")\n").unwrap();
+        fs::write(ctx.path().join("xtrace.log"), "+1: ls\n").unwrap();
+
+        let result = TestResult {
+            name: "test_traced".to_string(),
+            passed: true,
+            timed_out: false,
+            duration: Duration::from_millis(1),
+            context: ctx.path().to_path_buf(),
+            source_path: PathBuf::from("t.sh"),
+            #[cfg(feature = "cgroup")]
+            resources: None,
+        };
+
+        let save = TempDir::new().unwrap();
+        save_test_context(&result, save.path(), &[]);
+
+        let saved = save.path().join("test_traced");
+        assert_eq!(
+            fs::read_to_string(saved.join("strace/ls.log")).unwrap(),
+            "execve(\"/bin/ls\")\n"
+        );
+        assert!(saved.join("xtrace.log").exists());
     }
 
     #[test]

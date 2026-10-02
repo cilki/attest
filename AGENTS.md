@@ -73,7 +73,8 @@ implicit assertion - if it exits nonzero, the test fails. Non-test functions
   executables in DIR (no copy). Lower precedence than `--override`, higher than the
   inherited PATH. Repeatable
 - `--strace CMD` — wrap CMD with strace, output saved to `strace/CMD.log` in the
-  test context dir
+  test context dir. Requires `strace` on PATH; the run aborts if it is missing.
+  Pair with `--save-context` to keep the logs
 - `-v`, `--verbose` — increase verbosity (repeatable). By default only the
   progress bar is shown, plus a FAIL line with the test's xtrace output and a
   diagnostic snippet for each failure; `-v` adds per-test PASS/FAIL lines;
@@ -81,8 +82,9 @@ implicit assertion - if it exits nonzero, the test fails. Non-test functions
 - `--save-context DIR` — for each test, copy the files it created/modified
   (all overlay upper layers merged, laid out by absolute path: a write to
   `/tmp/x` appears at `DIR/<test>/tmp/x`) plus the test's working directory at
-  `DIR/<test>/cwd/` (it is live-bound, not part of any overlay) and
-  `stdout.log`/`xtrace.log` to `DIR/<test>/` for debugging
+  `DIR/<test>/cwd/` (it is live-bound, not part of any overlay),
+  `stdout.log`/`xtrace.log` to `DIR/<test>/`, and any `--strace` logs at
+  `DIR/<test>/strace/CMD.log` for debugging
 - `--no-overlay` — disable overlayfs isolation; run each test directly in the
   working directory (same as the automatic fallback when overlays are unavailable)
 - `--repeat N` — run each test N times (default: 1); combine with `--fuzz` to

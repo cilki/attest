@@ -385,6 +385,13 @@ working directory under `cwd/` (so a scratch file written to `$PWD` shows up at
 out by absolute path (a write to `/tmp/x` shows up at
 `results/<test>/tmp/x`).
 
+To see the syscalls a command makes, trace it with `--strace` and save the
+context — the log lands at `results/<test>/strace/<cmd>.log`:
+
+```sh
+attest . --strace curl --save-context ./results
+```
+
 Failed tests always print their xtrace output. You can also stream the xtrace
 output live with the `-vv` flag:
 
