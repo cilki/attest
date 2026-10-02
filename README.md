@@ -54,11 +54,18 @@ tests:
 - If any command in your function exits nonzero, the whole test fails
 - Each test starts in its own clean, empty temporary working directory, and
   runs in its own copy-on-write view of the filesystem: it sees the real
-  project files, but writes to the root filesystem, the project tree, and
-  `/tmp` are discarded after the run. (Other mounts — `/proc`, `/dev`, network
-  mounts, etc. — stay shared with the host, so writes there persist.
+  project files, but writes to the root filesystem, the project tree, `/tmp`,
+  and `/var/tmp` are discarded after the run. (Other mounts — `/proc`, `/dev`,
+  network mounts, etc. — stay shared with the host, so writes there persist.
   `--no-overlay` disables isolation entirely.) Any processes still running
   when a test ends are killed automatically.
+
+Isolation is built out of overlayfs, which needs `CAP_SYS_ADMIN` — either
+directly, or through a user namespace, in which case the test also sees itself
+as `root` inside that namespace. attest rehearses the whole setup once per run
+and, where neither route works, falls back to running every test directly in
+the working directory just like `--no-overlay` does, so writes are no longer
+discarded. Nested containers and sandboxes are the usual places this happens.
 
 ### Inline tests
 
@@ -285,6 +292,49 @@ per test.
 Every test runs in a temporary _context directory_ that collects logs and
 temporary files created by the test.
 
+### Selecting tests
+
+Any `<file>/<test>` pair works as a target, and `--filter` narrows a wider run
+down the same way. A name without a `*` matches as a prefix, so you rarely have
+to spell one out in full:
+
+```sh
+# Just one test
+attest examples/md5sum.test/testHello
+
+# Every test in one file, wherever that file turns up under the given directory
+attest . --filter 'md5sum.test/'
+
+# Every test whose name starts with "testHel"
+attest . --filter testHel
+
+# `*` is a wildcard
+attest . --filter 'testVer*'
+```
+
+`list` accepts the same targets and `--filter`, so you can check what a
+selection covers before running it.
+
+### Other options
+
+- `--timeout SECS` — kill a test after this much wall-clock time and report it
+  as `TIME`
+- `--bail` — stop launching new tests after the first failure
+- `--repeat N` — run each test N times
+- `--json` — print one JSON object per test instead of the colored output
+- `--override SPEC` — copy a binary into the test's `bin/` dir so tests resolve
+  that name to it. `SPEC` is a path (`/usr/bin/example`) or a mapping
+  (`example=/usr/bin/override`)
+- `--bin-dir DIR` — prepend DIR to each test's PATH, without copying anything
+- `--strace CMD` — run CMD under strace, saving the log to the test's context
+  dir
+- `--shebang SHELL` — force one shell for every test, ignoring each file's own
+  shebang
+- `--no-overlay` — skip filesystem isolation and run each test directly in the
+  working directory
+- `--no-cgroups` — don't track per-test CPU, memory and IO usage with cgroups
+- `-d`, `--debug` — enable debug logging
+
 ### Containerized tests
 
 If your application requires some dependencies in a Docker container, you can
@@ -293,6 +343,10 @@ run `attest` in a container with this recipe:
 ```sh
 docker run --rm -v $(which attest):/bin/attest -v $(pwd):/tests <image name> attest /tests
 ```
+
+Containers usually can't mount overlayfs, so tests run this way tend to land on
+the unisolated fallback described above — writes to the mounted project tree
+reach your real files.
 
 ### Fuzz testing
 
