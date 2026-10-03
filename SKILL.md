@@ -20,10 +20,14 @@ methods. Do NOT use syntax from other test frameworks (no `assert_eq`, no
 - Each test starts in its own clean, empty temporary working directory, so
   create scratch files right in `$PWD` — never use `mktemp`
 - Each test runs in its own copy-on-write view of the filesystem: writes to
-  the root filesystem, the project tree, and `/tmp` are discarded when the
-  test ends. Tests must not depend on each other's files. Writes to other
-  mounts (`/proc`, `/dev`, network mounts, …) reach the real system and
+  the root filesystem, the project tree, `/tmp`, and `/var/tmp` are discarded
+  when the test ends. Tests must not depend on each other's files. Writes to
+  other mounts (`/proc`, `/dev`, network mounts, …) reach the real system and
   persist
+- That view needs overlayfs support, which some environments (nested
+  containers, sandboxes) don't provide; attest then runs tests unisolated. Keep
+  scratch writes in `$PWD`, which is always a fresh directory, instead of
+  relying on writes elsewhere being thrown away
 - Any processes still running when a test ends (background servers, daemons,
   …) are killed automatically — never write `trap` cleanup for them
 
