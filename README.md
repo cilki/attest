@@ -412,7 +412,30 @@ output live with the `-vv` flag:
 
 ![](./.github/assets/xtrace.gif)
 
+### Resource usage
+
+Result lines can carry a second line describing what the test actually
+consumed:
+
+```
+PASS  testGrepQ#1                              (1.06s)
+      cpu=7.8ms+4.8ms  mem=2.8MiB  pids=5
+```
+
+`cpu` is user plus system time, `mem` the peak memory, `io` the bytes read and
+written, and `pids` the largest number of processes alive at once. Fields with
+nothing to report are left out.
+
+These numbers come from a cgroup created per test, so the line is absent
+altogether when `attest` can't make one — cgroup v2 not mounted, or no
+permission to create a child cgroup, which `-d` will tell you about — and when
+you pass `--no-cgroups`.
+
 ## Installation
+
+`attest` runs on Linux only: test isolation is built out of overlayfs and
+`pivot_root`, and resource usage comes from cgroup v2, none of which have
+equivalents elsewhere. It does not compile on macOS or Windows.
 
 <details>
 <summary>Crates.io</summary>

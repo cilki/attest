@@ -221,8 +221,9 @@ pub struct RunConfig {
     /// lines, 2+ adds live xtrace streaming.
     pub verbose: u8,
     pub json: bool,
-    /// When set, each test's context directory is created here and left on exit.
-    /// When unset, context dirs are temporary and cleaned up automatically.
+    /// When set, each test's logs, filesystem delta and working directory are
+    /// copied here once it finishes (see [`save_test_context`]). Context dirs
+    /// themselves always live in the run's tempdir and are cleaned up on exit.
     pub save_context: Option<PathBuf>,
     pub override_cmds: Vec<OverrideSpec>,
     /// Directories prepended to each test's PATH (e.g. build-cache output dirs).

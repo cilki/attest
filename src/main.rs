@@ -62,8 +62,10 @@ struct Cli {
     #[arg(long, add = ArgValueCompleter::new(complete_tests))]
     filter: Option<String>,
 
-    /// Save test context directories instead of cleaning them up on exit
-    #[arg(long)]
+    /// Copy each test's logs, filesystem delta and working directory into DIR
+    /// for debugging. The context directories themselves are always temporary
+    /// and are still removed on exit.
+    #[arg(long, value_name = "DIR")]
     save_context: Option<PathBuf>,
 
     /// Stop after first test failure
@@ -87,8 +89,10 @@ struct Cli {
     #[arg(long)]
     bin_dir: Vec<PathBuf>,
 
-    /// Trace a command with strace, saving output to the test context dir (can be specified multiple times)
-    #[arg(long)]
+    /// Trace a command with strace. The log is written to the test's context
+    /// dir, so pair this with --save-context to keep it. Can be specified
+    /// multiple times.
+    #[arg(long, value_name = "CMD")]
     strace: Vec<String>,
 
     /// Kill a test and mark it as timed out after this many seconds (wall-clock time)
