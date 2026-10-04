@@ -35,9 +35,9 @@ pub fn print_failure_snippet(result: &TestResult) {
     let Some(line_idx) = failure.lineno.checked_sub(1) else {
         return;
     };
-    let Some(failing_line) = lines.get(line_idx) else {
+    if line_idx >= lines.len() {
         return;
-    };
+    }
 
     // A timed-out test did not fail a command; the highlighted line is simply
     // where it was still running when the clock ran out.
@@ -47,12 +47,6 @@ pub fn print_failure_snippet(result: &TestResult) {
         "command failed"
     };
 
-    // Annotate the failing command, skipping the line's leading indentation.
-    let byte_start = line_start_byte(&lines, line_idx);
-    let indent = failing_line.len() - failing_line.trim_start().len();
-    let span_start = byte_start + indent;
-    let span_end = byte_start + failing_line.len();
-
     // Clamp the rendered context to the enclosing function so a snippet never
     // leaks into an adjacent test.
     let (func_start_line, func_end_line) =
@@ -61,9 +55,8 @@ pub fn print_failure_snippet(result: &TestResult) {
     render_snippet(
         title,
         &result.source_path,
-        &source,
-        span_start,
-        span_end,
+        &lines,
+        line_idx,
         func_start_line,
         func_end_line,
     );
@@ -99,12 +92,6 @@ fn parse_xtrace_failure(tmp_dir: &Path) -> Option<FailureInfo> {
         }
     }
     last_match
-}
-
-/// Byte offset where line `idx` (0-based) begins in the original source,
-/// assuming single-byte `\n` separators (which is what `str::lines` splits on).
-fn line_start_byte(lines: &[&str], idx: usize) -> usize {
-    lines[..idx].iter().map(|l| l.len() + 1).sum()
 }
 
 /// 0-based line range `(start, end)` of the function definition enclosing
@@ -162,14 +149,17 @@ fn is_function_header(trimmed: &str) -> bool {
     name_len > 0 && trimmed[name_len..].trim_start().starts_with('(')
 }
 
-/// Render an annotate-snippets diagnostic for the failing line with surrounding context,
-/// clamped to the enclosing function boundaries.
+/// How many lines of context to show on each side of the annotated line.
+const CONTEXT_LINES: usize = 3;
+
+/// Render an annotate-snippets diagnostic highlighting `lines[line_idx]`, with
+/// up to [`CONTEXT_LINES`] lines of surrounding context on each side, clamped
+/// to the enclosing function so a snippet never leaks into an adjacent test.
 fn render_snippet(
     title: &str,
     source_path: &Path,
-    source: &str,
-    byte_start: usize,
-    byte_end: usize,
+    lines: &[&str],
+    line_idx: usize,
     func_start_line: usize,
     func_end_line: usize,
 ) {
@@ -180,36 +170,30 @@ fn render_snippet(
         .map(|n| n.to_string_lossy())
         .unwrap_or_else(|| source_path.to_string_lossy());
 
-    // Extract a window of context lines around the annotation, clamped to
-    // the enclosing function so we never leak into adjacent tests.
-    let context_lines = 3;
-    let lines: Vec<&str> = source.lines().collect();
-
-    // Find which line the annotation starts on (0-based)
-    let anno_line = source[..byte_start].matches('\n').count();
-
-    let window_start = anno_line.saturating_sub(context_lines).max(func_start_line);
-    let window_end = (anno_line + context_lines + 1)
+    let start = line_idx.saturating_sub(CONTEXT_LINES).max(func_start_line);
+    let end = (line_idx + CONTEXT_LINES + 1)
         .min(lines.len())
         .min(func_end_line + 1);
+    let window = &lines[start..end];
+    let source = window.join("\n");
 
-    // Byte offset where the window starts in the original source
-    let window_byte_start = line_start_byte(&lines, window_start);
-
-    let window_source: String = lines[window_start..window_end].join("\n");
-    let adj_start = byte_start - window_byte_start;
-    let adj_end = byte_end - window_byte_start;
+    // Annotate the whole failing line within the rendered window, skipping its
+    // leading indentation. `join("\n")` puts one byte between lines.
+    let line_start: usize = window[..line_idx - start].iter().map(|l| l.len() + 1).sum();
+    let failing = lines[line_idx];
+    let indent = failing.len() - failing.trim_start().len();
 
     let report = &[Level::ERROR.primary_title(title).element(
-        Snippet::source(&window_source)
+        Snippet::source(&source)
             .path(&*path_str)
-            .line_start(window_start + 1)
+            .line_start(start + 1)
             .fold(false)
-            .annotation(AnnotationKind::Primary.span(adj_start..adj_end)),
+            .annotation(
+                AnnotationKind::Primary.span(line_start + indent..line_start + failing.len()),
+            ),
     )];
 
-    let renderer = Renderer::styled();
-    println!("{}", renderer.render(report));
+    println!("{}", Renderer::styled().render(report));
 }
 
 /// Comparison operators we know how to render a diff for. `==` is how `[[`

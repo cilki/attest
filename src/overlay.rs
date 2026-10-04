@@ -234,14 +234,12 @@ fn plan_submounts(
     invocation_dir: &Path,
     is_dir: impl Fn(&Path) -> bool,
 ) -> Vec<Submount> {
-    // Later mountinfo entries shadow earlier ones at the same path; keep the last.
-    let mut uniq: Vec<PathBuf> = Vec::new();
-    for m in mounts {
-        if let Some(i) = uniq.iter().position(|u| *u == m) {
-            uniq.remove(i);
-        }
-        uniq.push(m);
-    }
+    // mountinfo can list the same mount point twice (a later entry shadowing an
+    // earlier one); only the path matters here, so collapse the repeats. Sorted
+    // shallowest-first in the same pass so parents are planned before children.
+    let mut uniq = mounts;
+    uniq.sort_by_key(|p| (p.components().count(), p.clone()));
+    uniq.dedup();
 
     let root = Path::new("/");
     let project = mount_of(invocation_dir, &uniq);
@@ -249,8 +247,6 @@ fn plan_submounts(
         .chain(EPHEMERAL_SCRATCH.iter().map(Path::new))
         .filter(|p| *p != root && uniq.iter().any(|m| m == p))
         .collect();
-
-    uniq.sort_by_key(|p| (p.components().count(), p.clone()));
 
     let mut out: Vec<Submount> = Vec::new();
     for m in uniq {

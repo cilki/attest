@@ -387,12 +387,7 @@ fn main() -> anyhow::Result<()> {
                 no_cgroups: cli.no_cgroups,
             };
 
-            let test_refs: Vec<(
-                &str,
-                &str,
-                &[brush_parser::ast::FunctionDefinition],
-                &std::path::Path,
-            )> = all_tests
+            let test_refs: Vec<runner::TestSpec> = all_tests
                 .iter()
                 .map(|(display, fn_name, idx)| {
                     (

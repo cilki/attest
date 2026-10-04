@@ -22,83 +22,81 @@ extern "C" fn mark_interrupted(_: libc::c_int) {
     INTERRUPTED.store(true, Ordering::Relaxed);
 }
 
-/// Tracks live xtrace streaming state: which test holds the output lock and how
-/// far we've read into its xtrace.log.
-struct XtraceStreamer {
-    /// Name of the test currently holding the xtrace output lock.
-    holder: Option<String>,
-    /// File handle for the current holder's xtrace.log.
-    file: Option<std::fs::File>,
+/// The test whose xtrace.log is currently being tailed to stderr.
+struct Tailed {
+    /// Name of the test holding the xtrace output lock.
+    name: String,
+    file: std::fs::File,
     /// How many bytes have been printed so far.
     offset: u64,
 }
 
+/// Live xtrace streaming: at most one test at a time has its xtrace.log tailed
+/// to stderr, so concurrent traces never interleave.
+struct XtraceStreamer {
+    /// `None` while no test holds the xtrace output lock.
+    tailed: Option<Tailed>,
+}
+
 impl XtraceStreamer {
     fn new() -> Self {
-        Self {
-            holder: None,
-            file: None,
-            offset: 0,
-        }
+        Self { tailed: None }
     }
 
-    /// Acquire the lock for a test if no one currently holds it.
+    fn is_idle(&self) -> bool {
+        self.tailed.is_none()
+    }
+
+    /// Start tailing a test's xtrace.log if no other test holds the lock.
     fn try_acquire(&mut self, pending: &PendingTest) {
-        if self.holder.is_some() {
+        if self.tailed.is_some() {
             return;
         }
         let xtrace_path = pending.context.as_ref().unwrap().join("xtrace.log");
-        if let Ok(f) = std::fs::File::open(&xtrace_path) {
+        if let Ok(file) = std::fs::File::open(&xtrace_path) {
             eprintln!("\x1b[2m--- xtrace: {} ---\x1b[0m", pending.name);
-            self.holder = Some(pending.name.clone());
-            self.file = Some(f);
-            self.offset = 0;
+            self.tailed = Some(Tailed {
+                name: pending.name.clone(),
+                file,
+                offset: 0,
+            });
         }
     }
 
-    /// Check whether the current holder's xtrace.log has new data.
-    fn has_new(&mut self) -> bool {
-        let Some(ref mut f) = self.file else {
-            return false;
-        };
-        f.metadata().is_ok_and(|m| m.len() > self.offset)
+    /// Check whether the tailed xtrace.log has grown since the last flush.
+    fn has_new(&self) -> bool {
+        self.tailed
+            .as_ref()
+            .is_some_and(|t| t.file.metadata().is_ok_and(|m| m.len() > t.offset))
     }
 
-    /// Print any new bytes from the current holder's xtrace.log.
+    /// Print any bytes appended to the tailed xtrace.log since the last flush.
     fn flush_new(&mut self) {
-        let Some(ref mut f) = self.file else { return };
-        if f.seek(SeekFrom::Start(self.offset)).is_err() {
+        let Some(t) = self.tailed.as_mut() else {
+            return;
+        };
+        if t.file.seek(SeekFrom::Start(t.offset)).is_err() {
             return;
         }
         let mut buf = Vec::new();
-        if f.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
-            self.offset += buf.len() as u64;
+        if t.file.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
+            t.offset += buf.len() as u64;
             let _ = write!(std::io::stderr(), "\x1b[2m");
             let _ = std::io::stderr().write_all(&buf);
             let _ = write!(std::io::stderr(), "\x1b[0m");
         }
     }
 
-    /// Release the lock (flush remaining output first).
-    fn release(&mut self) {
-        self.flush_new();
-        self.holder = None;
-        self.file = None;
-        self.offset = 0;
-    }
-
-    /// Check if the named test currently holds the lock.
-    fn is_holder(&self, name: &str) -> bool {
-        self.holder.as_deref() == Some(name)
-    }
-
-    /// Dump the full xtrace log for a test that was never streamed (e.g. it
-    /// finished before the parent could open the file).
-    fn dump_missed(&self, pending: &PendingTest) {
-        if self.is_holder(&pending.name) {
-            return; // Will be flushed via release()
+    /// Settle a finished test's trace output: flush and release the lock if it
+    /// was the one being tailed, otherwise dump its whole log (it finished
+    /// before the parent could open the file).
+    fn finish(&mut self, pending: &PendingTest) {
+        if self.tailed.as_ref().is_some_and(|t| t.name == pending.name) {
+            self.flush_new();
+            self.tailed = None;
+        } else {
+            dump_xtrace_log(&pending.name, pending.context.as_ref().unwrap());
         }
-        dump_xtrace_log(&pending.name, pending.context.as_ref().unwrap());
     }
 }
 
@@ -253,10 +251,12 @@ struct RunEnv {
     submounts: Vec<overlay::Submount>,
 }
 
-pub fn run_all_tests(
-    tests: Vec<(&str, &str, &[FunctionDefinition], &Path)>,
-    config: &RunConfig,
-) -> Result<Vec<TestResult>> {
+/// One test to run: its unique display name, the shell function to invoke, all
+/// functions extracted from its file (the test plus any helpers), and the path
+/// of that file.
+pub type TestSpec<'a> = (&'a str, &'a str, &'a [FunctionDefinition], &'a Path);
+
+pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
     let total = tests.len();
     let mut status = output::StatusDisplay::new(total, config.json);
@@ -318,21 +318,22 @@ pub fn run_all_tests(
         std::fs::create_dir_all(save_dir)?;
     }
 
+    let spawn = |(display_name, fn_name, all_functions, source_path): TestSpec| {
+        spawn_test(
+            display_name,
+            fn_name,
+            all_functions,
+            source_path,
+            contexts_dir.join(display_name),
+            config,
+            &env,
+        )
+    };
+
     // Seed the initial batch up to max_parallel.
     while pending_list.len() < max_parallel {
-        if let Some((display_name, fn_name, all_functions, source_path)) = test_iter.next() {
-            pending_list.push(spawn_test(
-                display_name,
-                fn_name,
-                all_functions,
-                source_path,
-                contexts_dir.join(display_name),
-                config,
-                &env,
-            )?);
-        } else {
-            break;
-        }
+        let Some(test) = test_iter.next() else { break };
+        pending_list.push(spawn(test)?);
     }
 
     // If xtrace is enabled, acquire the lock for the first pending test.
@@ -369,44 +370,11 @@ pub fn run_all_tests(
             }
         }
 
-        // Randomly pause/resume individual descendant processes to introduce timing fuzziness.
-        // Each tick either pauses one random running process OR resumes one random stopped
-        // process — never both.
+        // Randomly pause/resume individual descendant processes to introduce
+        // timing fuzziness.
         if let Some(fuzz_level) = config.fuzz {
-            for pending in pending_list.iter_mut() {
-                let roll = xorshift64(&mut rng);
-                let test_pid = pending.child.id();
-                let descendants: Vec<u32> = collect_descendants(test_pid)
-                    .into_iter()
-                    .filter(|&pid| pid != test_pid)
-                    .collect();
-                if (roll as f64) / (u64::MAX as f64) >= fuzz_level {
-                    // Resume a random stopped descendant.
-                    let stopped: Vec<u32> = descendants
-                        .iter()
-                        .copied()
-                        .filter(|&pid| process_state(pid) == Some('T'))
-                        .collect();
-                    if !stopped.is_empty() {
-                        let chosen = stopped[(xorshift64(&mut rng) as usize) % stopped.len()];
-                        if unsafe { libc::kill(chosen as libc::pid_t, libc::SIGCONT) } == 0 {
-                            trace!(pid = chosen, "Resumed subprocess");
-                        }
-                    }
-                } else {
-                    // Pause a random running descendant.
-                    let running: Vec<u32> = descendants
-                        .iter()
-                        .copied()
-                        .filter(|&pid| process_state(pid) != Some('T'))
-                        .collect();
-                    if !running.is_empty() {
-                        let chosen = running[(xorshift64(&mut rng) as usize) % running.len()];
-                        if unsafe { libc::kill(chosen as libc::pid_t, libc::SIGSTOP) } == 0 {
-                            trace!(pid = chosen, "Paused subprocess");
-                        }
-                    }
-                }
+            for pending in &pending_list {
+                fuzz_tick(pending.child.id(), fuzz_level, &mut rng);
             }
         }
 
@@ -425,15 +393,7 @@ pub fn run_all_tests(
         let mut completed: Vec<TestResult> = Vec::new();
         for (i, exit_status) in reaped {
             if let Some(ref mut xt) = xtrace {
-                // If this test held the xtrace lock, release it (flushes remaining output).
-                // Otherwise dump the full log for tests that finished before we could stream.
-                status.suspend(|| {
-                    if xt.is_holder(&pending_list[i].name) {
-                        xt.release();
-                    } else {
-                        xt.dump_missed(&pending_list[i]);
-                    }
-                });
+                status.suspend(|| xt.finish(&pending_list[i]));
             }
             let pending = pending_list.remove(i);
             if bail_flag {
@@ -470,18 +430,8 @@ pub fn run_all_tests(
             }
             results.push(result);
 
-            if !bail_flag
-                && let Some((display_name, fn_name, all_functions, source_path)) = test_iter.next()
-            {
-                pending_list.push(spawn_test(
-                    display_name,
-                    fn_name,
-                    all_functions,
-                    source_path,
-                    contexts_dir.join(display_name),
-                    config,
-                    &env,
-                )?);
+            if !bail_flag && let Some(test) = test_iter.next() {
+                pending_list.push(spawn(test)?);
             }
         }
 
@@ -491,7 +441,7 @@ pub fn run_all_tests(
 
         // If xtrace lock is free, acquire the next pending test.
         if let Some(ref mut xt) = xtrace
-            && xt.holder.is_none()
+            && xt.is_idle()
             && let Some(p) = pending_list.first()
         {
             status.suspend(|| xt.try_acquire(p));
@@ -905,6 +855,32 @@ fn xorshift64(state: &mut u64) -> u64 {
     *state
 }
 
+/// One `--fuzz` tick for the test rooted at `test_pid`: either pause a random
+/// running descendant or resume a random stopped one, never both. `level` is
+/// the aggressiveness in (0,1) — the higher it is, the more often a tick pauses
+/// rather than resumes.
+fn fuzz_tick(test_pid: u32, level: f64, rng: &mut u64) {
+    let resume = (xorshift64(rng) as f64) / (u64::MAX as f64) >= level;
+    // A descendant whose state can't be read counts as running, so a vanished
+    // process is simply signalled and ignored rather than resumed forever.
+    let candidates: Vec<u32> = collect_descendants(test_pid)
+        .into_iter()
+        .filter(|&pid| pid != test_pid && (process_state(pid) == Some('T')) == resume)
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let chosen = candidates[(xorshift64(rng) as usize) % candidates.len()];
+    let (signal, verb) = if resume {
+        (libc::SIGCONT, "Resumed")
+    } else {
+        (libc::SIGSTOP, "Paused")
+    };
+    if unsafe { libc::kill(chosen as libc::pid_t, signal) } == 0 {
+        trace!(pid = chosen, "{verb} subprocess");
+    }
+}
+
 /// Collect the PID of `root` and all of its descendants by walking
 /// `/proc/<pid>/task/<pid>/children` recursively.
 fn collect_descendants(root: u32) -> Vec<u32> {
@@ -972,12 +948,6 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    /// Blocking wait + build result, for tests only.
-    fn wait_and_collect(mut pending: PendingTest) -> TestResult {
-        let status = pending.child.wait().expect("wait failed");
-        build_result(pending, status)
-    }
-
     /// A RunEnv with isolation disabled, for direct spawn_test tests.
     fn no_overlay_env(invocation_dir: &Path) -> RunEnv {
         RunEnv {
@@ -987,24 +957,56 @@ mod tests {
         }
     }
 
-    /// Parse `script` content and run `test_name` via spawn_test + wait_and_collect.
-    fn run_inline(script: &str, test_name: &str) -> TestResult {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("t.sh");
+    /// Write `script` to `dir/t.sh` and parse it.
+    fn parse_script(dir: &Path, script: &str) -> (PathBuf, crate::parser::TestFile) {
+        let path = dir.join("t.sh");
         fs::write(&path, script).unwrap();
         let tf = crate::parser::parse_test_file(&path).unwrap();
+        (path, tf)
+    }
+
+    /// Spawn `test_name` out of `script` (written under `srcdir`) and block
+    /// until it finishes.
+    fn run_script(
+        srcdir: &Path,
+        script: &str,
+        test_name: &str,
+        config: &RunConfig,
+        env: &RunEnv,
+    ) -> TestResult {
+        let (path, tf) = parse_script(srcdir, script);
         let ctx = TempDir::new().unwrap().keep();
-        let pending = spawn_test(
+        let mut pending =
+            spawn_test(test_name, test_name, &tf.functions, &path, ctx, config, env).unwrap();
+        let status = pending.child.wait().expect("wait failed");
+        build_result(pending, status)
+    }
+
+    /// `run_all_tests` input running every test in `tf` under its own name.
+    fn test_refs<'a>(tf: &'a crate::parser::TestFile, path: &'a Path) -> Vec<TestSpec<'a>> {
+        tf.tests
+            .iter()
+            .map(|t| {
+                (
+                    t.name.as_str(),
+                    t.name.as_str(),
+                    tf.functions.as_slice(),
+                    path,
+                )
+            })
+            .collect()
+    }
+
+    /// Run `test_name` from `script` without isolation or extra configuration.
+    fn run_inline(script: &str, test_name: &str) -> TestResult {
+        let tmp = TempDir::new().unwrap();
+        run_script(
+            tmp.path(),
+            script,
             test_name,
-            test_name,
-            &tf.functions,
-            &path,
-            ctx,
             &RunConfig::default(),
             &no_overlay_env(tmp.path()),
         )
-        .unwrap();
-        wait_and_collect(pending)
     }
 
     #[test]
@@ -1087,30 +1089,20 @@ mod tests {
     fn execute_test_with_override() {
         // Override `true` (always succeeds) to verify the copy lands in bin/ and runs.
         let tmp = TempDir::new().unwrap();
-        let script_content = "test_override() {\n  true\n}\n";
-        let path = tmp.path().join("t.sh");
-        fs::write(&path, script_content).unwrap();
-        let tf = crate::parser::parse_test_file(&path).unwrap();
-        let ctx = TempDir::new().unwrap().keep();
-        let spec = OverrideSpec {
-            name: "true".into(),
-            source: which::which("true").unwrap(),
-        };
         let config = RunConfig {
-            override_cmds: vec![spec],
+            override_cmds: vec![OverrideSpec {
+                name: "true".into(),
+                source: which::which("true").unwrap(),
+            }],
             ..RunConfig::default()
         };
-        let pending = spawn_test(
+        let result = run_script(
+            tmp.path(),
+            "test_override() {\n  true\n}\n",
             "test_override",
-            "test_override",
-            &tf.functions,
-            &path,
-            ctx,
             &config,
             &no_overlay_env(tmp.path()),
-        )
-        .unwrap();
-        let result = wait_and_collect(pending);
+        );
         assert!(result.passed);
         // bin/true should exist in the context dir
         assert!(result.context.join("bin/true").exists());
@@ -1126,29 +1118,17 @@ mod tests {
         fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("t.sh");
-        fs::write(
-            &path,
-            "test_bin_dir() {\n  out=$(mytool)\n  test \"$out\" = \"mytool_ran\"\n}\n",
-        )
-        .unwrap();
-        let tf = crate::parser::parse_test_file(&path).unwrap();
-        let ctx = TempDir::new().unwrap().keep();
         let config = RunConfig {
             bin_dirs: vec![bin.path().to_path_buf()],
             ..RunConfig::default()
         };
-        let pending = spawn_test(
+        let result = run_script(
+            tmp.path(),
+            "test_bin_dir() {\n  out=$(mytool)\n  test \"$out\" = \"mytool_ran\"\n}\n",
             "test_bin_dir",
-            "test_bin_dir",
-            &tf.functions,
-            &path,
-            ctx,
             &config,
             &no_overlay_env(tmp.path()),
-        )
-        .unwrap();
-        let result = wait_and_collect(pending);
+        );
         assert!(result.passed);
         // The tool is referenced in place, not copied into the context bin/.
         assert!(!result.context.join("bin/mytool").exists());
@@ -1171,21 +1151,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let srcdir = TempDir::new().unwrap();
         let env = overlay_env(tmp.path(), srcdir.path())?;
-        let path = srcdir.path().join("t.sh");
-        fs::write(&path, script).unwrap();
-        let tf = crate::parser::parse_test_file(&path).unwrap();
-        let ctx = TempDir::new().unwrap().keep();
-        let pending = spawn_test(
+        Some(run_script(
+            srcdir.path(),
+            script,
             test_name,
-            test_name,
-            &tf.functions,
-            &path,
-            ctx,
             &RunConfig::default(),
             &env,
-        )
-        .unwrap();
-        Some(wait_and_collect(pending))
+        ))
     }
 
     #[test]
@@ -1258,7 +1230,6 @@ mod tests {
         assert!(content.contains("\"$@\""));
 
         // Check it's executable
-        use std::os::unix::fs::PermissionsExt;
         let perms = fs::metadata(&wrapper).unwrap().permissions();
         assert!(perms.mode() & 0o111 != 0);
     }
@@ -1311,32 +1282,13 @@ mod tests {
     #[test]
     fn run_all_tests_serial() {
         let tmp = TempDir::new().unwrap();
-        let script_content = "test_a() {\n  true\n}\ntest_b() {\n  true\n}\n";
-
-        // Parse to get real FunctionDefinitions
-        let path = tmp.path().join("test.sh");
-        fs::write(&path, script_content).unwrap();
-        let test_file = crate::parser::parse_test_file(&path).unwrap();
-
+        let (path, tf) = parse_script(tmp.path(), "test_a() {\n  true\n}\ntest_b() {\n  true\n}\n");
         let config = RunConfig {
             parallel: 1,
             ..RunConfig::default()
         };
 
-        let test_refs: Vec<(&str, &str, &[FunctionDefinition], &Path)> = test_file
-            .tests
-            .iter()
-            .map(|t| {
-                (
-                    t.name.as_str(),
-                    t.name.as_str(),
-                    test_file.functions.as_slice(),
-                    path.as_path(),
-                )
-            })
-            .collect();
-
-        let results = run_all_tests(test_refs, &config).unwrap();
+        let results = run_all_tests(test_refs(&tf, &path), &config).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.passed));
     }
@@ -1345,32 +1297,17 @@ mod tests {
     fn bail_stops_after_first_failure() {
         let tmp = TempDir::new().unwrap();
         // test_fail comes first alphabetically, test_pass second
-        let script_content = "test_fail() {\n  false\n}\ntest_pass() {\n  true\n}\n";
-
-        let path = tmp.path().join("test.sh");
-        fs::write(&path, script_content).unwrap();
-        let test_file = crate::parser::parse_test_file(&path).unwrap();
-
+        let (path, tf) = parse_script(
+            tmp.path(),
+            "test_fail() {\n  false\n}\ntest_pass() {\n  true\n}\n",
+        );
         let config = RunConfig {
             parallel: 1,
             bail: true,
             ..RunConfig::default()
         };
 
-        let test_refs: Vec<(&str, &str, &[FunctionDefinition], &Path)> = test_file
-            .tests
-            .iter()
-            .map(|t| {
-                (
-                    t.name.as_str(),
-                    t.name.as_str(),
-                    test_file.functions.as_slice(),
-                    path.as_path(),
-                )
-            })
-            .collect();
-
-        let results = run_all_tests(test_refs, &config).unwrap();
+        let results = run_all_tests(test_refs(&tf, &path), &config).unwrap();
         // Only the failing test ran; bail stopped execution
         assert_eq!(results.len(), 1);
         assert!(!results[0].passed);
@@ -1379,31 +1316,16 @@ mod tests {
     #[test]
     fn run_all_tests_parallel() {
         let tmp = TempDir::new().unwrap();
-        let script_content = "test_x() {\n  true\n}\ntest_y() {\n  false\n}\n";
-
-        let path = tmp.path().join("test.sh");
-        fs::write(&path, script_content).unwrap();
-        let test_file = crate::parser::parse_test_file(&path).unwrap();
-
+        let (path, tf) = parse_script(
+            tmp.path(),
+            "test_x() {\n  true\n}\ntest_y() {\n  false\n}\n",
+        );
         let config = RunConfig {
             parallel: 0,
             ..RunConfig::default()
         };
 
-        let test_refs: Vec<(&str, &str, &[FunctionDefinition], &Path)> = test_file
-            .tests
-            .iter()
-            .map(|t| {
-                (
-                    t.name.as_str(),
-                    t.name.as_str(),
-                    test_file.functions.as_slice(),
-                    path.as_path(),
-                )
-            })
-            .collect();
-
-        let results = run_all_tests(test_refs, &config).unwrap();
+        let results = run_all_tests(test_refs(&tf, &path), &config).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.iter().any(|r| r.passed));
         assert!(results.iter().any(|r| !r.passed));
@@ -1412,32 +1334,14 @@ mod tests {
     #[test]
     fn timeout_kills_slow_test() {
         let tmp = TempDir::new().unwrap();
-        let script_content = "test_slow() {\n  sleep 60\n}\n";
-
-        let path = tmp.path().join("test.sh");
-        fs::write(&path, script_content).unwrap();
-        let tf = crate::parser::parse_test_file(&path).unwrap();
-
+        let (path, tf) = parse_script(tmp.path(), "test_slow() {\n  sleep 60\n}\n");
         let config = RunConfig {
             parallel: 1,
             timeout: Some(std::time::Duration::from_millis(200)),
             ..RunConfig::default()
         };
 
-        let test_refs: Vec<(&str, &str, &[FunctionDefinition], &Path)> = tf
-            .tests
-            .iter()
-            .map(|t| {
-                (
-                    t.name.as_str(),
-                    t.name.as_str(),
-                    tf.functions.as_slice(),
-                    path.as_path(),
-                )
-            })
-            .collect();
-
-        let results = run_all_tests(test_refs, &config).unwrap();
+        let results = run_all_tests(test_refs(&tf, &path), &config).unwrap();
         assert_eq!(results.len(), 1);
         assert!(!results[0].passed);
         assert!(results[0].timed_out);
@@ -1448,12 +1352,8 @@ mod tests {
         // A helper, a blank line, then a test: every function line must land on
         // the same line number it has in the source, with the gaps blanked.
         let source = "helper() {\n  echo setup\n}\n\ntest_foo() {\n  echo a\n  false\n}\n";
-        let tf = {
-            let tmp = TempDir::new().unwrap();
-            let path = tmp.path().join("t.sh");
-            fs::write(&path, source).unwrap();
-            crate::parser::parse_test_file(&path).unwrap()
-        };
+        let tmp = TempDir::new().unwrap();
+        let (_, tf) = parse_script(tmp.path(), source);
 
         let generated = build_functions_source(&tf.functions, source);
         let gen_lines: Vec<&str> = generated.lines().collect();
