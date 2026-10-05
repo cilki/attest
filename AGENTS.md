@@ -25,8 +25,10 @@
 - `src/overlay.rs` - Per-test whole-root overlayfs isolation. Each test pivots
   into a private copy-on-write view of `/`: writes land in per-test upper
   layers and are discarded on exit. The project mount (the one holding the
-  invocation dir) and the scratch mounts `/tmp`/`/var/tmp` get their own
-  ephemeral overlays; every other mount (`/proc`, `/dev`, `/sys`, file binds
+  invocation dir) and the scratch dirs `/tmp`/`/var/tmp` get their own
+  ephemeral overlays — the scratch dirs whether or not they are mount points,
+  so the host's partitioning cannot decide whether writes to them are
+  discarded; every other mount (`/proc`, `/dev`, `/sys`, file binds
   like `/etc/resolv.conf`, …) is recursively bind-mounted through live and so
   stays shared with the host — writes there persist. Overlays need
   `CAP_SYS_ADMIN`: either directly (`Mode::Privileged`, unshare a mount
