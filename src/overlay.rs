@@ -526,10 +526,57 @@ pub fn probe_support(
         .find(|&mode| probe_mode(scratch_parent, mode, invocation_dir, submounts))
 }
 
+/// Remove `path` when it is a symlink, so creating or copying something at that
+/// name cannot be redirected through it.
+///
+/// Everything copied out of a test's upper layer is attacker-controlled: a test
+/// may create `/stdout.log`, `/cwd` or `/var` as a symlink to any host path,
+/// and once that symlink has been reproduced under the `--save-context`
+/// directory a plain `create_dir_all`/`fs::copy` at the same name would follow
+/// it and write outside the destination tree.
+pub fn unlink_if_symlink(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_symlink() => std::fs::remove_file(path),
+        _ => Ok(()),
+    }
+}
+
+/// Create `base`/`rel` as real directories without following symlinks: a
+/// symlink standing where a component must go is replaced (see
+/// [`unlink_if_symlink`]). `rel` must be relative and contain only plain
+/// components. Returns the created directory.
+pub fn create_dir_nofollow(base: &Path, rel: &Path) -> std::io::Result<PathBuf> {
+    use std::path::Component;
+
+    std::fs::create_dir_all(base)?;
+    let mut path = base.to_path_buf();
+    for component in rel.components() {
+        let Component::Normal(name) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("not a plain relative path: {}", rel.display()),
+            ));
+        };
+        path.push(name);
+        unlink_if_symlink(&path)?;
+        match std::fs::create_dir(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(path)
+}
+
 /// Recursively copy `src` into `dst`, creating `dst` if needed. Regular files,
 /// directories, and symlinks are reproduced; other special files (e.g. overlay
 /// whiteout device nodes for deletions) are skipped.
+///
+/// A symlink already sitting at a destination name is replaced rather than
+/// written through, so a test cannot steer part of its own copied-out delta to
+/// a path outside `dst`.
 pub fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    unlink_if_symlink(dst)?;
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -540,8 +587,10 @@ pub fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
             copy_dir_recursive(&from, &to)?;
         } else if file_type.is_symlink() {
             let target = std::fs::read_link(&from)?;
+            unlink_if_symlink(&to)?;
             std::os::unix::fs::symlink(target, &to)?;
         } else if file_type.is_file() {
+            unlink_if_symlink(&to)?;
             std::fs::copy(&from, &to)?;
         }
     }
@@ -658,6 +707,36 @@ mod tests {
             .find(|s| s.source == Path::new("/etc/resolv.conf"))
             .unwrap();
         assert!(!resolv.is_dir);
+    }
+
+    #[test]
+    fn create_dir_nofollow_replaces_symlinked_components() {
+        let base = tempfile::TempDir::new().unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        // `var` is a symlink out of the tree, as a test's delta may well leave it.
+        std::os::unix::fs::symlink(elsewhere.path(), base.path().join("var")).unwrap();
+
+        let made = create_dir_nofollow(base.path(), Path::new("var/tmp")).unwrap();
+
+        assert_eq!(made, base.path().join("var/tmp"));
+        assert!(made.is_dir());
+        assert!(!elsewhere.path().join("tmp").exists());
+        assert!(
+            !std::fs::symlink_metadata(base.path().join("var"))
+                .unwrap()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn create_dir_nofollow_rejects_non_plain_components() {
+        let base = tempfile::TempDir::new().unwrap();
+        for rel in ["../escape", "/absolute"] {
+            assert!(
+                create_dir_nofollow(base.path(), Path::new(rel)).is_err(),
+                "{rel} should be rejected"
+            );
+        }
     }
 
     #[test]
