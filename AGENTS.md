@@ -12,7 +12,10 @@
   user named directly is
   fatal, while one in a file the directory walk turned up is reported on stderr
   and the file skipped, so an unparseable script elsewhere in the tree cannot
-  abort the run.
+  abort the run. Shell completion is dynamic (`clap_complete`'s `CompleteEnv`,
+  so `COMPLETE=<shell> attest` prints the completion script):
+  `complete_tests` discovers script files and parses them to complete
+  `<file>/<test>` pairs for the target and `--filter`.
 - `src/discovery.rs` - Finds test files from a file path or directory
   (recursive). Scans all shell scripts (by extension or shebang) for test
   functions, not just `.test` files.
@@ -74,7 +77,11 @@
   executed command, maps it back to the original source file, and renders an
   annotate-snippets error snippet. Also shows inline character-level diffs for
   failed `[ A = B ]` assertions.
-- `src/output.rs` - ANSI-colored terminal output for PASS/FAIL and summary.
+- `src/output.rs` - ANSI-colored terminal output for PASS/FAIL and summary, plus
+  the `--json` JSONL encoder (`print_test_result_json`): one object per test with
+  `name`, `file`, `status` (`pass`/`fail`/`timeout`), `duration_ms`, `stdout`,
+  `xtrace`, `strace` and `resources`. The schema is documented in the README, so
+  keep both in step when changing it.
   Test names and discovered file names go into a report line through
   `escape_label`, which spells their control characters `\xNN`: both are
   arbitrary bytes from the tree (a shell takes almost anything as a function

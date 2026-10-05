@@ -361,6 +361,27 @@ The directories are part of the selector because the file half is only a
 suffix: two files named `x.test` in different directories would otherwise list
 identically, and either line would select both of their tests.
 
+### Shell completion
+
+`attest` completes targets for you: the script files it would discover, and the
+test functions inside them. There's no separate completion file to install —
+the binary prints its own completion script when `COMPLETE` names your shell:
+
+```sh
+# bash (~/.bashrc)
+source <(COMPLETE=bash attest)
+
+# zsh (~/.zshrc, after compinit)
+source <(COMPLETE=zsh attest)
+
+# fish (~/.config/fish/config.fish)
+COMPLETE=fish attest | source
+```
+
+With that in place, `attest examples/md5<TAB>` completes the file name and
+`attest examples/md5sum.test/<TAB>` offers `testHelp`, `testVersion` and
+`testHello`. `--filter` completes the same way.
+
 ### Other options
 
 - `--timeout SECS` — kill a test after this much wall-clock time and report it
@@ -369,6 +390,7 @@ identically, and either line would select both of their tests.
   (see [Stopping a run early](#stopping-a-run-early))
 - `--repeat N` — run each test N times
 - `--json` — print one JSON object per test instead of the colored output
+  (schema below)
 - `--override SPEC` — copy a binary into the test's `bin/` dir so tests resolve
   that name to it. `SPEC` is a path (`/usr/bin/example`) or a mapping
   (`example=/usr/bin/override`)
@@ -419,6 +441,36 @@ so no `trap` inside a test runs on the way out:
 A run also winds down early if whatever was reading its output goes away:
 `attest . | head -1` kills the running tests and dies of `SIGPIPE` like any
 other filter, rather than finishing the suite with nobody left to report to.
+
+### JSON output
+
+`--json` replaces the colored output with JSONL: one object per test, printed
+as each test finishes, so another program can consume the results.
+
+```sh
+attest . --json | jq -c '{name, status, duration_ms}'
+```
+
+Every object carries the same keys:
+
+- `name` — display name of the test, verbatim (the terminal output escapes
+  control characters in it, this does not)
+- `file` — absolute path of the script the test was found in
+- `status` — `pass`, `fail`, or `timeout` (the `--timeout` was exceeded)
+- `duration_ms` — wall-clock time of the test, in milliseconds
+- `stdout` — everything the test wrote to stdout
+- `xtrace` — the test's xtrace log (its stderr, with the traced commands)
+- `strace` — object mapping each `--strace` command to its log, keyed by the
+  command's base name (`--strace /usr/bin/curl` appears as `curl`); `{}`
+  without `--strace`
+- `resources` — cgroup usage, or `null` when it isn't available
+
+When present, `resources` holds whichever of `cpu_user_usec`,
+`cpu_system_usec`, `memory_peak`, `io_read_bytes`, `io_write_bytes` and
+`pids_peak` the cgroup reported — the same numbers as the resource usage line
+described below, in microseconds and bytes.
+
+The exit status is unchanged by `--json`: 1 if any test failed, 0 otherwise.
 
 ### Containerized tests
 
