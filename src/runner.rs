@@ -318,13 +318,15 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
         std::fs::create_dir_all(save_dir)?;
     }
 
-    let spawn = |(display_name, fn_name, all_functions, source_path): TestSpec| {
+    let mut context_names = std::collections::HashSet::new();
+    let mut spawn = |(display_name, fn_name, all_functions, source_path): TestSpec| {
+        let dir = context_dir_name(display_name, &mut context_names);
         spawn_test(
             display_name,
             fn_name,
             all_functions,
             source_path,
-            contexts_dir.join(display_name),
+            contexts_dir.join(dir),
             config,
             &env,
         )
@@ -474,6 +476,46 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
     }
 
     Ok(results)
+}
+
+/// Derive the name of a test's context directory from its display name,
+/// keeping it a single path component that is unique within the run.
+///
+/// Test names come from shell function definitions and shells accept almost
+/// anything there, `/` and `..` included (`test_x/../../../etc() { … }` parses
+/// and runs fine under sh and bash). Joining such a name onto the run's temp
+/// dir escapes it, and the escape is not contained by test isolation: the
+/// parent process creates the context dir, writes the generated script and
+/// logs into it, and `remove_dir_all`s it on drop, all outside any overlay and
+/// with the invoking user's privileges. `--save-context` would likewise copy
+/// the test's files outside the directory that was asked for.
+///
+/// So the display name is kept verbatim for output and the directory name is
+/// derived from it, the same way the per-test cgroup name is (see
+/// [`crate::cgroup::TestCgroup::try_create`]). Only separators are replaced —
+/// everything else (`:` for file-qualified names, `#` for `--repeat`) is
+/// harmless in a path component and worth keeping legible. Distinct names that
+/// collapse to the same directory name get a numeric suffix, since contexts
+/// must never be shared between tests.
+fn context_dir_name(display_name: &str, taken: &mut std::collections::HashSet<String>) -> String {
+    let mut base: String = display_name
+        .chars()
+        .map(|c| if c == '/' || c == '\0' { '_' } else { c })
+        .collect();
+    if base.is_empty() || base == "." || base == ".." {
+        base = format!("_{base}");
+    }
+    if taken.insert(base.clone()) {
+        return base;
+    }
+    let mut k = 2;
+    loop {
+        let candidate = format!("{base}_{k}");
+        if taken.insert(candidate.clone()) {
+            return candidate;
+        }
+        k += 1;
+    }
 }
 
 /// Whether `shell` names something we can exec: an existing path when it
@@ -736,10 +778,19 @@ fn dir_non_empty(dir: &Path) -> bool {
 /// Copy the files a finished test created or modified (the upper layers of its
 /// root overlay and of each ephemeral submount overlay, merged and laid out by
 /// absolute path — a write to `/tmp/x` lands at `<dst>/tmp/x`) plus its logs
-/// into `<save_dir>/<test name>` for `--save-context`. The temp context dir is
+/// into `<save_dir>/<context dir name>` for `--save-context`. The temp context dir is
 /// otherwise discarded when the run's tempdir is dropped.
 fn save_test_context(result: &TestResult, save_dir: &Path, submounts: &[overlay::Submount]) {
-    let dst = save_dir.join(&result.name);
+    // Named after the context dir rather than the test: that name is already a
+    // single safe component (see context_dir_name), so a test whose function
+    // name contains `/` cannot steer the copy outside save_dir.
+    let Some(dst) = result.context.file_name().map(|n| save_dir.join(n)) else {
+        warn!(
+            "failed to save context for {}: unnamed context dir",
+            result.name
+        );
+        return;
+    };
     let upper = overlay::upper_dir(&result.context);
     if upper.is_dir() {
         if let Err(e) = overlay::copy_dir_recursive(&upper, &dst) {
@@ -1010,6 +1061,93 @@ mod tests {
     }
 
     #[test]
+    fn context_dir_name_flattens_separators_and_stays_unique() {
+        let mut taken = std::collections::HashSet::new();
+        // Ordinary names (including the `:` and `#` forms main.rs produces)
+        // are kept verbatim.
+        assert_eq!(context_dir_name("test_foo", &mut taken), "test_foo");
+        assert_eq!(
+            context_dir_name("a.test:test_foo#2", &mut taken),
+            "a.test:test_foo#2"
+        );
+        // Separators are replaced, so the result is always one component.
+        assert_eq!(
+            context_dir_name("test_x/../../etc", &mut taken),
+            "test_x_.._.._etc"
+        );
+        assert_eq!(context_dir_name("/etc/passwd", &mut taken), "_etc_passwd");
+        // Names that collapse onto each other still get their own dir.
+        assert_eq!(context_dir_name("test_a/b", &mut taken), "test_a_b");
+        assert_eq!(context_dir_name("test_a_b", &mut taken), "test_a_b_2");
+        // Pure traversal components never survive as-is.
+        assert_eq!(context_dir_name("..", &mut taken), "_..");
+        assert_eq!(context_dir_name("", &mut taken), "_");
+    }
+
+    #[test]
+    fn context_dir_name_never_escapes_its_parent() {
+        let mut taken = std::collections::HashSet::new();
+        let parent = Path::new("/run/attest-tmp");
+        for name in ["test_x/../../../tmp/pwned", "../../etc", "/etc", "."] {
+            let dir = parent.join(context_dir_name(name, &mut taken));
+            assert_eq!(dir.parent(), Some(parent), "{name} escaped to {dir:?}");
+        }
+    }
+
+    /// A test function name containing `/` must not make the runner create,
+    /// write to or delete anything outside the run's temp dir, nor make
+    /// `--save-context` write outside the directory it was given.
+    #[test]
+    fn traversing_test_name_cannot_escape_the_save_dir() {
+        let tmp = TempDir::new().unwrap();
+        let (path, tf) = parse_script(tmp.path(), "test_escape() {\n  echo hi > marker\n}\n");
+
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("precious"), "keep me").unwrap();
+
+        let save_dir = tmp.path().join("save/inner");
+        let display = "test_escape/../../../outside";
+        let config = RunConfig {
+            parallel: 1,
+            save_context: Some(save_dir.clone()),
+            ..RunConfig::default()
+        };
+
+        let results = run_all_tests(
+            vec![(display, "test_escape", tf.functions.as_slice(), &*path)],
+            &config,
+        )
+        .unwrap();
+        assert!(results[0].passed);
+        // The display name is untouched; only the directory derived from it is.
+        assert_eq!(results[0].name, display);
+
+        // Nothing was written through the traversal, and nothing was removed.
+        assert_eq!(
+            fs::read_to_string(outside.join("precious")).unwrap(),
+            "keep me"
+        );
+        let leaked: Vec<_> = fs::read_dir(&outside)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            leaked.len(),
+            1,
+            "run leaked files outside its dirs: {leaked:?}"
+        );
+
+        // The saved context landed in one directory directly under save_dir.
+        let saved: Vec<PathBuf> = fs::read_dir(&save_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(saved.len(), 1, "unexpected save dir contents: {saved:?}");
+        assert!(saved[0].join("stdout.log").exists());
+    }
+
+    #[test]
     fn shell_exists_detects_real_and_missing_shells() {
         // Absolute path that exists vs. one that doesn't.
         assert!(shell_exists("/bin/sh"));
@@ -1252,17 +1390,20 @@ mod tests {
         // --strace writes its logs into the context dir, which is a temp dir
         // discarded at exit: --save-context is the only way to read them, so it
         // must copy them out alongside the other logs.
-        let ctx = TempDir::new().unwrap();
-        fs::create_dir_all(ctx.path().join("strace")).unwrap();
-        fs::write(ctx.path().join("strace/ls.log"), "execve(\"/bin/ls\")\n").unwrap();
-        fs::write(ctx.path().join("xtrace.log"), "+1: ls\n").unwrap();
+        let contexts = TempDir::new().unwrap();
+        // Contexts are named after the test (sanitized; see context_dir_name)
+        // and save_test_context reuses that name under the save dir.
+        let ctx = contexts.path().join("test_traced");
+        fs::create_dir_all(ctx.join("strace")).unwrap();
+        fs::write(ctx.join("strace/ls.log"), "execve(\"/bin/ls\")\n").unwrap();
+        fs::write(ctx.join("xtrace.log"), "+1: ls\n").unwrap();
 
         let result = TestResult {
             name: "test_traced".to_string(),
             passed: true,
             timed_out: false,
             duration: Duration::from_millis(1),
-            context: ctx.path().to_path_buf(),
+            context: ctx,
             source_path: PathBuf::from("t.sh"),
             #[cfg(feature = "cgroup")]
             resources: None,
