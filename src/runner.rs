@@ -128,6 +128,10 @@ pub struct TestResult {
 /// waited on. Dropping this kills the child (if still running) and cleans up.
 struct PendingTest {
     child: Child,
+    /// Set once the child has been waited on. The kernel is free to hand its
+    /// pid to a new process from that moment, so nothing may be signalled
+    /// through it any more — see [`PendingTest::kill_tree`].
+    reaped: bool,
     /// Set to `true` when the child was killed due to exceeding `--timeout`.
     timed_out: bool,
     name: String,
@@ -143,21 +147,79 @@ impl PendingTest {
     /// Kill the test's entire process tree: the child was made a session (and
     /// process-group) leader at spawn, so its pgid is its pid. The cgroup, when
     /// present, also catches processes that re-`setsid`'d themselves.
+    ///
+    /// Both of those are only meaningful while the child is unreaped: once it
+    /// has been waited on the kernel may hand its pid — and therefore this
+    /// pgid — to an unrelated process, and `kill(-pgid)` would SIGKILL
+    /// somebody else's process group. So pid-based signalling stops at that
+    /// point and only `cgroup.kill`, which is keyed to a directory and can
+    /// never be misdirected, still runs. (`Child::kill` is no help as a guard:
+    /// it quietly succeeds on an already-waited-for child.)
     fn kill_tree(&mut self) {
         #[cfg(feature = "cgroup")]
         if let Some(ref cg) = self.cgroup {
             cg.kill_all();
         }
+        if self.reaped {
+            return;
+        }
         unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) };
         let _ = self.child.kill();
+    }
+
+    /// Has the child exited? `waitid` with `WNOWAIT` answers that without
+    /// consuming the zombie, so [`Child::try_wait`] can still reap it and the
+    /// pid — and the pgid derived from it — stays reserved for as long as
+    /// [`Self::reap`] needs to signal the group.
+    fn has_exited(&self) -> std::io::Result<bool> {
+        // Zeroed up front because `waitid` leaves the struct untouched when
+        // `WNOHANG` finds nothing, and `si_pid == 0` is how that is reported.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let ret = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.child.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if ret == -1 {
+            let err = std::io::Error::last_os_error();
+            // A signal cut the call short; the next poll pass asks again.
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                return Ok(false);
+            }
+            return Err(err);
+        }
+        Ok(unsafe { info.si_pid() } != 0)
+    }
+
+    /// Reap the child if it has exited, killing its process tree first.
+    /// `None` while it is still running.
+    ///
+    /// The order matters: the test's pgid is the child's pid, and that number
+    /// stays reserved only until the child is reaped. Killing the group first
+    /// and consuming the zombie second is what makes `kill(-pgid)` provably
+    /// land on this test and nothing else.
+    fn reap(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        if !self.reaped {
+            if !self.has_exited()? {
+                return Ok(None);
+            }
+            // Background processes the test left behind outlive the shell;
+            // tests are promised they never have to clean those up themselves.
+            self.kill_tree();
+            self.reaped = true;
+        }
+        self.child.try_wait()
     }
 }
 
 impl Drop for PendingTest {
     fn drop(&mut self) {
-        // Always kill the tree: even when the main shell exited normally,
-        // background processes it spawned survive in its session/cgroup, and
-        // tests are promised they never need to clean those up themselves.
+        // Kill the tree in case the test was abandoned before being reaped
+        // (--bail, a timeout, ^C). A test that went through `reap` was already
+        // torn down there, and `kill_tree` is a no-op once that has happened.
         self.kill_tree();
         let _ = self.child.wait();
         if let Some(ref dir) = self.context {
@@ -383,10 +445,10 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
         // Non-blocking reap: check all pending children.
         let mut reaped: Vec<(usize, ExitStatus)> = Vec::new();
         for (i, pending) in pending_list.iter_mut().enumerate() {
-            match pending.child.try_wait() {
+            match pending.reap() {
                 Ok(Some(status)) => reaped.push((i, status)),
                 Ok(None) => {} // still running
-                Err(e) => return Err(anyhow!("try_wait failed: {e}")),
+                Err(e) => return Err(anyhow!("reaping test child failed: {e}")),
             }
         }
 
@@ -735,6 +797,7 @@ fn spawn_test(
 
     Ok(PendingTest {
         child,
+        reaped: false,
         timed_out: false,
         name: display_name.to_string(),
         start,
@@ -1016,6 +1079,17 @@ mod tests {
         (path, tf)
     }
 
+    /// Block until `pending` finishes, reaping it exactly the way the poll
+    /// loop in `run_all_tests` does so tests exercise that path.
+    fn reap_blocking(pending: &mut PendingTest) -> ExitStatus {
+        loop {
+            if let Some(status) = pending.reap().expect("reap failed") {
+                return status;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// Spawn `test_name` out of `script` (written under `srcdir`) and block
     /// until it finishes.
     fn run_script(
@@ -1029,7 +1103,7 @@ mod tests {
         let ctx = TempDir::new().unwrap().keep();
         let mut pending =
             spawn_test(test_name, test_name, &tf.functions, &path, ctx, config, env).unwrap();
-        let status = pending.child.wait().expect("wait failed");
+        let status = reap_blocking(&mut pending);
         build_result(pending, status)
     }
 
@@ -1203,17 +1277,69 @@ mod tests {
             .trim()
             .parse()
             .unwrap();
-        // The straggler must be dead shortly after the test completes. It may
-        // linger as a zombie when nothing reaps reparented children (e.g. in
-        // minimal containers), which still counts as killed.
-        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        // The straggler must be dead shortly after the test completes.
+        assert!(await_death(pid, 5), "background process survived the test");
+    }
+
+    /// Wait (up to `secs`) for `pid` to stop being a live process. A reparented
+    /// straggler may linger as a zombie when nothing reaps it (e.g. in minimal
+    /// containers), which still counts as killed.
+    fn await_death(pid: u32, secs: u64) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(secs);
         loop {
             match process_state(pid) {
-                None | Some('Z') => break,
-                _ if Instant::now() > deadline => panic!("background process survived the test"),
-                _ => std::thread::sleep(std::time::Duration::from_millis(20)),
+                None | Some('Z') => return true,
+                _ if Instant::now() > deadline => return false,
+                _ => std::thread::sleep(Duration::from_millis(20)),
             }
         }
+    }
+
+    #[test]
+    fn test_tree_is_killed_before_the_child_is_reaped() {
+        // `kill(-pgid)` is only meaningful while the group leader is unreaped:
+        // the leader is the test's child, its pid *is* the pgid, and reaping it
+        // releases that number for the kernel to hand to anybody. So the tree
+        // has to be killed before the reap, not after — otherwise attest
+        // SIGKILLs whichever unrelated process group inherited the number.
+        //
+        // The observable consequence of the right order: by the time `reap`
+        // hands back an exit status, the straggler is already gone. Reaping
+        // first leaves it running until the context is dropped.
+        let tmp = TempDir::new().unwrap();
+        let (path, tf) = parse_script(
+            tmp.path(),
+            "test_bg() {\n  sleep 300 &\n  echo $! > pid\n}\n",
+        );
+        let ctx = TempDir::new().unwrap().keep();
+        let config = RunConfig::default();
+        let mut pending = spawn_test(
+            "test_bg",
+            "test_bg",
+            &tf.functions,
+            &path,
+            ctx,
+            &config,
+            &no_overlay_env(tmp.path()),
+        )
+        .unwrap();
+
+        let status = reap_blocking(&mut pending);
+        assert!(status.success());
+
+        let context = pending.context.clone().unwrap();
+        let pid: u32 = fs::read_to_string(cwd_dir(&context).join("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // `pending` is deliberately still alive, so nothing but the pre-reap
+        // kill can account for the straggler being dead.
+        assert!(
+            await_death(pid, 5),
+            "background process outlived the reap: the tree was killed too late"
+        );
+        drop(pending);
     }
 
     #[test]
