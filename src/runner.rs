@@ -843,6 +843,11 @@ fn dir_non_empty(dir: &Path) -> bool {
 /// absolute path — a write to `/tmp/x` lands at `<dst>/tmp/x`) plus its logs
 /// into `<save_dir>/<context dir name>` for `--save-context`. The temp context dir is
 /// otherwise discarded when the run's tempdir is dropped.
+///
+/// A delta is whatever the test chose to write, symlinks included, so every
+/// write made here stays inside `save_dir` by construction: names reproduced
+/// from the delta are never followed as symlinks when something else has to be
+/// written at (or under) them.
 fn save_test_context(result: &TestResult, save_dir: &Path, submounts: &[overlay::Submount]) {
     // Named after the context dir rather than the test: that name is already a
     // single safe component (see context_dir_name), so a test whose function
@@ -869,7 +874,13 @@ fn save_test_context(result: &TestResult, save_dir: &Path, submounts: &[overlay:
             continue;
         }
         let rel = sm.source.strip_prefix("/").unwrap_or(&sm.source);
-        if let Err(e) = overlay::copy_dir_recursive(&sub_upper, &dst.join(rel)) {
+        // `rel` is laid out inside the tree just filled from the root upper
+        // layer, so any of its leading components may be a symlink the test
+        // planted (e.g. `/var` replaced by a link to the user's home): create
+        // them explicitly instead of letting `create_dir_all` follow one.
+        let saved = overlay::create_dir_nofollow(&dst, rel)
+            .and_then(|sub_dst| overlay::copy_dir_recursive(&sub_upper, &sub_dst));
+        if let Err(e) = saved {
             warn!(
                 "failed to save {} delta for {}: {e}",
                 sm.source.display(),
@@ -897,7 +908,12 @@ fn save_test_context(result: &TestResult, save_dir: &Path, submounts: &[overlay:
     for log in ["stdout.log", "xtrace.log"] {
         let src = result.context.join(log);
         if src.exists() {
-            let _ = std::fs::copy(&src, dst.join(log));
+            // A test that created `/stdout.log` as a symlink has had it copied
+            // here verbatim; writing the real log through it would land on
+            // whatever host path it names.
+            let to = dst.join(log);
+            let _ = overlay::unlink_if_symlink(&to);
+            let _ = std::fs::copy(&src, to);
         }
     }
 }
@@ -1544,6 +1560,85 @@ mod tests {
             "execve(\"/bin/ls\")\n"
         );
         assert!(saved.join("xtrace.log").exists());
+    }
+
+    #[test]
+    fn save_context_never_writes_through_symlinks_from_the_delta() {
+        // A test may create symlinks anywhere in its ephemeral root; they land
+        // in its upper layer and --save-context copies them out verbatim. The
+        // rest of the save (logs, cwd, submount deltas) must not then be written
+        // *through* those symlinks, or a test could overwrite any file the user
+        // running attest can write — straight out of its sandbox.
+        let outside = TempDir::new().unwrap();
+        let victim_file = outside.path().join("victim.txt");
+        fs::write(&victim_file, "original").unwrap();
+        let victim_dir = outside.path().join("victim_dir");
+        fs::create_dir(&victim_dir).unwrap();
+
+        let contexts = TempDir::new().unwrap();
+        let ctx = contexts.path().join("test_evil");
+        let upper = overlay::upper_dir(&ctx);
+        fs::create_dir_all(&upper).unwrap();
+        // The delta of a test that ran `ln -s <host path> /stdout.log` etc.
+        std::os::unix::fs::symlink(&victim_file, upper.join("stdout.log")).unwrap();
+        std::os::unix::fs::symlink(&victim_dir, upper.join("cwd")).unwrap();
+        std::os::unix::fs::symlink(&victim_dir, upper.join("var")).unwrap();
+
+        // The real log, working directory and /var/tmp submount delta, each of
+        // which is saved at a name the delta has already claimed.
+        fs::write(ctx.join("stdout.log"), "attacker controlled").unwrap();
+        fs::create_dir_all(cwd_dir(&ctx)).unwrap();
+        fs::write(cwd_dir(&ctx).join("artifact"), "cwd artifact").unwrap();
+        let sub_upper = overlay::submount_upper_dir(&ctx, 0);
+        fs::create_dir_all(&sub_upper).unwrap();
+        fs::write(sub_upper.join("scratch"), "submount artifact").unwrap();
+
+        let result = TestResult {
+            name: "test_evil".to_string(),
+            passed: true,
+            timed_out: false,
+            duration: Duration::from_millis(1),
+            context: ctx,
+            source_path: PathBuf::from("t.sh"),
+            #[cfg(feature = "cgroup")]
+            resources: None,
+        };
+        let submounts = [overlay::Submount {
+            source: PathBuf::from("/var/tmp"),
+            is_dir: true,
+            ephemeral: true,
+        }];
+
+        let save = TempDir::new().unwrap();
+        save_test_context(&result, save.path(), &submounts);
+
+        // Nothing escaped the save dir.
+        assert_eq!(fs::read_to_string(&victim_file).unwrap(), "original");
+        assert_eq!(
+            fs::read_dir(&victim_dir).unwrap().count(),
+            0,
+            "files were written outside the save dir"
+        );
+
+        // ...and everything still landed inside it, as real files.
+        let saved = save.path().join("test_evil");
+        assert_eq!(
+            fs::read_to_string(saved.join("stdout.log")).unwrap(),
+            "attacker controlled"
+        );
+        assert!(
+            !fs::symlink_metadata(saved.join("stdout.log"))
+                .unwrap()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(saved.join("cwd/artifact")).unwrap(),
+            "cwd artifact"
+        );
+        assert_eq!(
+            fs::read_to_string(saved.join("var/tmp/scratch")).unwrap(),
+            "submount artifact"
+        );
     }
 
     #[test]
