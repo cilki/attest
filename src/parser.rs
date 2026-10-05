@@ -107,18 +107,22 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
     remaining.ends_with(segments[segments.len() - 1])
 }
 
+/// Parse shell source and return every function definition it contains, in
+/// source order.
+pub(crate) fn parse_functions(source: &str) -> anyhow::Result<Vec<FunctionDefinition>> {
+    let reader = BufReader::new(source.as_bytes());
+    let options = ParserOptions::default();
+    let mut parser = Parser::new(reader, &options);
+    let program = parser.parse_program().map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(extract_functions(&program))
+}
+
 pub fn parse_test_file(path: &Path) -> anyhow::Result<TestFile> {
     let contents =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
-    let reader = BufReader::new(contents.as_bytes());
-    let options = ParserOptions::default();
-    let mut parser = Parser::new(reader, &options);
-    let program = parser
-        .parse_program()
+    let functions = parse_functions(&contents)
         .map_err(|e| anyhow::anyhow!("parse error in {}: {e}", path.display()))?;
-
-    let functions = extract_functions(&program);
 
     // A shell function defined more than once in the same file is shadowed:
     // when the runner sources the file and calls the name, only the last
@@ -149,7 +153,7 @@ pub fn parse_test_file(path: &Path) -> anyhow::Result<TestFile> {
     Ok(TestFile { tests, functions })
 }
 
-pub(crate) fn extract_functions(program: &Program) -> Vec<FunctionDefinition> {
+fn extract_functions(program: &Program) -> Vec<FunctionDefinition> {
     let mut functions = Vec::new();
     for complete_command in &program.complete_commands {
         extract_from_compound_list(complete_command, &mut functions);

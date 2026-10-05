@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use brush_parser::ast::SourceLocation;
+
 use crate::output::{GREEN, RED, RESET};
 use crate::runner::TestResult;
 
@@ -50,7 +52,7 @@ pub fn print_failure_snippet(result: &TestResult) {
     // Clamp the rendered context to the enclosing function so a snippet never
     // leaks into an adjacent test.
     let (func_start_line, func_end_line) =
-        enclosing_function_bounds(&lines, line_idx).unwrap_or((line_idx, line_idx));
+        enclosing_function_bounds(&source, line_idx).unwrap_or((line_idx, line_idx));
 
     render_snippet(
         title,
@@ -96,57 +98,25 @@ fn parse_xtrace_failure(tmp_dir: &Path) -> Option<FailureInfo> {
 
 /// 0-based line range `(start, end)` of the function definition enclosing
 /// `target_line` (0-based), or `None` if the line is not inside a function.
-/// Used to clamp the rendered context window. Brace counting is naive (it does
-/// not account for braces in strings or `${...}`), matching how the rest of the
-/// tool scans shell source.
-fn enclosing_function_bounds(lines: &[&str], target_line: usize) -> Option<(usize, usize)> {
-    let mut i = 0;
-    while i < lines.len() {
-        if !is_function_header(lines[i].trim()) {
-            i += 1;
-            continue;
-        }
-
-        let start = i;
-        let mut depth: i32 = 0;
-        let mut opened = false;
-        let mut j = i;
-        loop {
-            let trimmed = lines[j].trim();
-            depth += trimmed.matches('{').count() as i32;
-            depth -= trimmed.matches('}').count() as i32;
-            if depth > 0 {
-                opened = true;
-            }
-            if opened && depth <= 0 {
-                break;
-            }
-            if j + 1 >= lines.len() {
-                break;
-            }
-            j += 1;
-        }
-
-        if (start..=j).contains(&target_line) {
-            return Some((start, j));
-        }
-        i = j + 1;
-    }
-    None
-}
-
-/// Whether a trimmed source line opens a shell function definition
-/// (`name()`, `name ()`, or `function name`).
-fn is_function_header(trimmed: &str) -> bool {
-    if let Some(rest) = trimmed.strip_prefix("function ") {
-        return rest
-            .trim_start()
-            .starts_with(|c: char| c.is_alphanumeric() || c == '_');
-    }
-    let name_len = trimmed
-        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .unwrap_or(0);
-    name_len > 0 && trimmed[name_len..].trim_start().starts_with('(')
+/// Used to clamp the rendered context window.
+///
+/// The bounds come from the same shell parser the runner uses to extract test
+/// functions, so quoting, `${...}`, comments and heredocs are all accounted for
+/// — a brace-counting scan over the raw lines would miscount any of them and
+/// clamp the window to the wrong range.
+fn enclosing_function_bounds(source: &str, target_line: usize) -> Option<(usize, usize)> {
+    let functions = crate::parser::parse_functions(source).ok()?;
+    functions
+        .iter()
+        .filter_map(|f| f.location())
+        // Spans are 1-based and inclusive of the closing brace's line.
+        .map(|span| {
+            (
+                span.start.line.saturating_sub(1),
+                span.end.line.saturating_sub(1),
+            )
+        })
+        .find(|&(start, end)| (start..=end).contains(&target_line))
 }
 
 /// How many lines of context to show on each side of the annotated line.
@@ -536,34 +506,40 @@ mod tests {
     }
 
     #[test]
-    fn is_function_header_recognizes_forms() {
-        assert!(is_function_header("test_foo() {"));
-        assert!(is_function_header("test_foo () {"));
-        assert!(is_function_header("function test_foo {"));
-        assert!(is_function_header("function test_foo() {"));
-        assert!(!is_function_header("echo hello"));
-        assert!(!is_function_header("[ 1 = 2 ]"));
-        assert!(!is_function_header("(subshell)"));
-    }
-
-    #[test]
     fn enclosing_bounds_finds_containing_function() {
-        // 0-based lines:            0            1              2   3  4              5            6   7
-        let lines: Vec<&str> =
-            "helper() {\n  echo setup\n}\n\ntest_foo() {\n  echo hello\n  false\n}\n"
-                .lines()
-                .collect();
+        // 0-based lines: 0            1              2   3  4              5            6       7
+        let source = "helper() {\n  echo setup\n}\n\ntest_foo() {\n  echo hello\n  false\n}\n";
         // Line 6 (`false`) is inside test_foo (lines 4..=7).
-        assert_eq!(enclosing_function_bounds(&lines, 6), Some((4, 7)));
+        assert_eq!(enclosing_function_bounds(source, 6), Some((4, 7)));
         // Line 1 (`echo setup`) is inside helper (lines 0..=2).
-        assert_eq!(enclosing_function_bounds(&lines, 1), Some((0, 2)));
+        assert_eq!(enclosing_function_bounds(source, 1), Some((0, 2)));
         // Line 3 (the blank separator) is inside no function.
-        assert_eq!(enclosing_function_bounds(&lines, 3), None);
+        assert_eq!(enclosing_function_bounds(source, 3), None);
     }
 
     #[test]
     fn enclosing_bounds_handles_brace_on_next_line() {
-        let lines: Vec<&str> = "test_foo ()\n{\n  false\n}\n".lines().collect();
-        assert_eq!(enclosing_function_bounds(&lines, 2), Some((0, 3)));
+        assert_eq!(
+            enclosing_function_bounds("test_foo ()\n{\n  false\n}\n", 2),
+            Some((0, 3))
+        );
+    }
+
+    #[test]
+    fn enclosing_bounds_ignores_braces_inside_words() {
+        // Braces that are part of a string, a parameter expansion or a comment
+        // are not block delimiters; a line-by-line brace count would close the
+        // function early and lose the context window around the failing line.
+        let source = "test_foo() {\n  echo \"}\"\n  echo \"${x}\"\n  # }\n  false\n}\n";
+        assert_eq!(enclosing_function_bounds(source, 4), Some((0, 5)));
+    }
+
+    #[test]
+    fn enclosing_bounds_ignores_non_function_blocks() {
+        // A subshell or a brace group at top level is not a function, so a
+        // failure inside one gets no function clamp.
+        let source = "(\n  false\n)\n\ntest_foo() {\n  false\n}\n";
+        assert_eq!(enclosing_function_bounds(source, 1), None);
+        assert_eq!(enclosing_function_bounds(source, 5), Some((4, 6)));
     }
 }
