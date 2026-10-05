@@ -71,20 +71,43 @@ fn cstr(path: &Path) -> anyhow::Result<CString> {
         .map_err(|_| anyhow!("path contains NUL: {}", path.display()))
 }
 
+/// Append a path to an overlay option value, escaping the characters the kernel
+/// treats as syntax: `,` ends an option, `:` separates lower layers, and `\`
+/// starts an escape. overlayfs unescapes the value before resolving it, so a
+/// backslash-escaped path round-trips exactly.
+///
+/// Without this, any `,` in the path (attest's context dirs carry test and
+/// file names; the lower dir is a mount point read from mountinfo) would be
+/// read as the end of the option — at best failing the mount, at worst letting
+/// a crafted test name inject its own `upperdir=`/`workdir=`. Those resolve
+/// relative to the invocation dir, which would send a test's writes to the
+/// host while attest still reported it as isolated.
+fn push_escaped(out: &mut Vec<u8>, path: &Path) {
+    for &byte in path.as_os_str().as_bytes() {
+        if matches!(byte, b'\\' | b',' | b':') {
+            out.push(b'\\');
+        }
+        out.push(byte);
+    }
+}
+
 /// Build the overlay mount option string, adding `userxattr` for unprivileged
-/// mounts (a user namespace cannot set `trusted.*` xattrs).
+/// mounts (a user namespace cannot set `trusted.*` xattrs). Assembled as bytes
+/// rather than via `Display`, so paths that are not valid UTF-8 keep their
+/// exact bytes instead of being mangled into U+FFFD.
 fn overlay_opts(lower: &Path, upper: &Path, work: &Path, mode: Mode) -> anyhow::Result<CString> {
-    let userxattr = if mode == Mode::Userns {
-        ",userxattr"
-    } else {
-        ""
-    };
-    let opts = format!(
-        "lowerdir={},upperdir={},workdir={}{userxattr}",
-        lower.display(),
-        upper.display(),
-        work.display()
-    );
+    let mut opts = Vec::new();
+    for (key, path) in [
+        (&b"lowerdir="[..], lower),
+        (b",upperdir=", upper),
+        (b",workdir=", work),
+    ] {
+        opts.extend_from_slice(key);
+        push_escaped(&mut opts, path);
+    }
+    if mode == Mode::Userns {
+        opts.extend_from_slice(b",userxattr");
+    }
     CString::new(opts).map_err(|_| anyhow!("overlay options contain NUL"))
 }
 
@@ -551,6 +574,162 @@ pub fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Split an option string the way the kernel's `ovl_next_opt` does: on
+    /// commas that are not preceded by a backslash.
+    fn kernel_split(opts: &CStr, sep: u8) -> Vec<Vec<u8>> {
+        let bytes = opts.to_bytes();
+        let mut out = vec![Vec::new()];
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                out.last_mut().unwrap().extend_from_slice(&bytes[i..i + 2]);
+                i += 2;
+            } else if bytes[i] == sep {
+                out.push(Vec::new());
+                i += 1;
+            } else {
+                out.last_mut().unwrap().push(bytes[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// Drop escapes the way the kernel's `ovl_unescape` does: every backslash
+    /// is removed and the byte after it taken literally.
+    fn kernel_unescape(token: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(token.len());
+        let mut i = 0;
+        while i < token.len() {
+            if token[i] == b'\\' {
+                i += 1;
+            }
+            if i < token.len() {
+                out.push(token[i]);
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// The `<key>=<value>` options the kernel would see, keyed by name.
+    fn kernel_opts(opts: &CStr) -> Vec<(Vec<u8>, Vec<u8>)> {
+        kernel_split(opts, b',')
+            .into_iter()
+            .map(|tok| match tok.iter().position(|&b| b == b'=') {
+                Some(eq) => (tok[..eq].to_vec(), tok[eq + 1..].to_vec()),
+                None => (tok, Vec::new()),
+            })
+            .collect()
+    }
+
+    fn opt_value<'a>(opts: &'a [(Vec<u8>, Vec<u8>)], key: &str) -> Vec<&'a [u8]> {
+        opts.iter()
+            .filter(|(k, _)| k == key.as_bytes())
+            .map(|(_, v)| v.as_slice())
+            .collect()
+    }
+
+    #[test]
+    fn opts_escape_the_kernels_separators() {
+        // A comma would end the option, a colon would start another lower
+        // layer, and a backslash would escape the next byte: each must survive
+        // as part of the path.
+        let opts = overlay_opts(
+            Path::new("/mnt/a,b"),
+            Path::new("/ctx/x:y/upper"),
+            Path::new("/ctx/back\\slash/work"),
+            Mode::Privileged,
+        )
+        .unwrap();
+
+        let parsed = kernel_opts(&opts);
+        let lower = opt_value(&parsed, "lowerdir");
+        assert_eq!(lower.len(), 1, "lowerdir given more than once in {opts:?}");
+        // The lower dir must still be a single layer after the kernel splits
+        // it on unescaped colons.
+        let layers = kernel_split(&CString::new(lower[0]).unwrap(), b':');
+        assert_eq!(
+            layers.len(),
+            1,
+            "lowerdir split into {} layers",
+            layers.len()
+        );
+        assert_eq!(kernel_unescape(lower[0]), b"/mnt/a,b");
+        assert_eq!(
+            kernel_unescape(opt_value(&parsed, "upperdir")[0]),
+            b"/ctx/x:y/upper"
+        );
+        assert_eq!(
+            kernel_unescape(opt_value(&parsed, "workdir")[0]),
+            b"/ctx/back\\slash/work"
+        );
+    }
+
+    #[test]
+    fn opts_keep_non_utf8_path_bytes_intact() {
+        // Mount points come from mountinfo as raw bytes and need not be UTF-8;
+        // going through `Display` would replace them with U+FFFD and mount the
+        // wrong (or no) directory.
+        let lower = PathBuf::from(OsString::from_vec(b"/mnt/\xff\xfe".to_vec()));
+        let opts = overlay_opts(
+            &lower,
+            Path::new("/ctx/upper"),
+            Path::new("/ctx/work"),
+            Mode::Privileged,
+        )
+        .unwrap();
+        let parsed = kernel_opts(&opts);
+        assert_eq!(
+            kernel_unescape(opt_value(&parsed, "lowerdir")[0]),
+            b"/mnt/\xff\xfe"
+        );
+    }
+
+    #[test]
+    fn a_hostile_context_dir_name_cannot_inject_mount_options() {
+        // Context dir names carry test and file names, which only have `/` and
+        // NUL stripped. A name like this one would otherwise close the
+        // `upperdir=` option and add its own: those are resolved relative to
+        // the invocation dir, so the test's writes would land in the project
+        // tree instead of a discarded upper layer.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = tmp.path().join("test_evil,upperdir=up,workdir=wk,volatile");
+        let plan = RootOverlay::build(
+            Mode::Privileged,
+            &context,
+            Path::new("/"),
+            &[Submount {
+                source: PathBuf::from("/tmp"),
+                is_dir: true,
+                ephemeral: true,
+            }],
+        )
+        .unwrap();
+
+        let sub_opts = match &plan.steps[0] {
+            MountStep::Overlay { opts, .. } => opts.clone(),
+            MountStep::Bind { .. } => panic!("/tmp should be an ephemeral overlay"),
+        };
+        for opts in [&plan.root_opts, &sub_opts] {
+            let parsed = kernel_opts(opts);
+            assert_eq!(parsed.len(), 3, "extra options injected into {opts:?}");
+            for (key, expected) in [("upperdir", "upper"), ("workdir", "work")] {
+                let values = opt_value(&parsed, key);
+                assert_eq!(values.len(), 1, "{key} given more than once in {opts:?}");
+                assert!(
+                    Path::new(&OsString::from_vec(kernel_unescape(values[0])))
+                        .starts_with(&context),
+                    "{key} escaped the context dir in {opts:?}"
+                );
+                assert!(
+                    kernel_unescape(values[0]).ends_with(expected.as_bytes()),
+                    "{key} is not the {expected} layer in {opts:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn unescape_handles_known_escapes() {
