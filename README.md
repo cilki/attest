@@ -327,7 +327,8 @@ selection covers before running it.
   (`example=/usr/bin/override`)
 - `--bin-dir DIR` — prepend DIR to each test's PATH, without copying anything
 - `--strace CMD` — run CMD under strace, saving the log to the test's context
-  dir
+  dir. `CMD` is a command name or a path to one; tests that call it by its base
+  name get the traced version
 - `--shebang SHELL` — force one shell for every test, ignoring each file's own
   shebang
 - `--no-overlay` — skip filesystem isolation and run each test directly in the

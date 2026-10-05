@@ -89,9 +89,11 @@ struct Cli {
     #[arg(long)]
     bin_dir: Vec<PathBuf>,
 
-    /// Trace a command with strace. The log is written to the test's context
-    /// dir, so pair this with --save-context to keep it. Can be specified
-    /// multiple times.
+    /// Trace a command with strace. CMD is a command name (`curl`) or a path to
+    /// one (`/usr/bin/curl`); either way tests calling it by its base name get
+    /// the traced version. The log is written to the test's context dir, so
+    /// pair this with --save-context to keep it. Can be specified multiple
+    /// times.
     #[arg(long, value_name = "CMD")]
     strace: Vec<String>,
 

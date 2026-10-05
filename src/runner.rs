@@ -1057,8 +1057,16 @@ fn create_strace_wrappers(working_dir: &Path, commands: &[String]) -> Result<()>
         let real_path =
             which::which(cmd).map_err(|_| anyhow!("--strace: command not found: {cmd}"))?;
 
-        let wrapper = strace_bin.join(cmd);
-        let strace_out = strace_dir.join(format!("{cmd}.log"));
+        // The wrapper is only ever reached by name through PATH, so it is named
+        // after the command's last component. Joining the spec itself would let
+        // `--strace /usr/bin/curl` (or `--strace ../x`) escape the context dir
+        // and overwrite the named binary with the wrapper script — fatal when
+        // attest runs under sudo, as overlay isolation often requires.
+        let name = Path::new(cmd)
+            .file_name()
+            .ok_or_else(|| anyhow!("--strace: not a command: {cmd}"))?;
+        let wrapper = strace_bin.join(name);
+        let strace_out = strace_dir.join(format!("{}.log", name.to_string_lossy()));
         let script = format!(
             "#!/bin/sh\nexec {} -f -o {} {} \"$@\"\n",
             sh_quote(&strace),
@@ -1525,6 +1533,38 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("nonexistent_cmd_xyz"), "got {err}");
+    }
+
+    #[test]
+    fn create_strace_wrappers_keeps_path_specs_inside_the_context() {
+        if which::which("strace").is_err() {
+            return;
+        }
+
+        // A command given as a path must not be written through: the wrapper
+        // belongs in strace_bin/ under the command's base name, and the traced
+        // binary must survive untouched.
+        let outside = TempDir::new().unwrap();
+        let victim = outside.path().join("victim");
+        fs::write(&victim, "#!/bin/sh\necho original\n").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        create_strace_wrappers(tmp.path(), &[victim.display().to_string()]).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "#!/bin/sh\necho original\n",
+            "the traced binary was overwritten with the wrapper"
+        );
+        assert!(!victim.with_extension("log").exists());
+
+        let wrapper = fs::read_to_string(tmp.path().join("strace_bin/victim")).unwrap();
+        assert!(wrapper.contains(&victim.display().to_string()), "{wrapper}");
+        assert!(
+            wrapper.contains(&tmp.path().join("strace/victim.log").display().to_string()),
+            "{wrapper}"
+        );
     }
 
     #[test]
