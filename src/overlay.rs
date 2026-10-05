@@ -10,8 +10,10 @@
 //! overlaying `/` we re-establish them inside the new root:
 //!
 //! * The mount holding the invocation dir (the "project mount") and the
-//!   scratch mounts in [`EPHEMERAL_SCRATCH`] each get their own ephemeral
-//!   overlay, so writes to them are also discarded.
+//!   scratch directories in [`EPHEMERAL_SCRATCH`] each get their own ephemeral
+//!   overlay, so writes to them are also discarded. A scratch directory gets
+//!   one whether or not it is a mount point of its own, as long as nothing
+//!   ephemeral already covers it.
 //! * Every other mount (`/proc`, `/dev`, `/sys`, file binds like
 //!   `/etc/resolv.conf`, …) is recursively bind-mounted through **live**:
 //!   those paths are shared with the host, and writes to them persist.
@@ -49,8 +51,10 @@ pub enum Mode {
     Userns,
 }
 
-/// Scratch mounts that get their own ephemeral overlay (when they are separate
-/// mounts), so the common case of tests writing temp files stays isolated.
+/// Scratch directories that always get an ephemeral overlay, so the common
+/// case of tests writing temp files stays isolated. Whether they are mount
+/// points of their own is an accident of the host's partitioning and must not
+/// change whether writes to them are discarded (see [`plan_submounts`]).
 const EPHEMERAL_SCRATCH: &[&str] = &["/tmp", "/var/tmp"];
 
 /// A mount under `/` to re-establish inside each test's ephemeral root.
@@ -239,23 +243,24 @@ fn mount_of(dir: &Path, mounts: &[PathBuf]) -> PathBuf {
 }
 
 /// Plan how each mount under `/` is re-established inside per-test roots: the
-/// project mount (holding `invocation_dir`) and [`EPHEMERAL_SCRATCH`] mounts
-/// become ephemeral overlays, everything else a live recursive bind. Mounts
-/// already carried by a live ancestor's `MS_REC` bind are dropped; children of
-/// ephemeral mounts are kept (an overlay does not cross into them). Sorted
-/// shallowest-first so parents mount before children.
+/// project mount (holding `invocation_dir`) and the [`EPHEMERAL_SCRATCH`]
+/// directories become ephemeral overlays, everything else a live recursive
+/// bind. Mounts already carried by a live ancestor's `MS_REC` bind are dropped;
+/// children of ephemeral mounts are kept (an overlay does not cross into them).
+/// Sorted shallowest-first so parents mount before children.
 pub fn compute_submounts(invocation_dir: &Path) -> Vec<Submount> {
     plan_submounts(mount_points(), invocation_dir, |p| {
-        std::fs::symlink_metadata(p)
-            .map(|m| m.is_dir())
-            .unwrap_or(true)
+        std::fs::symlink_metadata(p).ok().map(|m| m.is_dir())
     })
 }
 
+/// `kind(p)` reports what `p` is on the host: `None` when it does not exist,
+/// `Some(true)` for a directory, `Some(false)` for anything else (a file bind
+/// like `/etc/resolv.conf`, or a symlink such as `/var/run`).
 fn plan_submounts(
     mounts: Vec<PathBuf>,
     invocation_dir: &Path,
-    is_dir: impl Fn(&Path) -> bool,
+    kind: impl Fn(&Path) -> Option<bool>,
 ) -> Vec<Submount> {
     // mountinfo can list the same mount point twice (a later entry shadowing an
     // earlier one); only the path matters here, so collapse the repeats. Sorted
@@ -266,29 +271,62 @@ fn plan_submounts(
 
     let root = Path::new("/");
     let project = mount_of(invocation_dir, &uniq);
-    let ephemeral_roots: Vec<&Path> = std::iter::once(project.as_path())
-        .chain(EPHEMERAL_SCRATCH.iter().map(Path::new))
-        .filter(|p| *p != root && uniq.iter().any(|m| m == p))
+
+    // Paths that must end up with an ephemeral overlay of their own. The
+    // project mount is one by construction (`mount_of` returns a mount point).
+    let mut ephemeral: Vec<PathBuf> = Vec::new();
+    if project != root {
+        ephemeral.push(project);
+    }
+    for scratch in EPHEMERAL_SCRATCH.iter().map(PathBuf::from) {
+        // Whether a scratch directory happens to be a mount point is a property
+        // of the host's partitioning, not of the test, so it must not decide
+        // whether writes to it are discarded. It is already covered when it sits
+        // on the root filesystem (the root overlay) or inside a mount that is
+        // itself ephemeral; otherwise it is carried by a *live* recursive bind
+        // and needs its own overlay even though it is not a mount point.
+        let holder = mount_of(&scratch, &uniq);
+        if holder == root || ephemeral.contains(&holder) || ephemeral.contains(&scratch) {
+            continue;
+        }
+        // A lower layer has to be a real directory: skip a scratch path that is
+        // absent or a symlink (e.g. `/var/tmp` linked elsewhere), which is then
+        // isolated by whatever covers its target.
+        if kind(&scratch) == Some(true) {
+            ephemeral.push(scratch);
+        }
+    }
+
+    // Everything to re-establish: the host's mounts plus the scratch paths that
+    // are not mount points of their own, parents before children.
+    let mut targets = uniq;
+    let extra: Vec<PathBuf> = ephemeral
+        .iter()
+        .filter(|e| !targets.contains(e))
+        .cloned()
         .collect();
+    targets.extend(extra);
+    targets.sort_by_key(|p| (p.components().count(), p.clone()));
+    targets.dedup();
 
     let mut out: Vec<Submount> = Vec::new();
-    for m in uniq {
+    for m in targets {
         if m == root {
             continue;
         }
-        let ephemeral = ephemeral_roots.contains(&m.as_path());
-        if !ephemeral
+        let is_ephemeral = ephemeral.contains(&m);
+        if !is_ephemeral
             && out
                 .iter()
                 .any(|k| !k.ephemeral && m.starts_with(&k.source) && m != k.source)
         {
             continue; // already carried by a live ancestor's recursive bind
         }
-        let is_dir = ephemeral || is_dir(&m);
+        let is_dir = is_ephemeral || kind(&m).unwrap_or(true);
         out.push(Submount {
             source: m,
             is_dir,
-            ephemeral,
+            ephemeral: is_ephemeral,
         });
     }
     out
@@ -822,18 +860,80 @@ mod tests {
         );
     }
 
+    /// Every path in the plan is a directory that exists.
+    fn all_dirs(_: &Path) -> Option<bool> {
+        Some(true)
+    }
+
     #[test]
     fn plan_marks_project_and_scratch_ephemeral() {
         let mounts = ["/", "/proc", "/tmp", "/workspace"]
             .iter()
             .map(PathBuf::from)
             .collect();
-        let plan = plan_submounts(mounts, Path::new("/workspace/proj"), |_| true);
+        let plan = plan_submounts(mounts, Path::new("/workspace/proj"), all_dirs);
         let get = |p: &str| plan.iter().find(|s| s.source == Path::new(p)).unwrap();
         assert!(!plan.iter().any(|s| s.source == Path::new("/")));
         assert!(!get("/proc").ephemeral);
         assert!(get("/tmp").ephemeral);
         assert!(get("/workspace").ephemeral);
+    }
+
+    #[test]
+    fn plan_isolates_scratch_that_is_not_its_own_mount() {
+        // `/var` is a separate mount but `/var/tmp` is only a directory on it
+        // (a common server layout). `/var` is re-established as a *live* bind,
+        // so without an overlay of its own `/var/tmp` would be shared with the
+        // host and writes to it would persist — the opposite of what attest
+        // promises for scratch directories.
+        let mounts = ["/", "/proc", "/var"].iter().map(PathBuf::from).collect();
+        let plan = plan_submounts(mounts, Path::new("/home/u/proj"), all_dirs);
+        let get = |p: &str| plan.iter().find(|s| s.source == Path::new(p)).unwrap();
+
+        assert!(!get("/var").ephemeral, "/var itself stays live");
+        assert!(get("/var/tmp").ephemeral);
+        assert!(get("/var/tmp").is_dir);
+        // The overlay has to be mounted after the bind that carries its target.
+        let order: Vec<&Path> = plan.iter().map(|s| s.source.as_path()).collect();
+        assert!(
+            order.iter().position(|p| *p == Path::new("/var"))
+                < order.iter().position(|p| *p == Path::new("/var/tmp"))
+        );
+        // `/tmp` sits on the root filesystem here, so the root overlay already
+        // discards writes to it and it needs no entry of its own.
+        assert!(!plan.iter().any(|s| s.source == Path::new("/tmp")));
+    }
+
+    #[test]
+    fn plan_skips_scratch_covered_by_an_ephemeral_mount() {
+        // The project mount is already an ephemeral overlay, so a scratch
+        // directory living on it inherits that and must not be overlaid twice.
+        let mounts = ["/", "/var"].iter().map(PathBuf::from).collect();
+        let plan = plan_submounts(mounts, Path::new("/var/builds/proj"), all_dirs);
+        assert!(
+            plan.iter()
+                .find(|s| s.source == Path::new("/var"))
+                .unwrap()
+                .ephemeral
+        );
+        assert!(!plan.iter().any(|s| s.source == Path::new("/var/tmp")));
+    }
+
+    #[test]
+    fn plan_skips_scratch_that_is_absent_or_a_symlink() {
+        // A missing or symlinked scratch path has no directory to use as a
+        // lower layer; mounting one anyway would fail the whole run.
+        let mounts = ["/", "/var"].iter().map(PathBuf::from).collect();
+        let plan = plan_submounts(mounts, Path::new("/home/u"), |p| {
+            (p != Path::new("/var/tmp")).then_some(true)
+        });
+        assert!(!plan.iter().any(|s| s.source == Path::new("/var/tmp")));
+
+        let mounts = ["/", "/var"].iter().map(PathBuf::from).collect();
+        let plan = plan_submounts(mounts, Path::new("/home/u"), |p| {
+            Some(p != Path::new("/var/tmp"))
+        });
+        assert!(!plan.iter().any(|s| s.source == Path::new("/var/tmp")));
     }
 
     #[test]
@@ -848,7 +948,7 @@ mod tests {
         .iter()
         .map(PathBuf::from)
         .collect();
-        let plan = plan_submounts(mounts, Path::new("/workspace"), |_| true);
+        let plan = plan_submounts(mounts, Path::new("/workspace"), all_dirs);
         let paths: Vec<&Path> = plan.iter().map(|s| s.source.as_path()).collect();
         assert!(!paths.contains(&Path::new("/proc/sys/fs/binfmt_misc")));
         assert!(paths.contains(&Path::new("/workspace/nested")));
@@ -868,7 +968,7 @@ mod tests {
             .map(PathBuf::from)
             .collect();
         let plan = plan_submounts(mounts, Path::new("/x"), |p| {
-            p != Path::new("/etc/resolv.conf")
+            Some(p != Path::new("/etc/resolv.conf"))
         });
         // /a appears once, before /a/b would (which is pruned as a live child).
         assert_eq!(
