@@ -660,6 +660,10 @@ there isn't always the same thing:
   decorators](#generating-and-updating-decorators))
 - `-d`, `--debug` — enable debug logging
 
+Warnings — a `--save-context` copy that failed, a test function defined twice
+in one file — go to stderr and are on by default; `RUST_LOG` overrides the log
+filter if you want more or less than that.
+
 ### Stopping a run early
 
 Normally a run ends once every selected test has finished, and the summary
