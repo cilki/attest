@@ -304,17 +304,47 @@ fn exit_broken_pipe() -> ! {
     std::process::exit(128 + libc::SIGPIPE)
 }
 
+/// Build the log filter for a run. `rust_log` is the value of `RUST_LOG`, which
+/// always wins when it is set to something.
+///
+/// Without it, warnings are on: every `warn!` attest emits reports something the
+/// user has to know about to trust the run — that filesystem isolation is off
+/// and the tests are writing to the real filesystem, that a `--save-context`
+/// copy failed so the saved context is incomplete, that a duplicated test
+/// function shadows an earlier one and is the only body that runs. Defaulting
+/// to `ERROR` (what `EnvFilter` does with an unset `RUST_LOG`) swallowed all of
+/// them.
+fn log_filter(debug: bool, rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
+    if debug {
+        return tracing_subscriber::EnvFilter::new("attest=debug");
+    }
+    match rust_log {
+        Some(directives) if !directives.trim().is_empty() => {
+            tracing_subscriber::EnvFilter::new(directives)
+        }
+        _ => tracing_subscriber::EnvFilter::new("attest=warn"),
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     clap_complete::CompleteEnv::with_factory(Cli::command).complete();
 
     let cli = Cli::parse();
 
-    let env_filter = if cli.debug {
-        tracing_subscriber::EnvFilter::new("attest=debug")
+    let rust_log = std::env::var("RUST_LOG").ok();
+    // Logs belong on stderr, next to the progress bar and the xtrace dumps:
+    // `fmt()` would otherwise put them on stdout, in the middle of the `--json`
+    // stream and the result lines.
+    let builder = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(log_filter(cli.debug, rust_log.as_deref()));
+    if cli.debug {
+        builder.init();
     } else {
-        tracing_subscriber::EnvFilter::from_default_env()
-    };
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+        // A warning is part of the run's output rather than a log line, so it is
+        // printed without the timestamp and module path that `-d` wants.
+        builder.without_time().with_target(false).init();
+    }
 
     let mut any_failed = false;
     match cli.command {
@@ -548,6 +578,29 @@ mod tests {
         assert_eq!(
             display_base("test_dup", Path::new("c/x.test"), true, &mut taken),
             "x.test:test_dup:3"
+        );
+    }
+
+    #[test]
+    fn log_filter_shows_warnings_by_default() {
+        // The warnings about lost isolation, failed context saves and shadowed
+        // test functions have to reach a user who passed no flags at all.
+        assert_eq!(log_filter(false, None).to_string(), "attest=warn");
+        // An empty RUST_LOG is an unset one, not a request for silence.
+        assert_eq!(log_filter(false, Some("")).to_string(), "attest=warn");
+    }
+
+    #[test]
+    fn log_filter_honors_debug_and_rust_log() {
+        assert_eq!(log_filter(true, None).to_string(), "attest=debug");
+        assert_eq!(
+            log_filter(false, Some("attest=trace")).to_string(),
+            "attest=trace"
+        );
+        // `-d` is the more specific request, so it wins over the environment.
+        assert_eq!(
+            log_filter(true, Some("attest=error")).to_string(),
+            "attest=debug"
         );
     }
 }

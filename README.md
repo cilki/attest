@@ -63,9 +63,13 @@ tests:
 Isolation is built out of overlayfs, which needs `CAP_SYS_ADMIN` — either
 directly, or through a user namespace, in which case the test also sees itself
 as `root` inside that namespace. attest rehearses the whole setup once per run
-and, where neither route works, falls back to running every test directly in
-the working directory just like `--no-overlay` does, so writes are no longer
-discarded. Nested containers and sandboxes are the usual places this happens.
+and, where neither route works, says so with a warning and falls back to running
+every test directly in the working directory just like `--no-overlay` does, so
+writes are no longer discarded. Nested containers and sandboxes are the usual
+places this happens.
+
+Warnings like that one go to stderr and are on by default; `RUST_LOG` overrides
+the log filter if you want more or less than that.
 
 ### Inline tests
 

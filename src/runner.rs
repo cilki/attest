@@ -359,14 +359,18 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
     } else {
         overlay::probe_support(tmp.path(), &invocation_dir, &submounts)
     };
-    match overlay_mode {
+    // Suspended: the status line is already ticking, and the fallback warning
+    // below goes to the same stderr it draws on.
+    status.suspend(|| match overlay_mode {
         None if config.no_overlay => debug!("overlay isolation disabled via --no-overlay"),
-        None => warn!("overlayfs unavailable; tests run without filesystem isolation"),
+        None => warn!(
+            "overlayfs unavailable; tests run without filesystem isolation, so what they write to the real filesystem stays there"
+        ),
         Some(overlay::Mode::Userns) => {
             debug!("using unprivileged overlay; tests run as root inside their namespace")
         }
         Some(overlay::Mode::Privileged) => debug!("using privileged overlay isolation"),
-    }
+    });
     let env = RunEnv {
         invocation_dir,
         overlay_mode,
