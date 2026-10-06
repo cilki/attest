@@ -176,15 +176,107 @@ fn purge_cgroup_children(dir: &Path) {
     }
 }
 
-/// Move `ancestor` up one level within `/sys/fs/cgroup`. Returns false when
-/// already at the cgroup root (no useful parent remains).
-fn try_parent(ancestor: &mut PathBuf) -> bool {
-    match ancestor.parent() {
-        Some(p) if p.starts_with("/sys/fs/cgroup") && p != Path::new("/sys/fs/cgroup") => {
-            *ancestor = p.to_path_buf();
-            true
+/// The process's own cgroup directory followed by each of its ancestors, up to
+/// but not including the cgroup root (which can never parent an `attest` base
+/// that holds processes).
+fn cgroup_ancestors(leaf: PathBuf) -> impl Iterator<Item = PathBuf> {
+    std::iter::successors(Some(leaf), |dir| {
+        dir.parent()
+            .filter(|p| p.starts_with("/sys/fs/cgroup") && *p != Path::new("/sys/fs/cgroup"))
+            .map(Path::to_path_buf)
+    })
+}
+
+/// Outcome of trying to build the `attest` base under one ancestor cgroup.
+enum Attempt {
+    /// A usable base cgroup, with the controllers we need enabled for its children.
+    Usable(PathBuf),
+    /// Nothing usable here, but an ancestor further up may still work.
+    TryParent,
+    /// Nothing in this hierarchy can work; stop walking.
+    GiveUp,
+}
+
+/// Try to set up `<ancestor>/attest` as the base holding one cgroup per test,
+/// leaving nothing behind unless it succeeds. `pid` is this process's pid as a
+/// decimal string, ready to write to a `cgroup.procs`.
+fn try_ancestor(ancestor: &Path, pid: &str) -> Attempt {
+    // Only "domain" cgroups can parent child cgroups that hold processes.
+    // "domain threaded" and "domain invalid" ancestors yield unusable children.
+    if !is_domain(ancestor) {
+        debug!(path=%ancestor.display(), "ancestor type is '{}'; skipping", cgroup_type(ancestor));
+        return Attempt::TryParent;
+    }
+
+    let base = ancestor.join("attest");
+    if !ensure_domain_cgroup(&base) {
+        return Attempt::TryParent;
+    }
+
+    // cgroup v2 no-internal-process constraint: a non-root cgroup that has
+    // child cgroups cannot directly contain processes. Move the current process
+    // into base/main (a leaf) so that any child we fork also starts in a leaf
+    // and can freely migrate to a sibling test cgroup via cgroup.procs.
+    let main_cgroup = base.join("main");
+    let attempt = if !ensure_domain_cgroup(&main_cgroup) {
+        Attempt::TryParent
+    } else if let Err(e) = std::fs::write(main_cgroup.join("cgroup.procs"), pid) {
+        if e.raw_os_error() == Some(libc::EOPNOTSUPP) {
+            // The cgroup is in a threaded subtree; cgroup.procs is not valid
+            // anywhere in this hierarchy. No point walking up.
+            debug!(
+                "cgroup.procs not supported (type: '{}')",
+                cgroup_type(&main_cgroup)
+            );
+            Attempt::GiveUp
+        } else {
+            debug!(path=%main_cgroup.display(), "failed to enter main cgroup: {e}");
+            Attempt::TryParent
         }
-        _ => false,
+    } else if probe_migration(&base) {
+        enable_controllers(&base);
+        debug!(path=%base.display(), "selected cgroup base");
+        return Attempt::Usable(base);
+    } else {
+        // We are now inside base/main, which is about to be removed: step back
+        // out to the ancestor first.
+        let _ = std::fs::write(ancestor.join("cgroup.procs"), pid);
+        debug!(path=%base.display(), "cgroup.procs probe failed; trying parent");
+        Attempt::TryParent
+    };
+
+    // Single teardown for every failure above; the removals are no-ops for the
+    // directories that were never created.
+    let _ = std::fs::remove_dir(&main_cgroup);
+    let _ = std::fs::remove_dir(&base);
+    attempt
+}
+
+/// Fork a child that inherits `base/main` (a leaf) and check that it can
+/// migrate to a sibling cgroup by writing to its `cgroup.procs` — exactly what
+/// every test child has to do.
+fn probe_migration(base: &Path) -> bool {
+    let probe = base.join("_probe");
+    let _ = std::fs::remove_dir(&probe); // clean up from a crashed prior run
+    if std::fs::create_dir(&probe).is_err() {
+        return false;
+    }
+    let ok = probe_cgroup_procs(&probe);
+    let _ = std::fs::remove_dir(&probe);
+    ok
+}
+
+/// Enable the controllers we read stats from for `base`'s children, limited to
+/// those its parent already delegated to it (visible in `base/cgroup.controllers`).
+/// Never write to the parent's `cgroup.subtree_control` — doing so while the
+/// parent has live processes transitions it to "domain invalid" on later runs.
+fn enable_controllers(base: &Path) {
+    let available = std::fs::read_to_string(base.join("cgroup.controllers")).unwrap_or_default();
+    for ctrl in available
+        .split_whitespace()
+        .filter(|c| matches!(*c, "cpu" | "memory" | "io" | "pids"))
+    {
+        let _ = std::fs::write(base.join("cgroup.subtree_control"), format!("+{ctrl}"));
     }
 }
 
@@ -192,100 +284,16 @@ fn init_base() -> Option<PathBuf> {
     let cg_content = std::fs::read_to_string("/proc/self/cgroup").ok()?;
     let rel = cg_content
         .lines()
-        .find(|l| l.starts_with("0::"))?
-        .strip_prefix("0::")?
-        .trim()
-        .to_string();
+        .find_map(|l| l.strip_prefix("0::"))?
+        .trim();
+    let leaf = PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
+    let pid = std::process::id().to_string();
 
-    let mut ancestor = PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
-
-    loop {
-        // Only "domain" cgroups can parent child cgroups that hold processes.
-        // "domain threaded" and "domain invalid" ancestors yield unusable children.
-        if !is_domain(&ancestor) {
-            debug!(path=%ancestor.display(), "ancestor type is '{}'; skipping", cgroup_type(&ancestor));
-            if !try_parent(&mut ancestor) {
-                break;
-            }
-            continue;
-        }
-
-        let base = ancestor.join("attest");
-        if !ensure_domain_cgroup(&base) {
-            if !try_parent(&mut ancestor) {
-                break;
-            }
-            continue;
-        }
-
-        // cgroup v2 no-internal-process constraint: a non-root cgroup that has
-        // child cgroups cannot directly contain processes. Move the current process
-        // into base/main (a leaf) so that any child we fork also starts in a leaf
-        // and can freely migrate to a sibling test cgroup via cgroup.procs.
-        let main_cgroup = base.join("main");
-        if !ensure_domain_cgroup(&main_cgroup) {
-            let _ = std::fs::remove_dir(&base);
-            if !try_parent(&mut ancestor) {
-                break;
-            }
-            continue;
-        }
-
-        let current_pid = std::process::id().to_string();
-        if let Err(e) = std::fs::write(main_cgroup.join("cgroup.procs"), &current_pid) {
-            if e.raw_os_error() == Some(libc::EOPNOTSUPP) {
-                // The cgroup is in a threaded subtree; cgroup.procs is not valid
-                // anywhere in this hierarchy. No point walking up.
-                debug!(
-                    "cgroup.procs not supported (type: '{}')",
-                    cgroup_type(&main_cgroup)
-                );
-                let _ = std::fs::remove_dir(&main_cgroup);
-                let _ = std::fs::remove_dir(&base);
-                break;
-            }
-            debug!(path=%main_cgroup.display(), "failed to enter main cgroup: {e}");
-            let _ = std::fs::remove_dir(&main_cgroup);
-            let _ = std::fs::remove_dir(&base);
-            if !try_parent(&mut ancestor) {
-                break;
-            }
-            continue;
-        }
-
-        // Probe: fork a child that inherits base/main (a leaf) and verify it can
-        // migrate to a sibling cgroup by writing to its cgroup.procs.
-        let probe = base.join("_probe");
-        let _ = std::fs::remove_dir(&probe); // clean up from a crashed prior run
-        let probe_ok = std::fs::create_dir(&probe).is_ok() && {
-            let result = probe_cgroup_procs(&probe);
-            let _ = std::fs::remove_dir(&probe);
-            result
-        };
-
-        if probe_ok {
-            // Enable only the controllers already delegated to base by its parent
-            // (visible in base/cgroup.controllers). Never write to
-            // ancestor/cgroup.subtree_control — doing so while the ancestor has live
-            // processes transitions it to "domain invalid" state on subsequent runs.
-            let available =
-                std::fs::read_to_string(base.join("cgroup.controllers")).unwrap_or_default();
-            for ctrl in ["cpu", "memory", "io", "pids"] {
-                if available.split_whitespace().any(|c| c == ctrl) {
-                    let _ = std::fs::write(base.join("cgroup.subtree_control"), format!("+{ctrl}"));
-                }
-            }
-            debug!(path=%base.display(), "selected cgroup base");
-            return Some(base);
-        }
-
-        // Probe failed; restore the current process to the ancestor and walk up.
-        let _ = std::fs::write(ancestor.join("cgroup.procs"), &current_pid);
-        let _ = std::fs::remove_dir(&main_cgroup);
-        let _ = std::fs::remove_dir(&base);
-        debug!(path=%base.display(), "cgroup.procs probe failed; trying parent");
-        if !try_parent(&mut ancestor) {
-            break;
+    for ancestor in cgroup_ancestors(leaf) {
+        match try_ancestor(&ancestor, &pid) {
+            Attempt::Usable(base) => return Some(base),
+            Attempt::TryParent => continue,
+            Attempt::GiveUp => break,
         }
     }
 
@@ -378,4 +386,62 @@ fn read_io_field(cgroup_path: &Path, field: &str) -> Option<u64> {
         .filter_map(|v| v.parse::<u64>().ok())
         .sum();
     if total > 0 { Some(total) } else { None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ancestors_walk_up_to_but_not_into_the_cgroup_root() {
+        let leaf = PathBuf::from("/sys/fs/cgroup/user.slice/user-1000.slice/session-3.scope");
+        let walk: Vec<PathBuf> = cgroup_ancestors(leaf.clone()).collect();
+        assert_eq!(
+            walk,
+            vec![
+                leaf,
+                PathBuf::from("/sys/fs/cgroup/user.slice/user-1000.slice"),
+                PathBuf::from("/sys/fs/cgroup/user.slice"),
+            ],
+            "the walk must stop before /sys/fs/cgroup itself"
+        );
+    }
+
+    #[test]
+    fn ancestors_of_the_cgroup_root_are_just_itself() {
+        // A process in the root cgroup (`0::/`) still gets one attempt, but
+        // there is nowhere above it to fall back to.
+        assert_eq!(
+            cgroup_ancestors(PathBuf::from("/sys/fs/cgroup")).collect::<Vec<_>>(),
+            vec![PathBuf::from("/sys/fs/cgroup")]
+        );
+    }
+
+    #[test]
+    fn read_cpu_usec_picks_out_both_fields() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stat = tmp.path().join("cpu.stat");
+        std::fs::write(&stat, "usage_usec 300\nuser_usec 120\nsystem_usec 180\n").unwrap();
+        assert_eq!(read_cpu_usec(&stat), (Some(120), Some(180)));
+
+        // A missing field stays `None` rather than defaulting to zero.
+        std::fs::write(&stat, "usage_usec 300\nuser_usec 120\n").unwrap();
+        assert_eq!(read_cpu_usec(&stat), (Some(120), None));
+        assert_eq!(read_cpu_usec(tmp.path().join("absent")), (None, None));
+    }
+
+    #[test]
+    fn read_io_field_sums_every_device() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("io.stat"),
+            "8:0 rbytes=100 wbytes=7 rios=2 wios=1\n8:16 rbytes=23 wbytes=0\n",
+        )
+        .unwrap();
+        assert_eq!(read_io_field(tmp.path(), "rbytes"), Some(123));
+        assert_eq!(read_io_field(tmp.path(), "wbytes"), Some(7));
+        // A field no device reports sums to zero, which means "unavailable"
+        // rather than a real zero.
+        assert_eq!(read_io_field(tmp.path(), "dbytes"), None);
+    }
 }
