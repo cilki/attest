@@ -206,6 +206,38 @@ fn split_path_arg(arg: &str) -> (PathBuf, Option<String>) {
     (PathBuf::from(arg), None)
 }
 
+/// Parse every discovered file, returning the files that parsed together with
+/// their parse results (the two vectors stay index-aligned).
+///
+/// When the target was a single file the user named, a parse error is the
+/// answer to what they asked for and stays fatal. A directory target is
+/// different: the walk picks up *every* shell script in the tree, most of
+/// which were never meant to hold tests, so one script the parser cannot
+/// handle — zsh-only syntax, a generated or templated file, a genuine syntax
+/// error in something unrelated — must not abort a run it contributes no tests
+/// to. Those are reported on stderr and skipped.
+fn parse_discovered(
+    files: Vec<PathBuf>,
+    explicit_file: bool,
+) -> anyhow::Result<(Vec<PathBuf>, Vec<parser::TestFile>)> {
+    let mut kept = Vec::with_capacity(files.len());
+    let mut parsed = Vec::with_capacity(files.len());
+    for file in files {
+        match parser::parse_test_file(&file) {
+            Ok(test_file) => {
+                kept.push(file);
+                parsed.push(test_file);
+            }
+            Err(e) if explicit_file => return Err(e),
+            // Printed directly rather than logged: dropping a file changes
+            // what the run covers, so it must show up whatever the log level
+            // happens to be.
+            Err(e) => eprintln!("warning: {e}; skipping this file"),
+        }
+    }
+    Ok((kept, parsed))
+}
+
 fn complete_tests(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
     let current = current.to_string_lossy();
     let mut candidates = Vec::new();
@@ -277,9 +309,9 @@ fn main() -> anyhow::Result<()> {
             let filter = filter.or(inline_filter);
             let pattern = filter.as_deref().map(parser::TestPattern::parse);
             let files = discovery::discover_test_files(&path)?;
+            let (_, parsed) = parse_discovered(files, path.is_file())?;
             let mut tests = Vec::new();
-            for file in &files {
-                let test_file = parser::parse_test_file(file)?;
+            for test_file in parsed {
                 for test in test_file.tests {
                     if let Some(ref p) = pattern
                         && !p.matches(&test)
@@ -305,10 +337,7 @@ fn main() -> anyhow::Result<()> {
             // Parse each file exactly once and keep the owning `TestFile`s
             // alive, so every test can borrow its file's extracted functions
             // rather than cloning the whole AST per test (and again per repeat).
-            let parsed = files
-                .iter()
-                .map(|file| parser::parse_test_file(file))
-                .collect::<anyhow::Result<Vec<_>>>()?;
+            let (files, parsed) = parse_discovered(files, path.is_file())?;
 
             // Collect matching tests, tallying how often each name occurs so
             // duplicates across files can be given distinct display names. Each
@@ -416,6 +445,46 @@ fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    const GOOD: &str = "#!/bin/sh\ntestGood() {\n\ttrue\n}\n";
+    // Unterminated double quote: valid for no shell, and the kind of thing a
+    // tree can contain without it having anything to do with the tests.
+    const BROKEN: &str = "#!/bin/bash\nfoo() {\n\techo \"unterminated\n}\n";
+
+    fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn parse_discovered_skips_unparseable_scripts_found_by_a_walk() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let broken = script(tmp.path(), "broken.sh", BROKEN);
+        let good = script(tmp.path(), "good.test", GOOD);
+
+        let (kept, parsed) = parse_discovered(vec![broken, good.clone()], false)
+            .expect("one bad script must not abort a directory run");
+
+        // Kept files and their parse results stay index-aligned.
+        assert_eq!(kept, vec![good]);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0].tests.iter().map(|t| &t.name).collect::<Vec<_>>(),
+            vec!["testGood"]
+        );
+    }
+
+    #[test]
+    fn parse_discovered_is_fatal_for_an_explicitly_named_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let broken = script(tmp.path(), "broken.sh", BROKEN);
+
+        let Err(err) = parse_discovered(vec![broken], true) else {
+            panic!("a file the user named must not be skipped silently");
+        };
+        assert!(err.to_string().starts_with("parse error in "), "{err}");
+    }
 
     #[test]
     fn display_base_unqualified_when_unique() {

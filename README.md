@@ -281,6 +281,12 @@ plus any other file whose first line is a shebang naming a shell (`sh`, `bash`,
 `zsh`, `dash`, `ash`, `ksh`). Hidden files and directories are skipped. Pointed
 at a single file, it scans that file whatever it happens to be called.
 
+Not every script in a tree is shell `attest` can parse — zsh-only syntax, a
+generated or templated file, or just a script with a syntax error in it. Those
+are reported on stderr and skipped, so one unrelated file can't take down a run
+it has no tests in. Point `attest` straight at such a file, though, and the
+parse error is fatal: you asked for that file specifically.
+
 Each test runs under the shell its file's shebang asks for, falling back to
 `/bin/sh` when that shell isn't installed and to `bash` for files without a
 recognized shebang.

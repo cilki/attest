@@ -3,7 +3,11 @@
 - `src/main.rs` - CLI entry point using clap. Invoking `attest` with no
   subcommand runs the tests; `list` and `skill` are the only subcommands. The
   positional target is a file, a directory, or a `<file>/<test>` pattern, which
-  is split into a path plus an implicit `--filter`.
+  is split into a path plus an implicit `--filter`. `parse_discovered` parses
+  every discovered file: a parse error in a file the user named directly is
+  fatal, while one in a file the directory walk turned up is reported on stderr
+  and the file skipped, so an unparseable script elsewhere in the tree cannot
+  abort the run.
 - `src/discovery.rs` - Finds test files from a file path or directory
   (recursive). Scans all shell scripts (by extension or shebang) for test
   functions, not just `.test` files.
