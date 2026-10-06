@@ -982,10 +982,14 @@ fn xorshift64(state: &mut u64) -> u64 {
 /// rather than resumes.
 fn fuzz_tick(test_pid: u32, level: f64, rng: &mut u64) {
     let resume = (xorshift64(rng) as f64) / (u64::MAX as f64) >= level;
-    // A descendant whose state can't be read counts as running, so a vanished
-    // process is simply signalled and ignored rather than resumed forever.
-    let candidates: Vec<u32> = collect_descendants(test_pid)
-        .into_iter()
+    let tree = collect_descendants(test_pid);
+    // A descendant whose state can't be read counts as running. The pick is
+    // only a preference: `signal_tree_member` re-checks the state of whatever
+    // it is about to signal, so a process that changed state (or vanished)
+    // meanwhile is skipped rather than signalled anyway.
+    let candidates: Vec<u32> = tree
+        .iter()
+        .copied()
         .filter(|&pid| pid != test_pid && (process_state(pid) == Some('T')) == resume)
         .collect();
     if candidates.is_empty() {
@@ -997,8 +1001,103 @@ fn fuzz_tick(test_pid: u32, level: f64, rng: &mut u64) {
     } else {
         (libc::SIGSTOP, "Paused")
     };
-    if unsafe { libc::kill(chosen as libc::pid_t, signal) } == 0 {
+    if signal_tree_member(chosen, &tree, resume, signal) {
         trace!(pid = chosen, "{verb} subprocess");
+    }
+}
+
+/// Send `signal` to `pid`, but only if it is still the member of `tree` the
+/// caller took it for and its stopped-ness still matches `want_stopped`.
+/// Returns whether the signal was delivered.
+///
+/// `pid` came out of a `/proc` walk a few syscalls ago, and a pid is free to be
+/// reissued the moment its process is reaped — so signalling the number blind
+/// can land on an unrelated process, including one attest does not own at all.
+/// `SIGSTOP` makes that particularly unpleasant: nothing ever undoes it, since
+/// later ticks only resume processes they still find inside the test's tree, so
+/// a misdirected pause leaves somebody else's process stopped for good (every
+/// process on the host, when attest runs as root for privileged isolation).
+///
+/// Pinning the pid first rules it out: identity, state and signal all travel
+/// through one descriptor that the kernel never re-points at the pid's next
+/// occupant, and the parent check rejects a number that has already moved on.
+fn signal_tree_member(pid: u32, tree: &[u32], want_stopped: bool, signal: libc::c_int) -> bool {
+    let Some(target) = PinnedProcess::open(pid) else {
+        return false;
+    };
+    // Read through the pinned descriptor, so the process described here is
+    // provably the one signalled below.
+    let Some(stat) = target.stat() else {
+        return false; // already gone
+    };
+    if (stat_state(&stat) == Some('T')) != want_stopped {
+        return false;
+    }
+    // Still ours? A reissued pid belongs to a process from outside the test, so
+    // its parent is not one of the processes the tree walk just found.
+    if !stat_ppid(&stat).is_some_and(|ppid| tree.contains(&ppid)) {
+        debug!(pid, "fuzz: pid left the test tree; not signalling it");
+        return false;
+    }
+    target.send_signal(signal)
+}
+
+/// A process pinned by an open descriptor on its `/proc/<pid>` directory.
+///
+/// procfs gives every incarnation of a pid its own directory inode, and Linux
+/// accepts such a descriptor as a pidfd, so reads and signals issued through
+/// one either reach the process it was opened for or fail with `ESRCH`. That is
+/// what makes it safe to act on a pid read out of `/proc`: the number may be
+/// recycled in the meantime, but this descriptor does not follow it.
+struct PinnedProcess(libc::c_int);
+
+impl PinnedProcess {
+    /// Pin `pid`. `None` if it is already gone (or never existed).
+    fn open(pid: u32) -> Option<Self> {
+        let path = std::ffi::CString::new(format!("/proc/{pid}")).ok()?;
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_DIRECTORY | libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
+        (fd >= 0).then_some(Self(fd))
+    }
+
+    /// This process's `stat` line, or `None` once it is gone (reading anything
+    /// under the directory of a dead task fails with `ESRCH`).
+    fn stat(&self) -> Option<String> {
+        use std::os::fd::FromRawFd;
+
+        let fd =
+            unsafe { libc::openat(self.0, c"stat".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return None;
+        }
+        let mut stat = String::new();
+        unsafe { std::fs::File::from_raw_fd(fd) }
+            .read_to_string(&mut stat)
+            .ok()?;
+        Some(stat)
+    }
+
+    /// Deliver `signal` to the pinned process via `pidfd_send_signal(2)`.
+    fn send_signal(&self, signal: libc::c_int) -> bool {
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.0,
+                signal,
+                std::ptr::null_mut::<libc::siginfo_t>(),
+                0,
+            ) == 0
+        }
+    }
+}
+
+impl Drop for PinnedProcess {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.0) };
     }
 }
 
@@ -1022,11 +1121,24 @@ fn collect_descendants(root: u32) -> Vec<u32> {
 /// Read the single-character process state from `/proc/<pid>/stat`.
 /// Returns `None` if the file cannot be read (e.g. the process has already exited).
 fn process_state(pid: u32) -> Option<char> {
-    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
-    // Format: "pid (comm) state ..."  — comm may contain spaces/parens, so
-    // find the *last* ')' to reliably locate the state field.
-    let after_comm = stat.rfind(')')?.checked_add(2)?;
-    stat[after_comm..].chars().next()
+    stat_state(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// The fields of a `/proc/<pid>/stat` line from `state` (field 3) on. The
+/// `comm` field before it is parenthesized and may itself contain spaces and
+/// parens, so the *last* `)` is what reliably locates the rest.
+fn stat_fields(stat: &str) -> Option<std::str::SplitWhitespace<'_>> {
+    Some(stat[stat.rfind(')')? + 1..].split_whitespace())
+}
+
+/// The single-character state field of a `/proc/<pid>/stat` line.
+fn stat_state(stat: &str) -> Option<char> {
+    stat_fields(stat)?.next()?.chars().next()
+}
+
+/// The parent pid field of a `/proc/<pid>/stat` line.
+fn stat_ppid(stat: &str) -> Option<u32> {
+    stat_fields(stat)?.nth(1)?.parse().ok()
 }
 
 fn create_strace_wrappers(working_dir: &Path, commands: &[String]) -> Result<()> {
@@ -1738,6 +1850,127 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(!results[0].passed);
         assert!(results[0].timed_out);
+    }
+
+    /// Wait (up to `secs`) for `pid` to reach process state `want`.
+    fn await_state(pid: u32, want: char, secs: u64) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            match process_state(pid) {
+                Some(s) if s == want => return true,
+                _ if Instant::now() > deadline => return false,
+                _ => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_pauses_and_resumes_a_descendant() {
+        // The baseline the hardening below must not break: a live descendant of
+        // a test gets stopped by a pausing tick and resumed by a resuming one.
+        let mut shell = Command::new("/bin/sh")
+            .args(["-c", "sleep 30 & echo $! >&2; wait"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut out = String::new();
+        {
+            use std::io::BufRead;
+            let mut reader = std::io::BufReader::new(shell.stderr.take().unwrap());
+            reader.read_line(&mut out).unwrap();
+        }
+        let sleeper: u32 = out.trim().parse().unwrap();
+        assert!(await_state(sleeper, 'S', 5), "sleeper never started");
+
+        // level 1.0 always pauses, 0.0 always resumes.
+        let mut rng = 1;
+        fuzz_tick(shell.id(), 1.0, &mut rng);
+        assert!(await_state(sleeper, 'T', 5), "descendant was not paused");
+        fuzz_tick(shell.id(), 0.0, &mut rng);
+        assert!(await_state(sleeper, 'S', 5), "descendant was not resumed");
+
+        let _ = shell.kill();
+        let _ = shell.wait();
+        unsafe { libc::kill(sleeper as libc::pid_t, libc::SIGKILL) };
+    }
+
+    #[test]
+    fn fuzz_never_signals_a_process_outside_the_test_tree() {
+        // pids are reissued as soon as their process is reaped, so a pid read
+        // out of a /proc walk may belong to somebody else by the time the fuzz
+        // scheduler gets to it. A stray SIGSTOP is unrecoverable — nothing
+        // resumes a process that is not in the tree — so a pid whose process is
+        // no longer part of the test must not be signalled at all.
+        //
+        // Detached from the harness's pipes: a process this test leaves stopped
+        // must not be able to hold them open and wedge the whole run.
+        let mut outsider = Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = outsider.id();
+        assert!(await_state(pid, 'S', 5), "outsider never started");
+
+        // An empty tree stands for "this pid is not one of ours": the process
+        // exists and is in the right state, and must still be left alone.
+        assert!(
+            !signal_tree_member(pid, &[], false, libc::SIGSTOP),
+            "signalled a process outside the tree"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            process_state(pid),
+            Some('S'),
+            "an unrelated process was paused"
+        );
+
+        // Same pid, now presented as a genuine child of this process: signalled.
+        let tree = [std::process::id()];
+        assert!(signal_tree_member(pid, &tree, false, libc::SIGSTOP));
+        assert!(await_state(pid, 'T', 5), "a tree member was not paused");
+
+        let _ = outsider.kill();
+        let _ = outsider.wait();
+    }
+
+    #[test]
+    fn a_pinned_process_cannot_be_signalled_once_its_pid_is_free() {
+        // The property the fix rests on: a /proc/<pid> descriptor is bound to
+        // one incarnation of the pid. Once the process is reaped — the moment
+        // the kernel may hand the number to an unrelated process — signalling
+        // through the descriptor fails instead of reaching the new owner.
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pinned = PinnedProcess::open(child.id()).expect("pin a live child");
+        assert!(pinned.stat().is_some());
+        assert!(pinned.send_signal(0), "signalling a live process must work");
+
+        let _ = child.kill();
+        let _ = child.wait(); // reaped: the pid is now free for reuse
+
+        assert!(pinned.stat().is_none(), "a reaped process still reads back");
+        assert!(
+            !pinned.send_signal(libc::SIGSTOP),
+            "a reaped process was still signalled through its pinned descriptor"
+        );
+    }
+
+    #[test]
+    fn stat_fields_survive_a_hostile_comm() {
+        // `comm` is parenthesized but may itself hold spaces and parens, so the
+        // state and ppid fields are only found from the *last* ')'.
+        let stat = "42 (we (are) (legion) ) T 7 7 0 -1 4194304";
+        assert_eq!(stat_state(stat), Some('T'));
+        assert_eq!(stat_ppid(stat), Some(7));
+        assert_eq!(stat_state("garbage"), None);
+        assert_eq!(stat_ppid("42 (sh) T"), None);
     }
 
     #[test]
