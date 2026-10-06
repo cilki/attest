@@ -298,14 +298,10 @@ fn plan_submounts(
     }
 
     // Everything to re-establish: the host's mounts plus the scratch paths that
-    // are not mount points of their own, parents before children.
+    // are not mount points of their own, parents before children. The ones
+    // already in `uniq` are folded back out by the sort/dedup.
     let mut targets = uniq;
-    let extra: Vec<PathBuf> = ephemeral
-        .iter()
-        .filter(|e| !targets.contains(e))
-        .cloned()
-        .collect();
-    targets.extend(extra);
+    targets.extend(ephemeral.iter().cloned());
     targets.sort_by_key(|p| (p.components().count(), p.clone()));
     targets.dedup();
 

@@ -33,39 +33,17 @@ impl TestPattern {
     pub fn parse(s: &str) -> Self {
         let is_path = s.starts_with("./");
         let s = s.strip_prefix("./").unwrap_or(s);
-        match s.rfind('/') {
-            Some(slash) => {
-                let file_part = &s[..slash];
-                let name_part = &s[slash + 1..];
-                Self {
-                    file: if file_part.is_empty() {
-                        None
-                    } else {
-                        Some(PathBuf::from(file_part))
-                    },
-                    name: if name_part.is_empty() {
-                        None
-                    } else {
-                        Some(name_part.to_string())
-                    },
-                }
-            }
-            None if is_path => Self {
-                file: if s.is_empty() {
-                    None
-                } else {
-                    Some(PathBuf::from(s))
-                },
-                name: None,
-            },
-            None => Self {
-                file: None,
-                name: if s.is_empty() {
-                    None
-                } else {
-                    Some(s.to_string())
-                },
-            },
+        // A `/` splits file from name; without one, a `./`-prefixed argument is
+        // a bare file and anything else a bare test name. Either side may come
+        // out empty (`foo.sh/`, `/test_x`), which means "unconstrained".
+        let (file_part, name_part) = match s.rsplit_once('/') {
+            Some(parts) => parts,
+            None if is_path => (s, ""),
+            None => ("", s),
+        };
+        Self {
+            file: (!file_part.is_empty()).then(|| PathBuf::from(file_part)),
+            name: (!name_part.is_empty()).then(|| name_part.to_string()),
         }
     }
 

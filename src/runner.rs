@@ -400,13 +400,6 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
         pending_list.push(spawn(test)?);
     }
 
-    // If xtrace is enabled, acquire the lock for the first pending test.
-    if let Some(ref mut xt) = xtrace
-        && let Some(p) = pending_list.first()
-    {
-        status.suspend(|| xt.try_acquire(p));
-    }
-
     // Poll loop: non-blocking reap, process completions, update status.
     while !pending_list.is_empty() {
         // A SIGINT/SIGTERM arrived: kill every test tree and abort the run.
@@ -442,20 +435,20 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
             }
         }
 
-        // Non-blocking reap: check all pending children.
-        let mut reaped: Vec<(usize, ExitStatus)> = Vec::new();
-        for (i, pending) in pending_list.iter_mut().enumerate() {
-            match pending.reap() {
-                Ok(Some(status)) => reaped.push((i, status)),
-                Ok(None) => {} // still running
-                Err(e) => return Err(anyhow!("reaping test child failed: {e}")),
-            }
-        }
-
-        // Process reaped tests in reverse index order so removal doesn't shift indices.
-        reaped.sort_by_key(|b| std::cmp::Reverse(b.0));
+        // Non-blocking reap: walk the pending list, taking out whatever has
+        // finished. `i` only advances past tests that are still running, so a
+        // removal leaves it pointing at the next candidate.
         let mut completed: Vec<TestResult> = Vec::new();
-        for (i, exit_status) in reaped {
+        let mut i = 0;
+        while i < pending_list.len() {
+            let exit_status = match pending_list[i].reap() {
+                Ok(Some(status)) => status,
+                Ok(None) => {
+                    i += 1; // still running
+                    continue;
+                }
+                Err(e) => return Err(anyhow!("reaping test child failed: {e}")),
+            };
             if let Some(ref mut xt) = xtrace {
                 status.suspend(|| xt.finish(&pending_list[i]));
             }
@@ -613,16 +606,24 @@ fn resolve_shell(shell: &str) -> String {
 /// Only function definitions are emitted (top-level code is dropped), matching
 /// the previous `to_string`-based behavior, so sourcing the script never runs a
 /// test's top-level statements.
-fn build_functions_source(functions: &[FunctionDefinition], source: &str) -> String {
-    let src_lines: Vec<&str> = source.lines().collect();
+///
+/// `source` is `None` when the original file could not be read. Then — as for
+/// any single function the parser gave no location for — the function falls
+/// back to the reformatted AST rendering: line alignment is lost, but the
+/// script still defines and runs the same functions.
+fn build_functions_source(functions: &[FunctionDefinition], source: Option<&str>) -> String {
+    let src_lines: Vec<&str> = source.unwrap_or_default().lines().collect();
     let mut out = String::new();
     // 1-based line number of the next line to be written to `out`.
     let mut line = 1usize;
 
     for func in functions {
-        let Some(span) = func.location() else {
-            // No source location: fall back to the reformatted rendering. This
-            // breaks line alignment for this one function but keeps it runnable.
+        let located = if src_lines.is_empty() {
+            None
+        } else {
+            func.location()
+        };
+        let Some(span) = located else {
             for l in func.to_string().lines() {
                 out.push_str(l);
                 out.push('\n');
@@ -684,19 +685,9 @@ fn spawn_test(
 
     let script_path = context.join("functions.sh");
     // Read the original source so functions can be emitted verbatim at their
-    // original line numbers (see build_functions_source). Fall back to the
-    // reformatted AST rendering if the file can't be read.
-    let script = match std::fs::read_to_string(source_path) {
-        Ok(source) => build_functions_source(all_functions, &source),
-        Err(_) => {
-            let mut s = String::new();
-            for func in all_functions {
-                s.push_str(&func.to_string());
-                s.push('\n');
-            }
-            s
-        }
-    };
+    // original line numbers (see build_functions_source).
+    let source = std::fs::read_to_string(source_path).ok();
+    let script = build_functions_source(all_functions, source.as_deref());
     std::fs::write(&script_path, &script)?;
 
     if !config.override_cmds.is_empty() {
@@ -1757,7 +1748,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (_, tf) = parse_script(tmp.path(), source);
 
-        let generated = build_functions_source(&tf.functions, source);
+        let generated = build_functions_source(&tf.functions, Some(source));
         let gen_lines: Vec<&str> = generated.lines().collect();
         let src_lines: Vec<&str> = source.lines().collect();
 
@@ -1766,6 +1757,27 @@ mod tests {
             assert_eq!(gen_lines[idx], src_lines[idx], "line {idx} differs");
         }
         assert_eq!(gen_lines[3], "", "top-level/gap line 3 should be blank");
+    }
+
+    #[test]
+    fn functions_source_falls_back_when_the_source_is_unavailable() {
+        // Without the original text there are no line numbers to preserve, so
+        // every function is re-rendered from the AST. Line alignment is lost
+        // (and with it the diagnostic snippet), but the script must still be
+        // valid shell that defines and runs each function.
+        let source = "helper() {\n  echo 42\n}\n\ntest_foo() {\n  test \"$(helper)\" = 42\n}\n";
+        let tmp = TempDir::new().unwrap();
+        let (_, tf) = parse_script(tmp.path(), source);
+
+        let generated = build_functions_source(&tf.functions, None);
+        let script = tmp.path().join("fallback.sh");
+        fs::write(&script, &generated).unwrap();
+
+        let status = Command::new("/bin/sh")
+            .args(["-c", &format!(". {}\ntest_foo\n", sh_quote(&script))])
+            .status()
+            .unwrap();
+        assert!(status.success(), "generated script failed:\n{generated}");
     }
 
     #[test]
