@@ -19,6 +19,9 @@ methods. Do NOT use syntax from other test frameworks (no `assert_eq`, no
   nonzero, the test fails immediately (`set -e` semantics)
 - Each test starts in its own clean, empty temporary working directory, so
   create scratch files right in `$PWD` — never use `mktemp`
+- That directory is NOT the directory attest was run from, so relative paths
+  reach nothing in the project. `$0` is the absolute path of the file the test
+  lives in: read fixtures as `"$(dirname "$0")/fixture.txt"`
 - Each test runs in its own copy-on-write view of the filesystem: writes to
   the root filesystem, the project tree, `/tmp`, and `/var/tmp` are discarded
   when the test ends. Tests must not depend on each other's files. Writes to

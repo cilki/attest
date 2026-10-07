@@ -69,7 +69,10 @@ back to `/bin/sh` when that shell is not installed and to `bash` when there is
 no recognized shebang (`--shebang` overrides this for every test). Every command
 in a test function is an implicit assertion - if it exits nonzero, the test
 fails. Non-test functions (helpers/setup) are also extracted and made available
-to tests.
+to tests. Every test starts in a fresh empty working directory under its context
+dir rather than in the invocation dir, so relative paths in a test resolve
+against scratch space; `$0` is the canonicalized path of the test's own file
+(passed as the shell's `argv[0]`), which is how a test reaches its fixtures.
 
 ## CLI options
 
@@ -98,8 +101,11 @@ to tests.
   `DIR/<test>/cwd/` (it is live-bound, not part of any overlay),
   `stdout.log`/`xtrace.log` to `DIR/<test>/`, and any `--strace` logs at
   `DIR/<test>/strace/CMD.log` for debugging
-- `--no-overlay` — disable overlayfs isolation; run each test directly in the
-  working directory (same as the automatic fallback when overlays are unavailable)
+- `--no-overlay` — disable the overlay (same as the automatic fallback when
+  overlays are unavailable). The per-test working directory is unaffected —
+  `build_runner_script` always `cd`s into `cwd_dir(context)` — so what changes is
+  only that writes outside it reach the real filesystem instead of an upper layer,
+  and `--save-context` has no delta to copy
 - `--repeat N` — run each test N times (default: 1); combine with `--fuzz` to
   shake out flaky tests
 - `--fuzz [VALUE]` — randomly pause and resume each test's descendant processes

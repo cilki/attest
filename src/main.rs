@@ -120,7 +120,9 @@ struct Cli {
     #[arg(long)]
     shebang: Option<String>,
 
-    /// Disable overlayfs isolation; run each test directly in the working directory
+    /// Disable overlayfs isolation, so writes outside a test's own working
+    /// directory are kept rather than discarded. Each test still runs in its
+    /// own fresh working directory.
     #[arg(long)]
     no_overlay: bool,
 
