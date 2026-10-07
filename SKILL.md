@@ -17,6 +17,13 @@ methods. Do NOT use syntax from other test frameworks (no `assert_eq`, no
 - Test functions MUST be prefixed with `test` (e.g., `testFoo`, `testVersion`)
 - Every command in a test function is an implicit assertion: if it exits
   nonzero, the test fails immediately (`set -e` semantics)
+- Only function definitions are used: attest extracts the functions out of the
+  file and runs them, so anything at the file's top level is dropped and never
+  executes. NEVER put `set -euo pipefail`, global variables, `trap`s, or setup
+  code outside a function — put it in a helper that each test calls
+- `set -e` is already on, but `pipefail` is NOT: `false | true` succeeds. When
+  the thing being asserted is a pipeline, run `set -o pipefail` inside the test
+  function first
 - Each test starts in its own clean, empty temporary working directory, so
   create scratch files right in `$PWD` — never use `mktemp`
 - Each test runs in its own copy-on-write view of the filesystem: writes to
@@ -72,6 +79,10 @@ testHeading() {
 
 # Output contains a pattern
 echo "$output" | grep "pattern"
+
+# A failure on the LEFT of a pipe needs pipefail, which is off by default
+set -o pipefail
+some_command | grep "pattern"
 
 # Output does NOT contain a pattern
 ! echo "$output" | grep "pattern"

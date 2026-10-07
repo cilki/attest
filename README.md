@@ -67,6 +67,35 @@ and, where neither route works, falls back to running every test directly in
 the working directory just like `--no-overlay` does, so writes are no longer
 discarded. Nested containers and sandboxes are the usual places this happens.
 
+### What attest actually runs
+
+Those three facts are about the inside of a test function. There is one more
+worth knowing about the file around them: attest never executes your test file.
+It parses it, extracts the *function definitions* — tests and helpers alike —
+and sources only those into a fresh shell, which then calls one test function.
+Everything at the file's top level is dropped, which has two consequences:
+
+- **Code outside a function never runs.** A variable assigned at the top of the
+  file is unset inside the tests, and a top-level `trap` or `set` has no
+  effect. Put shared values and setup in a helper function that each test
+  calls.
+- **Shell options belong inside the test function.** The runner turns on
+  `set -e` (that is what makes every statement an assertion) and `set -x`, and
+  nothing else — in particular `pipefail` is off, so `false | true` *passes*.
+  To assert on a pipeline, enable it in the test itself, the way
+  `examples/race_condition.test` does:
+
+  ```sh
+  testGrepQ() {
+  	set -o pipefail
+
+  	produce | consume
+  }
+  ```
+
+Dropping the top level is also what makes inline tests work: sourcing a script
+that happens to be a program doesn't run the program.
+
 ### Inline tests
 
 If you're testing something that's itself a shell script, you can also include
