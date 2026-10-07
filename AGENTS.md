@@ -13,12 +13,21 @@
   functions, not just `.test` files.
 - `src/parser.rs` - Parses shell scripts with `brush_parser::Parser`, walks the
   AST to extract all `FunctionDefinition` nodes. Test functions start with
-  `test`.
+  `test`. Also holds `TestPattern`, the `[<file>/]<name>` selector behind
+  `--filter` and the positional target: the file half is a `Path::ends_with`
+  suffix (whole components, no wildcards), the name half a `*` glob that
+  degrades to a prefix match when it contains no `*`, and either half may be
+  empty to mean "unconstrained". Without a `/` the whole pattern is a name, so
+  a file-only filter needs the trailing slash.
 - `src/runner.rs` - For each test: writes all extracted functions (test +
-  helper) to a temp script, forks a child that execs `/bin/sh -c`, redirects
-  stdout to `stdout.log` and stderr to `xtrace.log`, enables `set -ex`, sources
-  the script, then invokes the test function by name. The child pivots into a
-  per-test ephemeral root (see `src/overlay.rs`) when available, runs in its own
+  helper) to a temp script, forks a child that execs `<shell> -c` (the shell
+  `resolve_shell` picked for the file, or `--shebang`) with the original script
+  path as `argv[0]` so `$0` still works, redirects stdout to `stdout.log` and
+  stderr to `xtrace.log`, enables `set -e`, sources the script, and only then
+  turns on `set -x` before invoking the test function by name — so the xtrace
+  log starts at the test itself rather than at the function definitions. The
+  child pivots into a per-test ephemeral root (see `src/overlay.rs`) when
+  available, runs in its own
   session (so timeouts and ^C kill the whole process tree via its process group
   and, when cgroups are active, `cgroup.kill`). Parallel by default via
   `fork(2)` with configurable parallelism (`--parallel`). Supports `--timeout`,
@@ -84,8 +93,9 @@ to tests.
 - `--timeout SECS` — wall-clock timeout per test; timed-out tests show `TIME`
   and count as failures
 - `--bail` — stop after first failure
-- `--filter [FILE/]PATTERN` — run only matching tests (`*` wildcards, prefix
-  match)
+- `--filter [FILE/]PATTERN` — run only matching tests. `FILE` is a path suffix
+  (no wildcards); `PATTERN` takes `*` wildcards and matches as a prefix only
+  when it has none. Without a `/` the argument is all `PATTERN`
 - `--override SPEC` — copy a binary into the test context `bin/` dir so tests
   use it exclusively. SPEC is either a path (`/usr/bin/example` or
   `./bin/example`) or a mapping (`example=/usr/bin/override`)
