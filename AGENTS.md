@@ -71,6 +71,13 @@ in a test function is an implicit assertion - if it exits nonzero, the test
 fails. Non-test functions (helpers/setup) are also extracted and made available
 to tests.
 
+Only function definitions are extracted (`build_functions_source` drops
+everything else), so top-level code in a test file never runs: globals, `trap`s
+and `set` options have to live inside a function. The generated runner script
+enables `set -e` and `set -x` and nothing more — `pipefail` in particular is
+off, so a test asserting on a pipeline must set it itself (see
+`examples/race_condition.test`).
+
 ## CLI options
 
 - `--parallel N` — max concurrent tests (default: CPU cores)
