@@ -57,15 +57,29 @@ tests:
   project files, but writes to the root filesystem, the project tree, `/tmp`,
   and `/var/tmp` are discarded after the run. (Other mounts — `/proc`, `/dev`,
   network mounts, etc. — stay shared with the host, so writes there persist.
-  `--no-overlay` disables isolation entirely.) Any processes still running
-  when a test ends are killed automatically.
+  `--no-overlay` turns the copy-on-write view off; the fresh working directory
+  stays.) Any processes still running when a test ends are killed
+  automatically.
+
+That working directory is a temporary one, not the directory you ran `attest`
+from, so a relative path in a test is relative to the scratch directory and
+reaches nothing in your project. Inside a test function `$0` is the absolute
+path of the file the test came from, which is how you get back to the project:
+
+```sh
+testFixture() {
+	[ "$(cat "$(dirname "$0")/fixture.txt")" = "expected" ]
+}
+```
 
 Isolation is built out of overlayfs, which needs `CAP_SYS_ADMIN` — either
 directly, or through a user namespace, in which case the test also sees itself
 as `root` inside that namespace. attest rehearses the whole setup once per run
-and, where neither route works, falls back to running every test directly in
-the working directory just like `--no-overlay` does, so writes are no longer
-discarded. Nested containers and sandboxes are the usual places this happens.
+and, where neither route works, falls back to running tests without the
+copy-on-write view, just like `--no-overlay` does: each test still gets its own
+fresh working directory, but everything it writes outside that directory lands
+on the real filesystem and stays there. Nested containers and sandboxes are the
+usual places this happens.
 
 ### What attest actually runs
 
@@ -440,8 +454,8 @@ With that in place, `attest examples/md5<TAB>` completes the file name and
   name get the traced version
 - `--shebang SHELL` — force one shell for every test, ignoring each file's own
   shebang
-- `--no-overlay` — skip filesystem isolation and run each test directly in the
-  working directory
+- `--no-overlay` — skip the copy-on-write view of the filesystem, so writes
+  outside the test's own working directory are kept instead of discarded
 - `--no-cgroups` — don't track per-test CPU, memory and IO usage with cgroups
 - `-d`, `--debug` — enable debug logging
 
@@ -533,8 +547,9 @@ docker run --rm -v $(which attest):/bin/attest -v $(pwd):/tests <image name> att
 ```
 
 Containers usually can't mount overlayfs, so tests run this way tend to land on
-the unisolated fallback described above — writes to the mounted project tree
-reach your real files.
+the unisolated fallback described above: a test that writes to a path under
+`/tests` changes your real files. Scratch writes are unaffected — the working
+directory each test starts in is temporary either way.
 
 ### Fuzz testing
 
@@ -641,6 +656,12 @@ working directory under `cwd/` (so a scratch file written to `$PWD` shows up at
 `results/<test>/cwd/x`), and every file it created or modified elsewhere, laid
 out by absolute path (a write to `/tmp/x` shows up at
 `results/<test>/tmp/x`).
+
+That last part is the overlay's upper layer, so it only appears when the
+copy-on-write view is in use. Under `--no-overlay` — or the fallback attest
+takes when overlayfs is unavailable — writes outside the working directory went
+straight to the real filesystem and are still there, so the saved context is
+just the logs and `cwd/`.
 
 Saved files keep their permissions, minus the set-user-ID, set-group-ID and
 sticky bits: those files are whatever the test chose to write, and the copy is
