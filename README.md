@@ -278,8 +278,13 @@ attest list .
 Pointed at a directory, `attest` walks it recursively and scans every shell
 script it finds for test functions: files named `*.test`, `*.sh` or `*.bash`,
 plus any other file whose first line is a shebang naming a shell (`sh`, `bash`,
-`zsh`, `dash`, `ash`, `ksh`). Hidden files and directories are skipped. Pointed
-at a single file, it scans that file whatever it happens to be called.
+`zsh`, `dash`, `ash`, `ksh`). Hidden files and directories are skipped, and so
+are symlinks: `attest` runs every test function it finds, so a `result` link
+into the nix store or a `tests/fixtures` link to a sibling checkout would
+otherwise mean running code from a directory you never pointed it at. Anything
+that isn't a regular file is skipped too: a named pipe sitting in the tree would
+block the walk waiting for a writer. Pointed at a single file — or a symlink to
+one — it scans that whatever it happens to be called.
 
 Not every script in a tree is shell `attest` can parse — zsh-only syntax, a
 generated or templated file, or just a script with a syntax error in it. Those

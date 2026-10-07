@@ -62,9 +62,11 @@
 Standalone test files (`.test`) have any shell shebang and contain functions
 prefixed with `test`. Test functions can also be inline in any regular shell
 script. When scanning directories, all shell scripts (identified by extension or
-shebang) are checked for test functions; the walk is recursive and skips hidden
-files and directories, while a path passed directly is always scanned whatever
-it is named. Each test runs under the shell named by its file's shebang, falling
+shebang) are checked for test functions; the walk is recursive, skips hidden
+files and directories, and never follows symlinks (a symlinked directory would
+pull in — and run — tests from outside the tree, and one pointing at an ancestor
+would yield each test once per level), while a path passed directly is always
+scanned whatever it is named. Each test runs under the shell named by its file's shebang, falling
 back to `/bin/sh` when that shell is not installed and to `bash` when there is
 no recognized shebang (`--shebang` overrides this for every test). Every command
 in a test function is an implicit assertion - if it exits nonzero, the test

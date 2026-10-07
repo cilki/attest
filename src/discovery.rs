@@ -24,6 +24,29 @@ pub fn discover_test_files(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
     bail!("path does not exist: {}", path.display());
 }
 
+/// Recursively collect the shell scripts under `dir`, skipping hidden entries
+/// and never following symlinks.
+///
+/// Following them would make the set of tests a run covers unbounded: the walk
+/// descends into whatever a symlinked directory names, and `attest` *executes*
+/// every test function it finds. A `result` link into the nix store, a
+/// `node_modules` link to a sibling checkout or a stray `tests/x -> /` all turn
+/// "run the tests in this directory" into running code from somewhere the
+/// caller never named. A link pointing back at an ancestor is worse still:
+/// `ln -s . loop` makes the same file turn up once per level until path
+/// resolution gives up at the kernel's symlink limit, so every test in the tree
+/// runs forty times over.
+///
+/// Only regular files are considered for scanning, for the same reason: a
+/// non-regular file the walk merely stumbled on is not something to open. A
+/// named pipe is the sharp case — [`is_shell_script`] reads the first line of
+/// anything without a known extension, and opening a FIFO blocks until a writer
+/// shows up, so a single `mkfifo`'d file anywhere in the tree used to hang the
+/// whole run before it reported a thing.
+///
+/// A path passed to `attest` directly is still scanned whatever it is — the
+/// caller named it, so there is nothing unbounded about it (see
+/// [`discover_test_files`]).
 fn collect_script_files(dir: &Path, files: &mut Vec<PathBuf>) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
@@ -35,9 +58,15 @@ fn collect_script_files(dir: &Path, files: &mut Vec<PathBuf>) -> anyhow::Result<
         {
             continue;
         }
-        if path.is_dir() {
+        // `file_type()` comes from the directory entry (or an lstat), so a
+        // symlink reports as one rather than as whatever it points at.
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             collect_script_files(&path, files)?;
-        } else if is_shell_script(&path) {
+        } else if file_type.is_file() && is_shell_script(&path) {
             files.push(path);
         }
     }
@@ -134,6 +163,96 @@ mod tests {
 
         let result = discover_test_files(tmp.path()).unwrap();
         assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn walk_does_not_descend_into_symlinked_directories() {
+        // A link to a directory outside the tree would make `attest <dir>` run
+        // test functions from files the caller never pointed at.
+        let tmp = TempDir::new().unwrap();
+        let tree = tmp.path().join("tree");
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&tree).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(tree.join("inside.test"), "#!/bin/sh\n").unwrap();
+        fs::write(outside.join("outside.test"), "#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(&outside, tree.join("link")).unwrap();
+
+        let result = discover_test_files(&tree).unwrap();
+        assert_eq!(result, vec![tree.join("inside.test")]);
+    }
+
+    #[test]
+    fn walk_does_not_follow_symlinked_files() {
+        let tmp = TempDir::new().unwrap();
+        let tree = tmp.path().join("tree");
+        fs::create_dir(&tree).unwrap();
+        let real = tmp.path().join("elsewhere.test");
+        fs::write(&real, "#!/bin/sh\n").unwrap();
+        fs::write(tree.join("inside.test"), "#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(&real, tree.join("linked.test")).unwrap();
+
+        let result = discover_test_files(&tree).unwrap();
+        assert_eq!(result, vec![tree.join("inside.test")]);
+    }
+
+    #[test]
+    fn walk_terminates_on_a_symlink_loop() {
+        // `ln -s . loop` resolves until the kernel's symlink limit, so a walk
+        // that followed it yielded the same file once per level.
+        let tmp = TempDir::new().unwrap();
+        let tree = tmp.path().join("tree");
+        fs::create_dir(&tree).unwrap();
+        fs::write(tree.join("a.test"), "#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(".", tree.join("loop")).unwrap();
+
+        let result = discover_test_files(&tree).unwrap();
+        assert_eq!(result, vec![tree.join("a.test")]);
+    }
+
+    #[test]
+    fn a_directly_named_symlink_is_still_scanned() {
+        // Only the walk refuses to follow links; a path the caller named is
+        // exactly what they asked for, link or not.
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real.test");
+        fs::write(&real, "#!/bin/sh\n").unwrap();
+
+        let link = tmp.path().join("link.test");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(discover_test_files(&link).unwrap(), vec![link]);
+
+        let dir = tmp.path().join("dir");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("in.test"), "#!/bin/sh\n").unwrap();
+        let dir_link = tmp.path().join("dir_link");
+        std::os::unix::fs::symlink(&dir, &dir_link).unwrap();
+        assert_eq!(
+            discover_test_files(&dir_link).unwrap(),
+            vec![dir_link.join("in.test")]
+        );
+    }
+
+    #[test]
+    fn walk_does_not_open_a_named_pipe() {
+        // Reading the first line of a FIFO blocks until somebody writes to it,
+        // so the walk must not treat one as a candidate script. Run it off the
+        // test thread so a regression fails here instead of hanging the suite.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("a.test"), "#!/bin/sh\n").unwrap();
+        use std::os::unix::ffi::OsStringExt;
+        let fifo = std::ffi::CString::new(tmp.path().join("pipe").into_os_string().into_vec())
+            .expect("fifo path has no NUL");
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+
+        let dir = tmp.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(discover_test_files(&dir)));
+        let found = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the walk blocked on the FIFO")
+            .unwrap();
+        assert_eq!(found, vec![tmp.path().join("a.test")]);
     }
 
     #[test]
