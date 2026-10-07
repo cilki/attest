@@ -921,7 +921,7 @@ fn sh_quote(path: &Path) -> String {
 }
 
 /// Build the shell script content that sources the function definitions and
-/// runs the named test. Used with `/bin/sh -c <content> <source_path>` so
+/// runs the named test. Used with `<shell> -c <content> <source_path>` so
 /// that `$0` inside test functions refers to the original script.
 fn build_runner_script(
     test_name: &str,

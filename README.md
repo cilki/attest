@@ -318,6 +318,19 @@ attest . --filter testHel
 attest . --filter 'testVer*'
 ```
 
+A filter is `[<file>/]<name>`, and the `/` is what tells the two halves apart:
+
+- **With no `/` the whole thing is a test name**, never a file — which is why
+  the file-only example above ends in one. `--filter md5sum.test` looks for a
+  test whose name starts with `md5sum.test` and so matches nothing.
+- **The file half is a path suffix**, compared a whole component at a time and
+  with no wildcards: `md5sum.test/` and `examples/md5sum.test/` both select the
+  file, while `um.test/` and `md5*.test/` select nothing. An empty name half
+  (`md5sum.test/`) means every test in the file.
+- **The name half is where `*` works.** Without one it matches as a prefix
+  (`testHel` catches `testHelp` and `testHello`); with one it has to match the
+  name in full, so `*Help` is a suffix match and `test*` is everything.
+
 `list` accepts the same targets and `--filter`, so you can check what a
 selection covers before running it.
 
