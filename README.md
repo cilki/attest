@@ -478,6 +478,51 @@ output live with the `-vv` flag:
 
 ![](./.github/assets/xtrace.gif)
 
+### Where a test's own output goes
+
+A test never writes to your terminal. Both of its streams are captured into its
+context directory:
+
+- stdout goes to `stdout.log`
+- stderr goes to `xtrace.log`, interleaved with the trace, so each line lands
+  directly under the command that produced it
+
+Only `xtrace.log` is ever printed — it's what you see under a `FAIL` and what
+`-vv` streams live. A test's stdout is invisible unless you keep the context with
+`--save-context` (or read it out of `--json`), which is worth knowing before you
+reach for `echo` to debug a failure:
+
+```sh
+testFails() {
+	echo "where did this go?"    # stdout.log, which nothing prints
+	echo "this one shows up" >&2 # the FAIL report, right below its own command
+	false
+}
+```
+
+```
+❯ attest demo.test
+FAIL  testFails                                (50ms)
+--- xtrace: testFails ---
++8: testFails
++4: echo 'where did this go?'
++5: echo 'this one shows up'
+this one shows up
++6: false
+...
+```
+
+So send anything you want to see on failure to stderr, and don't redirect either
+stream to `/dev/null`: that throws away the only report you get.
+
+Standard input, by contrast, is _not_ redirected — every test inherits
+`attest`'s own stdin, and all of them share it. A command inside a test that
+reads stdin therefore consumes whatever `attest` was given, two tests reading it
+in parallel race over the same bytes, and if nothing is ever written there (an
+idle terminal, say) the test simply blocks until `--timeout` kills it — or for as
+long as the run lasts, without one. Redirect explicitly whenever a test runs
+something that might read stdin: `mycmd < input.txt`, or `mycmd < /dev/null`.
+
 ### Resource usage
 
 Result lines can carry a second line describing what the test actually

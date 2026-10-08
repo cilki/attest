@@ -120,6 +120,28 @@ testReadInput() {
 }
 ```
 
+## Output and input
+
+- A test's output is captured, never printed as it runs: stdout goes to a
+  `stdout.log` nothing displays, while stderr is interleaved into the trace
+  attest prints when the test fails
+- So diagnostics belong on stderr: `echo "unexpected: $output" >&2` shows up in
+  the failure report, a bare `echo` does not
+- Never redirect stdout or stderr to `/dev/null` — that discards exactly what
+  the failure report would have shown
+- Never let a test read standard input: tests inherit (and share) attest's own
+  stdin, so a command that reads it blocks or steals another test's input.
+  Always feed input explicitly
+
+```sh
+testStdinInput() {
+	printf 'a\nb\n' > input.txt
+
+	# Feed the command from a file or a pipe, never from the test's own stdin
+	[ "$(sort -r < input.txt)" = "$(printf 'b\na\n')" ]
+}
+```
+
 ## Example: testing a CLI command
 
 ```sh
@@ -152,8 +174,6 @@ testHello() {
 - Use comments to explain non-obvious assertions, not obvious ones
 - Comments on test functions themselves should be "documentation style" with
   `##`.
-- Avoid redirecting stderr or stdout to /dev/null because it might be useful for
-  debugging.
 
 ## General test writing practice
 
