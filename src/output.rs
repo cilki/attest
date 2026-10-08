@@ -1,9 +1,10 @@
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use indicatif::{ProgressBar, ProgressStyle};
+use serde_json::{Map, Value};
 
 use crate::runner::TestResult;
 
@@ -182,27 +183,52 @@ impl StatusDisplay {
     }
 }
 
-/// Escape a string for inclusion as a JSON string value (without surrounding quotes).
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                use std::fmt::Write;
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out
+/// Read one of a test's logs out of its context dir. Lossy so a log containing
+/// invalid UTF-8 (e.g. binary output) is still reported rather than silently
+/// becoming empty.
+fn read_log(path: PathBuf) -> String {
+    String::from_utf8_lossy(&std::fs::read(path).unwrap_or_default()).into_owned()
 }
 
-pub fn print_test_result_json(result: &TestResult) {
+/// A test's `--strace` logs as `{"<cmd>": "<log>"}`, read from the
+/// `strace/<cmd>.log` files the runner wrote into its context dir. Empty
+/// without `--strace` (or when nothing was traced).
+fn strace_logs(context: &Path) -> Map<String, Value> {
+    std::fs::read_dir(context.join("strace"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| {
+            let file = entry.file_name().to_string_lossy().into_owned();
+            let cmd = file.strip_suffix(".log").unwrap_or(&file).to_owned();
+            (cmd, read_log(entry.path()).into())
+        })
+        .collect()
+}
+
+/// Whichever resource numbers the cgroup actually reported, or `null` when no
+/// stats were collected for the test at all.
+#[cfg(feature = "cgroup")]
+fn resource_stats_json(stats: Option<&crate::cgroup::ResourceStats>) -> Value {
+    let Some(r) = stats else {
+        return Value::Null;
+    };
+    [
+        ("cpu_user_usec", r.cpu_user_usec),
+        ("cpu_system_usec", r.cpu_system_usec),
+        ("memory_peak", r.memory_peak),
+        ("io_read_bytes", r.io_read_bytes),
+        ("io_write_bytes", r.io_write_bytes),
+        ("pids_peak", r.pids_peak),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| value.map(|v| (key.to_owned(), v.into())))
+    .collect::<Map<String, Value>>()
+    .into()
+}
+
+/// One finished test as the JSON object `--json` reports it by.
+fn test_result_json(result: &TestResult) -> Value {
     let status = if result.passed {
         "pass"
     } else if result.timed_out {
@@ -210,73 +236,25 @@ pub fn print_test_result_json(result: &TestResult) {
     } else {
         "fail"
     };
-
-    // Lossy so a log containing invalid UTF-8 (e.g. binary output) is still
-    // reported rather than silently becoming empty.
-    let read_log = |name: &str| -> String {
-        String::from_utf8_lossy(&std::fs::read(result.context.join(name)).unwrap_or_default())
-            .into_owned()
-    };
-
-    let stdout = json_escape(&read_log("stdout.log"));
-    let xtrace = json_escape(&read_log("xtrace.log"));
-
-    // Collect strace logs: strace/<cmd>.log → key is <cmd>
-    let strace_dir = result.context.join("strace");
-    let mut strace_pairs: Vec<String> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&strace_dir) {
-        let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
-        entries.sort_by_key(|e| e.file_name());
-        for entry in entries {
-            let fname = entry.file_name();
-            let fname = fname.to_string_lossy();
-            let key = fname.strip_suffix(".log").unwrap_or(&fname);
-            let content = std::fs::read_to_string(entry.path()).unwrap_or_default();
-            strace_pairs.push(format!(
-                "\"{}\":\"{}\"",
-                json_escape(key),
-                json_escape(&content)
-            ));
-        }
-    }
-    let strace_obj = format!("{{{}}}", strace_pairs.join(","));
-
     #[cfg(feature = "cgroup")]
-    let resources_json = match result.resources {
-        Some(ref r) => {
-            let mut fields: Vec<String> = Vec::new();
-            if let Some(v) = r.cpu_user_usec {
-                fields.push(format!("\"cpu_user_usec\":{v}"));
-            }
-            if let Some(v) = r.cpu_system_usec {
-                fields.push(format!("\"cpu_system_usec\":{v}"));
-            }
-            if let Some(v) = r.memory_peak {
-                fields.push(format!("\"memory_peak\":{v}"));
-            }
-            if let Some(v) = r.io_read_bytes {
-                fields.push(format!("\"io_read_bytes\":{v}"));
-            }
-            if let Some(v) = r.io_write_bytes {
-                fields.push(format!("\"io_write_bytes\":{v}"));
-            }
-            if let Some(v) = r.pids_peak {
-                fields.push(format!("\"pids_peak\":{v}"));
-            }
-            format!("{{{}}}", fields.join(","))
-        }
-        None => "null".to_string(),
-    };
+    let resources = resource_stats_json(result.resources.as_ref());
     #[cfg(not(feature = "cgroup"))]
-    let resources_json = "null";
+    let resources = Value::Null;
 
-    let name = json_escape(&result.name);
-    let file = json_escape(&result.source_path.display().to_string());
-    let duration_ms = result.duration.as_millis();
+    serde_json::json!({
+        "name": result.name,
+        "file": result.source_path.display().to_string(),
+        "status": status,
+        "duration_ms": result.duration.as_millis() as u64,
+        "stdout": read_log(result.context.join("stdout.log")),
+        "xtrace": read_log(result.context.join("xtrace.log")),
+        "strace": strace_logs(&result.context),
+        "resources": resources,
+    })
+}
 
-    outln!(
-        r#"{{"name":"{name}","file":"{file}","status":"{status}","duration_ms":{duration_ms},"stdout":"{stdout}","xtrace":"{xtrace}","strace":{strace_obj},"resources":{resources_json}}}"#
-    );
+pub fn print_test_result_json(result: &TestResult) {
+    outln!("{}", test_result_json(result));
 }
 
 pub fn print_test_result(result: &TestResult) {
@@ -389,6 +367,90 @@ fn format_duration(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    /// A finished test whose logs live in `context`.
+    fn result_in(context: &Path, name: &str) -> TestResult {
+        TestResult {
+            name: name.to_string(),
+            passed: false,
+            timed_out: true,
+            duration: Duration::from_millis(1500),
+            context: context.to_path_buf(),
+            source_path: PathBuf::from("/repo/a b.test"),
+            #[cfg(feature = "cgroup")]
+            resources: None,
+        }
+    }
+
+    #[test]
+    fn json_result_survives_hostile_names_and_logs() {
+        // Test names come from shell function definitions and the logs hold
+        // whatever the test wrote, so both turn up carrying quotes,
+        // backslashes, newlines, control bytes and invalid UTF-8. All of it
+        // has to come back out of the emitted line intact: one unescaped byte
+        // and the consumer's parser chokes on the run.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("stdout.log"),
+            b"quote\" back\\slash \x07\xff\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("xtrace.log"), "+1: false\n").unwrap();
+        std::fs::create_dir(tmp.path().join("strace")).unwrap();
+        std::fs::write(
+            tmp.path().join("strace/curl.log"),
+            "execve(\"/bin/curl\")\n",
+        )
+        .unwrap();
+
+        let result = result_in(tmp.path(), "test_\"odd\"\n\tname");
+        let line = test_result_json(&result).to_string();
+        let parsed: Value = serde_json::from_str(&line).expect("emitted a parseable line");
+
+        assert_eq!(parsed["name"], json!("test_\"odd\"\n\tname"));
+        assert_eq!(parsed["file"], json!("/repo/a b.test"));
+        assert_eq!(parsed["status"], json!("timeout"));
+        assert_eq!(parsed["duration_ms"], json!(1500));
+        // The one invalid byte is replaced; everything else survives verbatim.
+        assert_eq!(
+            parsed["stdout"],
+            json!("quote\" back\\slash \x07\u{fffd}\n")
+        );
+        assert_eq!(parsed["xtrace"], json!("+1: false\n"));
+        assert_eq!(
+            parsed["strace"],
+            json!({ "curl": "execve(\"/bin/curl\")\n" })
+        );
+        assert_eq!(parsed["resources"], Value::Null);
+    }
+
+    #[test]
+    fn json_result_keeps_every_key_when_there_is_nothing_to_report() {
+        // A consumer reads the same keys for every test, so a test with no
+        // logs and no --strace still gets them — empty, not missing.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let parsed = test_result_json(&result_in(tmp.path(), "test_plain"));
+        assert_eq!(parsed["stdout"], json!(""));
+        assert_eq!(parsed["xtrace"], json!(""));
+        assert_eq!(parsed["strace"], json!({}));
+    }
+
+    #[cfg(feature = "cgroup")]
+    #[test]
+    fn json_resources_omit_what_the_cgroup_did_not_report() {
+        // An unavailable controller must not be reported as a real zero.
+        let stats = crate::cgroup::ResourceStats {
+            cpu_user_usec: Some(120),
+            memory_peak: Some(4096),
+            ..Default::default()
+        };
+        assert_eq!(
+            resource_stats_json(Some(&stats)),
+            json!({ "cpu_user_usec": 120, "memory_peak": 4096 })
+        );
+        assert_eq!(resource_stats_json(None), Value::Null);
+    }
 
     fn display_with(total: usize, results: Vec<bool>) -> StatusDisplay {
         StatusDisplay {
