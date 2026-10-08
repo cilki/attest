@@ -1,10 +1,10 @@
 use std::io::Write;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::parser::TestCase;
 use crate::runner::TestResult;
 
 pub(crate) const GREEN: &str = "\x1b[32m";
@@ -365,14 +365,15 @@ pub fn print_summary(results: &[TestResult], wall_duration: Duration) {
     outln!("Time:   {}", format_duration(wall_duration));
 }
 
-pub fn print_test_list(tests: &[TestCase]) {
-    for test in tests {
-        let filename = test
-            .file
+/// Print each `(file, test name)` pair as the `<file>/<test>` form `--filter`
+/// and the positional target accept.
+pub fn print_test_list(tests: &[(&Path, &str)]) {
+    for (file, name) in tests {
+        let filename = file
             .file_name()
             .map(|n| n.to_string_lossy())
-            .unwrap_or_else(|| test.file.to_string_lossy());
-        outln!("{}/{}", filename, test.name);
+            .unwrap_or_else(|| file.to_string_lossy());
+        outln!("{filename}/{name}");
     }
 }
 

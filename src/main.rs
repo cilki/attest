@@ -208,8 +208,9 @@ fn split_path_arg(arg: &str) -> (PathBuf, Option<String>) {
     (PathBuf::from(arg), None)
 }
 
-/// Parse every discovered file, returning the files that parsed together with
-/// their parse results (the two vectors stay index-aligned).
+/// Parse every discovered file, returning the files that parsed. Each
+/// [`parser::TestFile`] carries the path it came from, so nothing else has to
+/// be kept alongside.
 ///
 /// When the target was a single file the user named, a parse error is the
 /// answer to what they asked for and stays fatal. A directory target is
@@ -221,15 +222,11 @@ fn split_path_arg(arg: &str) -> (PathBuf, Option<String>) {
 fn parse_discovered(
     files: Vec<PathBuf>,
     explicit_file: bool,
-) -> anyhow::Result<(Vec<PathBuf>, Vec<parser::TestFile>)> {
-    let mut kept = Vec::with_capacity(files.len());
+) -> anyhow::Result<Vec<parser::TestFile>> {
     let mut parsed = Vec::with_capacity(files.len());
     for file in files {
         match parser::parse_test_file(&file) {
-            Ok(test_file) => {
-                kept.push(file);
-                parsed.push(test_file);
-            }
+            Ok(test_file) => parsed.push(test_file),
             Err(e) if explicit_file => return Err(e),
             // Printed directly rather than logged: dropping a file changes
             // what the run covers, so it must show up whatever the log level
@@ -237,7 +234,7 @@ fn parse_discovered(
             Err(e) => errln!("warning: {e}; skipping this file"),
         }
     }
-    Ok((kept, parsed))
+    Ok(parsed)
 }
 
 fn complete_tests(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
@@ -252,12 +249,9 @@ fn complete_tests(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
 
         if path.is_file() {
             if let Ok(test_file) = parser::parse_test_file(path) {
-                for test in &test_file.tests {
-                    if test.name.starts_with(name_prefix) {
-                        candidates.push(CompletionCandidate::new(format!(
-                            "{}/{}",
-                            file_part, test.name
-                        )));
+                for name in &test_file.tests {
+                    if name.starts_with(name_prefix) {
+                        candidates.push(CompletionCandidate::new(format!("{file_part}/{name}")));
                     }
                 }
             }
@@ -277,8 +271,8 @@ fn complete_tests(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
             }
 
             if let Ok(test_file) = parser::parse_test_file(file) {
-                for test in &test_file.tests {
-                    let full = format!("{}/{}", rel, test.name);
+                for name in &test_file.tests {
+                    let full = format!("{rel}/{name}");
                     if full.starts_with(&*current) {
                         candidates.push(CompletionCandidate::new(full));
                     }
@@ -326,16 +320,16 @@ fn main() -> anyhow::Result<()> {
             let filter = filter.or(inline_filter);
             let pattern = filter.as_deref().map(parser::TestPattern::parse);
             let files = discovery::discover_test_files(&path)?;
-            let (_, parsed) = parse_discovered(files, path.is_file())?;
-            let mut tests = Vec::new();
-            for test_file in parsed {
-                for test in test_file.tests {
+            let parsed = parse_discovered(files, path.is_file())?;
+            let mut tests: Vec<(&Path, &str)> = Vec::new();
+            for test_file in &parsed {
+                for name in &test_file.tests {
                     if let Some(ref p) = pattern
-                        && !p.matches(&test)
+                        && !p.matches(&test_file.path, name)
                     {
                         continue;
                     }
-                    tests.push(test);
+                    tests.push((&test_file.path, name));
                 }
             }
             output::print_test_list(&tests);
@@ -352,24 +346,25 @@ fn main() -> anyhow::Result<()> {
             let files = discovery::discover_test_files(&path)?;
 
             // Parse each file exactly once and keep the owning `TestFile`s
-            // alive, so every test can borrow its file's extracted functions
-            // rather than cloning the whole AST per test (and again per repeat).
-            let (files, parsed) = parse_discovered(files, path.is_file())?;
+            // alive, so every test can borrow its file's name, path and
+            // extracted functions rather than cloning the whole AST per test
+            // (and again per repeat).
+            let parsed = parse_discovered(files, path.is_file())?;
 
             // Collect matching tests, tallying how often each name occurs so
             // duplicates across files can be given distinct display names. Each
-            // selection records the index of the file it came from.
-            let mut selected: Vec<(String, usize)> = Vec::new();
-            let mut name_counts: std::collections::HashMap<String, usize> = Default::default();
-            for (idx, test_file) in parsed.iter().enumerate() {
-                for test in &test_file.tests {
+            // selection borrows the file it came from.
+            let mut selected: Vec<(&str, &parser::TestFile)> = Vec::new();
+            let mut name_counts: std::collections::HashMap<&str, usize> = Default::default();
+            for test_file in &parsed {
+                for name in &test_file.tests {
                     if let Some(ref p) = pattern
-                        && !p.matches(test)
+                        && !p.matches(&test_file.path, name)
                     {
                         continue;
                     }
-                    *name_counts.entry(test.name.clone()).or_default() += 1;
-                    selected.push((test.name.clone(), idx));
+                    *name_counts.entry(name).or_default() += 1;
+                    selected.push((name, test_file));
                 }
             }
             if selected.is_empty() {
@@ -382,16 +377,16 @@ fn main() -> anyhow::Result<()> {
             // Display names key result output, per-test context dirs, and
             // --save-context dirs, so they must be unique per test.
             let mut taken = std::collections::HashSet::new();
-            let mut all_tests: Vec<(String, String, usize)> = Vec::new();
-            for (name, idx) in selected {
-                let base = display_base(&name, &files[idx], name_counts[&name] > 1, &mut taken);
+            let mut all_tests: Vec<(String, &str, &parser::TestFile)> = Vec::new();
+            for (name, test_file) in selected {
+                let base = display_base(name, &test_file.path, name_counts[name] > 1, &mut taken);
                 for i in 1..=cli.repeat {
                     let display = if cli.repeat > 1 {
                         format!("{base}#{i}")
                     } else {
                         base.clone()
                     };
-                    all_tests.push((display, name.clone(), idx));
+                    all_tests.push((display, name, test_file));
                 }
             }
 
@@ -437,12 +432,12 @@ fn main() -> anyhow::Result<()> {
 
             let test_refs: Vec<runner::TestSpec> = all_tests
                 .iter()
-                .map(|(display, fn_name, idx)| {
+                .map(|(display, fn_name, test_file)| {
                     (
                         display.as_str(),
-                        fn_name.as_str(),
-                        parsed[*idx].functions.as_slice(),
-                        files[*idx].as_path(),
+                        *fn_name,
+                        test_file.functions.as_slice(),
+                        test_file.path.as_path(),
                     )
                 })
                 .collect();
@@ -487,16 +482,13 @@ mod tests {
         let broken = script(tmp.path(), "broken.sh", BROKEN);
         let good = script(tmp.path(), "good.test", GOOD);
 
-        let (kept, parsed) = parse_discovered(vec![broken, good.clone()], false)
+        let parsed = parse_discovered(vec![broken, good.clone()], false)
             .expect("one bad script must not abort a directory run");
 
-        // Kept files and their parse results stay index-aligned.
-        assert_eq!(kept, vec![good]);
+        // Only the file that parsed is kept, and it knows where it came from.
         assert_eq!(parsed.len(), 1);
-        assert_eq!(
-            parsed[0].tests.iter().map(|t| &t.name).collect::<Vec<_>>(),
-            vec!["testGood"]
-        );
+        assert_eq!(parsed[0].path, good);
+        assert_eq!(parsed[0].tests, ["testGood"]);
     }
 
     #[test]
