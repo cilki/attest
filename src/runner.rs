@@ -1,6 +1,5 @@
 use anyhow::{Result, anyhow};
 use brush_parser::ast::{FunctionDefinition, SourceLocation};
-use std::io::Write;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
@@ -11,6 +10,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 
 use crate::output;
+use crate::output::errln;
 use crate::overlay;
 
 /// Set by the SIGINT/SIGTERM handler. Tests run in their own sessions (see the
@@ -54,7 +54,7 @@ impl XtraceStreamer {
         }
         let xtrace_path = pending.context.as_ref().unwrap().join("xtrace.log");
         if let Ok(file) = std::fs::File::open(&xtrace_path) {
-            eprintln!("\x1b[2m--- xtrace: {} ---\x1b[0m", pending.name);
+            errln!("\x1b[2m--- xtrace: {} ---\x1b[0m", pending.name);
             self.tailed = Some(Tailed {
                 name: pending.name.clone(),
                 file,
@@ -81,9 +81,9 @@ impl XtraceStreamer {
         let mut buf = Vec::new();
         if t.file.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
             t.offset += buf.len() as u64;
-            let _ = write!(std::io::stderr(), "\x1b[2m");
-            let _ = std::io::stderr().write_all(&buf);
-            let _ = write!(std::io::stderr(), "\x1b[0m");
+            output::write_err(b"\x1b[2m");
+            output::write_err(&buf);
+            output::write_err(b"\x1b[0m");
         }
     }
 
@@ -106,10 +106,10 @@ fn dump_xtrace_log(name: &str, context: &Path) {
     if let Ok(content) = std::fs::read(context.join("xtrace.log"))
         && !content.is_empty()
     {
-        eprintln!("\x1b[2m--- xtrace: {name} ---\x1b[0m");
-        let _ = write!(std::io::stderr(), "\x1b[2m");
-        let _ = std::io::stderr().write_all(&content);
-        let _ = write!(std::io::stderr(), "\x1b[0m");
+        errln!("\x1b[2m--- xtrace: {name} ---\x1b[0m");
+        output::write_err(b"\x1b[2m");
+        output::write_err(&content);
+        output::write_err(b"\x1b[0m");
     }
 }
 
@@ -408,6 +408,16 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
             pending_list.clear(); // drop kills the trees and removes contexts
             status.finish();
             anyhow::bail!("interrupted; killed {n} running test(s)");
+        }
+
+        // Whoever was reading our output has gone away (`attest | head -1`, or
+        // quitting out of a pager). The tests still running have nobody left to
+        // report to, so wind the run down like an interrupt rather than running
+        // it out in silence; `main` then exits on a real SIGPIPE.
+        if output::output_closed() {
+            pending_list.clear(); // drop kills the trees and removes contexts
+            status.finish();
+            return Ok(results);
         }
 
         // Stream xtrace output from the current holder.

@@ -1,3 +1,5 @@
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use indicatif::{ProgressBar, ProgressStyle};
@@ -8,6 +10,67 @@ use crate::runner::TestResult;
 pub(crate) const GREEN: &str = "\x1b[32m";
 pub(crate) const RED: &str = "\x1b[31m";
 pub(crate) const RESET: &str = "\x1b[0m";
+
+/// Set once the reader on the other end of one of our streams has gone away, as
+/// `attest | head -1` or quitting out of `attest | less` does.
+///
+/// Rust disables `SIGPIPE` for the whole process at startup, so writing to a
+/// closed pipe does not kill us the way it kills an ordinary Unix filter:
+/// instead the write fails with `EPIPE`, and that is an error `println!`
+/// answers by panicking. A test runner panicking halfway through a run is a
+/// bad look for a tool whose whole job is reporting failures, so every write
+/// goes through [`write_stream`], which latches this flag instead. The run then
+/// winds down the same way it does for ^C and `main` exits on a real `SIGPIPE`.
+static BROKEN_PIPE: AtomicBool = AtomicBool::new(false);
+
+/// Whether our output has nowhere left to go, so the run should wind down.
+pub fn output_closed() -> bool {
+    BROKEN_PIPE.load(Ordering::Relaxed)
+}
+
+/// Write `buf` to `stream`, latching `closed` when the reader is gone and
+/// writing nothing at all once it is set.
+///
+/// Any other error is dropped: there is nowhere left to report a failure to
+/// write a report, and a stream that is merely full should not abandon a run
+/// that is otherwise fine.
+fn write_stream(closed: &AtomicBool, stream: &mut impl Write, buf: &[u8]) {
+    if closed.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Err(e) = stream.write_all(buf).and_then(|()| stream.flush())
+        && e.kind() == std::io::ErrorKind::BrokenPipe
+    {
+        closed.store(true, Ordering::Relaxed);
+    }
+}
+
+pub fn write_out(buf: &[u8]) {
+    write_stream(&BROKEN_PIPE, &mut std::io::stdout().lock(), buf);
+}
+
+pub fn write_err(buf: &[u8]) {
+    write_stream(&BROKEN_PIPE, &mut std::io::stderr().lock(), buf);
+}
+
+/// `println!` that winds the run down instead of panicking once stdout's reader
+/// has gone away. See [`BROKEN_PIPE`].
+macro_rules! outln {
+    () => { $crate::output::write_out(b"\n") };
+    ($($arg:tt)*) => {
+        $crate::output::write_out(format!("{}\n", format_args!($($arg)*)).as_bytes())
+    };
+}
+
+/// `eprintln!` counterpart of [`outln!`].
+macro_rules! errln {
+    () => { $crate::output::write_err(b"\n") };
+    ($($arg:tt)*) => {
+        $crate::output::write_err(format!("{}\n", format_args!($($arg)*)).as_bytes())
+    };
+}
+
+pub(crate) use {errln, outln};
 
 /// Number of blocks in the live progress strip. The whole run is scaled to fit
 /// this width, so on a large suite a single block stands for several tests.
@@ -211,7 +274,7 @@ pub fn print_test_result_json(result: &TestResult) {
     let file = json_escape(&result.source_path.display().to_string());
     let duration_ms = result.duration.as_millis();
 
-    println!(
+    outln!(
         r#"{{"name":"{name}","file":"{file}","status":"{status}","duration_ms":{duration_ms},"stdout":"{stdout}","xtrace":"{xtrace}","strace":{strace_obj},"resources":{resources_json}}}"#
     );
 }
@@ -225,7 +288,7 @@ pub fn print_test_result(result: &TestResult) {
         ("FAIL", RED)
     };
     let duration = format_duration(result.duration);
-    println!("{color}{label}{RESET}  {:<40} ({duration})", result.name);
+    outln!("{color}{label}{RESET}  {:<40} ({duration})", result.name);
     #[cfg(feature = "cgroup")]
     if let Some(ref r) = result.resources {
         print_resource_stats(r);
@@ -263,7 +326,7 @@ fn print_resource_stats(r: &crate::cgroup::ResourceStats) {
     }
 
     if !parts.is_empty() {
-        println!("      {}", parts.join("  "));
+        outln!("      {}", parts.join("  "));
     }
 }
 
@@ -287,19 +350,19 @@ pub fn print_summary(results: &[TestResult], wall_duration: Duration) {
     let passed = results.iter().filter(|r| r.passed).count();
     let failed = results.len() - passed;
 
-    println!();
+    outln!();
     if failed > 0 {
-        println!(
+        outln!(
             "Results: {GREEN}{passed} passed{RESET}, {RED}{failed} failed{RESET}, {} total",
             results.len()
         );
     } else {
-        println!(
+        outln!(
             "Results: {GREEN}{passed} passed{RESET}, {} total",
             results.len()
         );
     }
-    println!("Time:   {}", format_duration(wall_duration));
+    outln!("Time:   {}", format_duration(wall_duration));
 }
 
 pub fn print_test_list(tests: &[TestCase]) {
@@ -309,7 +372,7 @@ pub fn print_test_list(tests: &[TestCase]) {
             .file_name()
             .map(|n| n.to_string_lossy())
             .unwrap_or_else(|| test.file.to_string_lossy());
-        println!("{}/{}", filename, test.name);
+        outln!("{}/{}", filename, test.name);
     }
 }
 
@@ -373,5 +436,50 @@ mod tests {
         let s = display_with(total, vec![true; 2]).render_blocks();
         assert!(s.contains('░'));
         assert!(s.matches('█').count() >= 1);
+    }
+
+    /// A stream whose every write fails with a fixed error kind.
+    struct Failing(std::io::ErrorKind);
+
+    impl Write for Failing {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(self.0))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_vanished_reader_latches_instead_of_failing_the_write() {
+        // The case `println!` answers with a panic: `attest | head -1`.
+        let closed = AtomicBool::new(false);
+        write_stream(
+            &closed,
+            &mut Failing(std::io::ErrorKind::BrokenPipe),
+            b"PASS\n",
+        );
+        assert!(closed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn other_write_errors_leave_the_run_alone() {
+        // A full disk is not a reader walking away, so the run carries on
+        // rather than silently reporting on a fraction of the suite.
+        let closed = AtomicBool::new(false);
+        write_stream(
+            &closed,
+            &mut Failing(std::io::ErrorKind::StorageFull),
+            b"PASS\n",
+        );
+        assert!(!closed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn nothing_is_written_once_the_reader_is_gone() {
+        let closed = AtomicBool::new(true);
+        let mut sink: Vec<u8> = Vec::new();
+        write_stream(&closed, &mut sink, b"PASS\n");
+        assert!(sink.is_empty());
     }
 }

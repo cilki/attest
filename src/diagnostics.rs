@@ -2,7 +2,7 @@ use std::path::Path;
 
 use brush_parser::ast::SourceLocation;
 
-use crate::output::{GREEN, RED, RESET};
+use crate::output::{GREEN, RED, RESET, outln};
 use crate::runner::TestResult;
 
 /// Information extracted from an xtrace log about the failing command.
@@ -163,7 +163,7 @@ fn render_snippet(
             ),
     )];
 
-    println!("{}", Renderer::styled().render(report));
+    outln!("{}", Renderer::styled().render(report));
 }
 
 /// Comparison operators we know how to render a diff for. `==` is how `[[`
@@ -320,9 +320,9 @@ fn render_bracket_diff(expr: &BracketExpr) {
     let left = escape_for_display(&expr.left);
     let right = escape_for_display(&expr.right);
 
-    println!();
-    println!("  left: \"{left}\"");
-    println!(" right: \"{right}\"");
+    outln!();
+    outln!("  left: \"{left}\"");
+    outln!(" right: \"{right}\"");
 
     // For equality operators, show inline diff if values differ
     if matches!(expr.op.as_str(), "=" | "==" | "!=") && left != right {
@@ -349,8 +349,8 @@ fn render_bracket_diff(expr: &BracketExpr) {
                 }
             }
         }
-        println!("  diff: \"{left_hl}\"");
-        println!("        \"{right_hl}\"");
+        outln!("  diff: \"{left_hl}\"");
+        outln!("        \"{right_hl}\"");
     }
 }
 

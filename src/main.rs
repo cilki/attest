@@ -11,6 +11,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
 use std::path::{Path, PathBuf};
 
+use crate::output::errln;
+
 fn parse_fuzz(s: &str) -> Result<f64, String> {
     let v: f64 = s
         .parse()
@@ -232,7 +234,7 @@ fn parse_discovered(
             // Printed directly rather than logged: dropping a file changes
             // what the run covers, so it must show up whatever the log level
             // happens to be.
-            Err(e) => eprintln!("warning: {e}; skipping this file"),
+            Err(e) => errln!("warning: {e}; skipping this file"),
         }
     }
     Ok((kept, parsed))
@@ -288,6 +290,20 @@ fn complete_tests(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
     candidates
 }
 
+/// Finish the way an ordinary Unix filter does once its reader has gone away.
+///
+/// Rust turns `SIGPIPE` off at startup, so restore the default disposition and
+/// re-raise it: the shell then sees the usual signal status instead of an exit
+/// code we invented, and `attest | head -1` behaves like `seq 100 | head -1`.
+fn exit_broken_pipe() -> ! {
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        libc::raise(libc::SIGPIPE);
+    }
+    // Only reached if something had SIGPIPE blocked.
+    std::process::exit(128 + libc::SIGPIPE)
+}
+
 fn main() -> anyhow::Result<()> {
     clap_complete::CompleteEnv::with_factory(Cli::command).complete();
 
@@ -300,9 +316,10 @@ fn main() -> anyhow::Result<()> {
     };
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
+    let mut any_failed = false;
     match cli.command {
         Some(Commands::Skill) => {
-            print!("{}", include_str!("../SKILL.md"));
+            output::write_out(include_str!("../SKILL.md").as_bytes());
         }
         Some(Commands::List { path, filter }) => {
             let (path, inline_filter) = split_path_arg(&path);
@@ -325,7 +342,7 @@ fn main() -> anyhow::Result<()> {
         }
         None => {
             let path_arg = cli.path.unwrap_or_else(|| {
-                eprintln!("error: a path to a test file or directory is required");
+                errln!("error: a path to a test file or directory is required");
                 std::process::exit(1);
             });
 
@@ -431,11 +448,18 @@ fn main() -> anyhow::Result<()> {
                 .collect();
 
             let results = runner::run_all_tests(test_refs, &config)?;
-
-            if results.iter().any(|r| !r.passed) {
-                std::process::exit(1);
-            }
+            any_failed = results.iter().any(|r| !r.passed);
         }
+    }
+
+    // Our reader is gone, so the run has no report to exit about — exiting 1
+    // for a failure nobody ever saw would be worse than useless under
+    // `set -o pipefail`.
+    if output::output_closed() {
+        exit_broken_pipe();
+    }
+    if any_failed {
+        std::process::exit(1);
     }
 
     Ok(())

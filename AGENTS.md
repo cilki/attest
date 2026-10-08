@@ -50,6 +50,11 @@
   annotate-snippets error snippet. Also shows inline character-level diffs for
   failed `[ A = B ]` assertions.
 - `src/output.rs` - ANSI-colored terminal output for PASS/FAIL and summary.
+  Every write to stdout/stderr goes through `write_out`/`write_err` (and the
+  `outln!`/`errln!` macros) rather than `println!`: Rust disables `SIGPIPE`, so
+  `println!` panics when the reader goes away (`attest | head -1`). Instead the
+  first `EPIPE` latches `output_closed()`, the runner winds the run down like an
+  interrupt, and `main` re-raises `SIGPIPE` so the shell sees the usual status.
 
 ## Key dependencies
 
