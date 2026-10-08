@@ -9,19 +9,18 @@ use tracing::warn;
 
 /// File containing tests.
 pub struct TestFile {
-    pub tests: Vec<TestCase>,
+    /// The file this was parsed from. Every test in it shares it, so it is kept
+    /// here rather than repeated per test.
+    pub path: PathBuf,
+    /// Names of the test functions, in source order — one per name the shell
+    /// would actually run (see [`parse_test_file`]).
+    pub tests: Vec<String>,
     pub functions: Vec<FunctionDefinition>,
-}
-
-/// Test function within a `TestFile`.
-pub struct TestCase {
-    pub file: PathBuf,
-    pub name: String,
 }
 
 /// A pattern for selecting tests, parsed from `[<file>/]<name-pattern>`.
 ///
-/// - `file`: if present, `test.file` must end with this path
+/// - `file`: if present, the test's file must end with this path
 /// - `name`: if present, matches the test function name; `*` is a wildcard;
 ///   a pattern without `*` matches any name that starts with the pattern
 pub struct TestPattern {
@@ -47,14 +46,14 @@ impl TestPattern {
         }
     }
 
-    pub fn matches(&self, test: &TestCase) -> bool {
+    pub fn matches(&self, file: &Path, name: &str) -> bool {
         if let Some(ref file_pat) = self.file
-            && !test.file.ends_with(file_pat)
+            && !file.ends_with(file_pat)
         {
             return false;
         }
         if let Some(ref name_pat) = self.name
-            && !wildcard_match(name_pat, &test.name)
+            && !wildcard_match(name_pat, name)
         {
             return false;
         }
@@ -122,13 +121,14 @@ pub fn parse_test_file(path: &Path) -> anyhow::Result<TestFile> {
             );
             continue;
         }
-        tests.push(TestCase {
-            file: path.to_path_buf(),
-            name: f.fname.value.clone(),
-        });
+        tests.push(f.fname.value.clone());
     }
 
-    Ok(TestFile { tests, functions })
+    Ok(TestFile {
+        path: path.to_path_buf(),
+        tests,
+        functions,
+    })
 }
 
 fn extract_functions(program: &Program) -> Vec<FunctionDefinition> {
@@ -210,13 +210,6 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    fn make_case(file: &str, name: &str) -> TestCase {
-        TestCase {
-            file: PathBuf::from(file),
-            name: name.to_string(),
-        }
-    }
-
     #[test]
     fn pattern_parse_name_only() {
         let p = TestPattern::parse("test_foo");
@@ -249,30 +242,31 @@ mod tests {
     #[test]
     fn pattern_prefix_match() {
         let p = TestPattern::parse("test_foo");
-        assert!(p.matches(&make_case("/any/file.sh", "test_foo")));
-        assert!(p.matches(&make_case("/any/file.sh", "test_foo_bar")));
-        assert!(!p.matches(&make_case("/any/file.sh", "test_baz")));
+        let file = Path::new("/any/file.sh");
+        assert!(p.matches(file, "test_foo"));
+        assert!(p.matches(file, "test_foo_bar"));
+        assert!(!p.matches(file, "test_baz"));
     }
 
     #[test]
     fn pattern_wildcard_match() {
         let p = TestPattern::parse("test_*_end");
-        assert!(p.matches(&make_case("f.sh", "test_foo_end")));
-        assert!(!p.matches(&make_case("f.sh", "test_foo_end_extra")));
+        assert!(p.matches(Path::new("f.sh"), "test_foo_end"));
+        assert!(!p.matches(Path::new("f.sh"), "test_foo_end_extra"));
     }
 
     #[test]
     fn pattern_file_filter() {
         let p = TestPattern::parse("foo.sh/test_");
-        assert!(p.matches(&make_case("/path/to/foo.sh", "test_bar")));
-        assert!(!p.matches(&make_case("/path/to/bar.sh", "test_bar")));
+        assert!(p.matches(Path::new("/path/to/foo.sh"), "test_bar"));
+        assert!(!p.matches(Path::new("/path/to/bar.sh"), "test_bar"));
     }
 
     #[test]
     fn pattern_file_subpath() {
         let p = TestPattern::parse("tests/foo.sh/test_");
-        assert!(p.matches(&make_case("/repo/tests/foo.sh", "test_bar")));
-        assert!(!p.matches(&make_case("/repo/other/foo.sh", "test_bar")));
+        assert!(p.matches(Path::new("/repo/tests/foo.sh"), "test_bar"));
+        assert!(!p.matches(Path::new("/repo/other/foo.sh"), "test_bar"));
     }
 
     fn write_script(dir: &Path, name: &str, content: &str) -> PathBuf {
@@ -291,9 +285,7 @@ mod tests {
         );
 
         let result = parse_test_file(&path).unwrap();
-        assert_eq!(result.tests.len(), 2);
-        assert_eq!(result.tests[0].name, "test_hello");
-        assert_eq!(result.tests[1].name, "test_world");
+        assert_eq!(result.tests, ["test_hello", "test_world"]);
         assert_eq!(result.functions.len(), 2);
     }
 
@@ -307,8 +299,7 @@ mod tests {
         );
 
         let result = parse_test_file(&path).unwrap();
-        assert_eq!(result.tests.len(), 1);
-        assert_eq!(result.tests[0].name, "test_foo");
+        assert_eq!(result.tests, ["test_foo"]);
         assert_eq!(result.functions.len(), 2);
     }
 
@@ -342,7 +333,7 @@ mod tests {
         let path = write_script(tmp.path(), "my.test", "test_a() {\n  true\n}\n");
 
         let result = parse_test_file(&path).unwrap();
-        assert_eq!(result.tests[0].file, path);
+        assert_eq!(result.path, path);
     }
 
     #[test]
@@ -362,7 +353,7 @@ mod tests {
 
         let result = parse_test_file(&path).unwrap();
         // "testing" starts with "test" so it is a test; "my_test" does not start with "test"
-        let names: Vec<&str> = result.tests.iter().map(|t| t.name.as_str()).collect();
+        let names: Vec<&str> = result.tests.iter().map(String::as_str).collect();
         assert!(names.contains(&"testing"));
         assert!(names.contains(&"test_real"));
         assert!(!names.contains(&"my_test"));
@@ -379,7 +370,7 @@ mod tests {
         );
 
         let result = parse_test_file(&path).unwrap();
-        let names: Vec<&str> = result.tests.iter().map(|t| t.name.as_str()).collect();
+        let names: Vec<&str> = result.tests.iter().map(String::as_str).collect();
         assert!(names.contains(&"test_inside_if"));
         assert!(names.contains(&"test_inside_for"));
     }
@@ -398,8 +389,7 @@ mod tests {
         );
 
         let result = parse_test_file(&path).unwrap();
-        assert_eq!(result.tests.len(), 1);
-        assert_eq!(result.tests[0].name, "test_dup");
+        assert_eq!(result.tests, ["test_dup"]);
         assert_eq!(result.functions.len(), 2);
     }
 

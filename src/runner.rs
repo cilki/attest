@@ -1208,12 +1208,12 @@ mod tests {
         }
     }
 
-    /// Write `script` to `dir/t.sh` and parse it.
-    fn parse_script(dir: &Path, script: &str) -> (PathBuf, crate::parser::TestFile) {
+    /// Write `script` to `dir/t.sh` and parse it. The result carries the path it
+    /// was parsed from, so callers that need it read `tf.path`.
+    fn parse_script(dir: &Path, script: &str) -> crate::parser::TestFile {
         let path = dir.join("t.sh");
         fs::write(&path, script).unwrap();
-        let tf = crate::parser::parse_test_file(&path).unwrap();
-        (path, tf)
+        crate::parser::parse_test_file(&path).unwrap()
     }
 
     /// Block until `pending` finishes, reaping it exactly the way the poll
@@ -1236,24 +1236,32 @@ mod tests {
         config: &RunConfig,
         env: &RunEnv,
     ) -> TestResult {
-        let (path, tf) = parse_script(srcdir, script);
+        let tf = parse_script(srcdir, script);
         let ctx = TempDir::new().unwrap().keep();
-        let mut pending =
-            spawn_test(test_name, test_name, &tf.functions, &path, ctx, config, env).unwrap();
+        let mut pending = spawn_test(
+            test_name,
+            test_name,
+            &tf.functions,
+            &tf.path,
+            ctx,
+            config,
+            env,
+        )
+        .unwrap();
         let status = reap_blocking(&mut pending);
         build_result(pending, status)
     }
 
     /// `run_all_tests` input running every test in `tf` under its own name.
-    fn test_refs<'a>(tf: &'a crate::parser::TestFile, path: &'a Path) -> Vec<TestSpec<'a>> {
+    fn test_refs(tf: &crate::parser::TestFile) -> Vec<TestSpec<'_>> {
         tf.tests
             .iter()
-            .map(|t| {
+            .map(|name| {
                 (
-                    t.name.as_str(),
-                    t.name.as_str(),
+                    name.as_str(),
+                    name.as_str(),
                     tf.functions.as_slice(),
-                    path,
+                    tf.path.as_path(),
                 )
             })
             .collect()
@@ -1311,7 +1319,7 @@ mod tests {
     #[test]
     fn traversing_test_name_cannot_escape_the_save_dir() {
         let tmp = TempDir::new().unwrap();
-        let (path, tf) = parse_script(tmp.path(), "test_escape() {\n  echo hi > marker\n}\n");
+        let tf = parse_script(tmp.path(), "test_escape() {\n  echo hi > marker\n}\n");
 
         let outside = tmp.path().join("outside");
         fs::create_dir(&outside).unwrap();
@@ -1326,7 +1334,7 @@ mod tests {
         };
 
         let results = run_all_tests(
-            vec![(display, "test_escape", tf.functions.as_slice(), &*path)],
+            vec![(display, "test_escape", tf.functions.as_slice(), &tf.path)],
             &config,
         )
         .unwrap();
@@ -1444,7 +1452,7 @@ mod tests {
         // hands back an exit status, the straggler is already gone. Reaping
         // first leaves it running until the context is dropped.
         let tmp = TempDir::new().unwrap();
-        let (path, tf) = parse_script(
+        let tf = parse_script(
             tmp.path(),
             "test_bg() {\n  sleep 300 &\n  echo $! > pid\n}\n",
         );
@@ -1454,7 +1462,7 @@ mod tests {
             "test_bg",
             "test_bg",
             &tf.functions,
-            &path,
+            &tf.path,
             ctx,
             &config,
             &no_overlay_env(tmp.path()),
@@ -1797,13 +1805,13 @@ mod tests {
     #[test]
     fn run_all_tests_serial() {
         let tmp = TempDir::new().unwrap();
-        let (path, tf) = parse_script(tmp.path(), "test_a() {\n  true\n}\ntest_b() {\n  true\n}\n");
+        let tf = parse_script(tmp.path(), "test_a() {\n  true\n}\ntest_b() {\n  true\n}\n");
         let config = RunConfig {
             parallel: 1,
             ..RunConfig::default()
         };
 
-        let results = run_all_tests(test_refs(&tf, &path), &config).unwrap();
+        let results = run_all_tests(test_refs(&tf), &config).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.passed));
     }
@@ -1812,7 +1820,7 @@ mod tests {
     fn bail_stops_after_first_failure() {
         let tmp = TempDir::new().unwrap();
         // test_fail comes first alphabetically, test_pass second
-        let (path, tf) = parse_script(
+        let tf = parse_script(
             tmp.path(),
             "test_fail() {\n  false\n}\ntest_pass() {\n  true\n}\n",
         );
@@ -1822,7 +1830,7 @@ mod tests {
             ..RunConfig::default()
         };
 
-        let results = run_all_tests(test_refs(&tf, &path), &config).unwrap();
+        let results = run_all_tests(test_refs(&tf), &config).unwrap();
         // Only the failing test ran; bail stopped execution
         assert_eq!(results.len(), 1);
         assert!(!results[0].passed);
@@ -1831,7 +1839,7 @@ mod tests {
     #[test]
     fn run_all_tests_parallel() {
         let tmp = TempDir::new().unwrap();
-        let (path, tf) = parse_script(
+        let tf = parse_script(
             tmp.path(),
             "test_x() {\n  true\n}\ntest_y() {\n  false\n}\n",
         );
@@ -1840,7 +1848,7 @@ mod tests {
             ..RunConfig::default()
         };
 
-        let results = run_all_tests(test_refs(&tf, &path), &config).unwrap();
+        let results = run_all_tests(test_refs(&tf), &config).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.iter().any(|r| r.passed));
         assert!(results.iter().any(|r| !r.passed));
@@ -1849,14 +1857,14 @@ mod tests {
     #[test]
     fn timeout_kills_slow_test() {
         let tmp = TempDir::new().unwrap();
-        let (path, tf) = parse_script(tmp.path(), "test_slow() {\n  sleep 60\n}\n");
+        let tf = parse_script(tmp.path(), "test_slow() {\n  sleep 60\n}\n");
         let config = RunConfig {
             parallel: 1,
             timeout: Some(std::time::Duration::from_millis(200)),
             ..RunConfig::default()
         };
 
-        let results = run_all_tests(test_refs(&tf, &path), &config).unwrap();
+        let results = run_all_tests(test_refs(&tf), &config).unwrap();
         assert_eq!(results.len(), 1);
         assert!(!results[0].passed);
         assert!(results[0].timed_out);
@@ -1989,7 +1997,7 @@ mod tests {
         // the same line number it has in the source, with the gaps blanked.
         let source = "helper() {\n  echo setup\n}\n\ntest_foo() {\n  echo a\n  false\n}\n";
         let tmp = TempDir::new().unwrap();
-        let (_, tf) = parse_script(tmp.path(), source);
+        let tf = parse_script(tmp.path(), source);
 
         let generated = build_functions_source(&tf.functions, Some(source));
         let gen_lines: Vec<&str> = generated.lines().collect();
@@ -2010,7 +2018,7 @@ mod tests {
         // valid shell that defines and runs each function.
         let source = "helper() {\n  echo 42\n}\n\ntest_foo() {\n  test \"$(helper)\" = 42\n}\n";
         let tmp = TempDir::new().unwrap();
-        let (_, tf) = parse_script(tmp.path(), source);
+        let tf = parse_script(tmp.path(), source);
 
         let generated = build_functions_source(&tf.functions, None);
         let script = tmp.path().join("fallback.sh");
