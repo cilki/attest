@@ -337,7 +337,22 @@ A filter is `[<file>/]<name>`, and the `/` is what tells the two halves apart:
   name in full, so `*Help` is a suffix match and `test*` is everything.
 
 `list` accepts the same targets and `--filter`, so you can check what a
-selection covers before running it.
+selection covers before running it. What it prints is a selector of exactly the
+same shape, relative to the directory you ran it in, so a line of its output
+goes straight back as a target or a filter:
+
+```sh
+❯ attest list examples/md5sum.test
+examples/md5sum.test/testHelp
+examples/md5sum.test/testVersion
+examples/md5sum.test/testHello
+
+❯ attest examples/md5sum.test/testHello
+```
+
+The directories are part of the selector because the file half is only a
+suffix: two files named `x.test` in different directories would otherwise list
+identically, and either line would select both of their tests.
 
 ### Other options
 

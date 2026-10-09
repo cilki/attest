@@ -343,15 +343,30 @@ pub fn print_summary(results: &[TestResult], wall_duration: Duration) {
     outln!("Time:   {}", format_duration(wall_duration));
 }
 
+/// Format a `(file, test name)` pair as the `<file>/<test>` selector that
+/// `--filter` and the positional target accept.
+///
+/// The file half is the path the test was discovered at, not just its base
+/// name. Two things need it that way: the file half of a selector is matched
+/// as a path *suffix*, so a bare `x.test/test_foo` names every `x.test` in the
+/// tree while `a/x.test/test_foo` names exactly one; and a positional target
+/// has to have a real path on its left (`split_path_arg` only splits where the
+/// left side is an existing file), so only a selector carrying the directories
+/// it was found under can be pasted back as `attest <selector>` from the
+/// directory the listing was made in.
+fn test_selector(file: &Path, name: &str) -> String {
+    let path = file.to_string_lossy();
+    // A walk rooted at `.` yields `./a/x.test`; the leading `./` is noise in a
+    // selector that is already relative to the invocation directory.
+    let path = path.strip_prefix("./").unwrap_or(&path);
+    format!("{path}/{name}")
+}
+
 /// Print each `(file, test name)` pair as the `<file>/<test>` form `--filter`
 /// and the positional target accept.
 pub fn print_test_list(tests: &[(&Path, &str)]) {
     for (file, name) in tests {
-        let filename = file
-            .file_name()
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_else(|| file.to_string_lossy());
-        outln!("{filename}/{name}");
+        outln!("{}", test_selector(file, name));
     }
 }
 
@@ -499,6 +514,37 @@ mod tests {
         let s = display_with(total, vec![true; 2]).render_blocks();
         assert!(s.contains('░'));
         assert!(s.matches('█').count() >= 1);
+    }
+
+    #[test]
+    fn listed_selector_keeps_the_directories_a_test_was_found_under() {
+        // A listing is relative to the directory it was made in, and a
+        // positional target only splits where the left half is an existing
+        // file — so the selector has to carry the path, not just the base
+        // name, or `attest $(attest list . | head -1)` cannot find the file.
+        assert_eq!(
+            test_selector(&Path::new(".").join("tests/x.test"), "test_foo"),
+            "tests/x.test/test_foo"
+        );
+        assert_eq!(
+            test_selector(Path::new("/abs/x.test"), "test_foo"),
+            "/abs/x.test/test_foo"
+        );
+    }
+
+    #[test]
+    fn listed_selectors_tell_same_named_files_apart() {
+        // Base names repeat across a tree, and the file half of a selector is
+        // a path suffix: listing base names alone printed the same line twice
+        // for `a/x.test` and `b/x.test`, and that line selected both tests.
+        let a = Path::new("a/x.test");
+        let b = Path::new("b/x.test");
+        let selector = test_selector(a, "test_foo");
+        assert_ne!(selector, test_selector(b, "test_foo"));
+
+        let pattern = crate::parser::TestPattern::parse(&selector);
+        assert!(pattern.matches(a, "test_foo"));
+        assert!(!pattern.matches(b, "test_foo"));
     }
 
     /// A stream whose every write fails with a fixed error kind.

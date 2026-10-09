@@ -3,8 +3,13 @@
 - `src/main.rs` - CLI entry point using clap. Invoking `attest` with no
   subcommand runs the tests; `list` and `skill` are the only subcommands. The
   positional target is a file, a directory, or a `<file>/<test>` pattern, which
-  is split into a path plus an implicit `--filter`. `parse_discovered` parses
-  every discovered file: a parse error in a file the user named directly is
+  is split into a path plus an implicit `--filter`. `list` prints each test as
+  that same selector, keeping the directories the file was discovered under —
+  the file half matches as a path suffix and a positional target only splits
+  where its left half is an existing file, so a base-name-only listing is both
+  ambiguous between same-named files and unusable as a target.
+  `parse_discovered` parses every discovered file: a parse error in a file the
+  user named directly is
   fatal, while one in a file the directory walk turned up is reported on stderr
   and the file skipped, so an unparseable script elsewhere in the tree cannot
   abort the run.
