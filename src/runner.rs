@@ -54,7 +54,10 @@ impl XtraceStreamer {
         }
         let xtrace_path = pending.context.as_ref().unwrap().join("xtrace.log");
         if let Ok(file) = overlay::open_nofollow(&xtrace_path) {
-            errln!("\x1b[2m--- xtrace: {} ---\x1b[0m", pending.name);
+            errln!(
+                "\x1b[2m--- xtrace: {} ---\x1b[0m",
+                output::escape_label(&pending.name)
+            );
             self.tailed = Some(Tailed {
                 name: pending.name.clone(),
                 file,
@@ -109,7 +112,10 @@ fn dump_xtrace_log(name: &str, context: &Path) {
     if let Ok(content) = overlay::read_nofollow(&context.join("xtrace.log"))
         && !content.is_empty()
     {
-        errln!("\x1b[2m--- xtrace: {name} ---\x1b[0m");
+        errln!(
+            "\x1b[2m--- xtrace: {} ---\x1b[0m",
+            output::escape_label(name)
+        );
         output::write_err(b"\x1b[2m");
         output::write_err(&content);
         output::write_err(b"\x1b[0m");
