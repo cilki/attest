@@ -153,7 +153,9 @@ impl StatusDisplay {
             bar.set_position(completed as u64);
             let running_msg: String = running
                 .iter()
-                .map(|(name, elapsed)| format!("{}({})", name, format_duration(*elapsed)))
+                .map(|(name, elapsed)| {
+                    format!("{}({})", escape_label(name), format_duration(*elapsed))
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             let blocks = self.render_blocks();
@@ -264,7 +266,8 @@ pub fn print_test_result_json(result: &TestResult) {
     outln!("{}", test_result_json(result));
 }
 
-pub fn print_test_result(result: &TestResult) {
+/// The one-line `PASS`/`FAIL`/`TIME` report for a finished test.
+fn result_line(result: &TestResult) -> String {
     let (label, color) = if result.passed {
         ("PASS", GREEN)
     } else if result.timed_out {
@@ -273,7 +276,12 @@ pub fn print_test_result(result: &TestResult) {
         ("FAIL", RED)
     };
     let duration = format_duration(result.duration);
-    outln!("{color}{label}{RESET}  {:<40} ({duration})", result.name);
+    let name = escape_label(&result.name);
+    format!("{color}{label}{RESET}  {:<40} ({duration})", &*name)
+}
+
+pub fn print_test_result(result: &TestResult) {
+    outln!("{}", result_line(result));
     #[cfg(feature = "cgroup")]
     if let Some(ref r) = result.resources {
         print_resource_stats(r);
@@ -373,8 +381,52 @@ fn test_selector(file: &Path, name: &str) -> String {
 /// and the positional target accept.
 pub fn print_test_list(tests: &[(&Path, &str)]) {
     for (file, name) in tests {
-        outln!("{}", test_selector(file, name));
+        // The selector carries both halves of a name the tree chose, so it is
+        // escaped as a whole rather than printed raw.
+        outln!("{}", escape_label(&test_selector(file, name)));
     }
+}
+
+/// Escape the control characters in a label — a test name, or the name of a
+/// file the walk turned up — before it is printed as part of the report.
+///
+/// Both are arbitrary bytes chosen by whoever wrote the tree, not by `attest`:
+/// a shell takes almost anything as a function name (`test_x$'\e[K'() { … }`
+/// defines and runs fine under `sh` and `bash`), and a file name is whatever
+/// `read_dir` hands back. Printed raw, those bytes are terminal commands, and
+/// the field they sit in is the part of the line that says what happened — so a
+/// failing test can name itself `test_lie\e[1G\e[K\e[32mPASS\e[0m\e[2Ctest_lie`
+/// and have `attest` address the cursor back over the `FAIL` it just wrote,
+/// erase it, and print a green `PASS` in its place.
+///
+/// A label is one field *inside* a line, so `\n`, `\r` and `\t` are escaped
+/// here too: a newline in a name forges a whole extra line of the report rather
+/// than merely mangling the layout of one. Characters outside ASCII are left
+/// alone — a UTF-8 terminal reads them as text, and a test named in Japanese
+/// should still say so.
+///
+/// `--json` reports names verbatim: nothing interprets them there, and
+/// `serde_json` escapes what its own grammar needs.
+pub(crate) fn escape_label(label: &str) -> std::borrow::Cow<'_, str> {
+    use std::fmt::Write as _;
+
+    /// C0 controls and `DEL`: everything a terminal acts on rather than shows.
+    fn is_control(c: char) -> bool {
+        matches!(c, '\0'..='\u{1f}' | '\u{7f}')
+    }
+
+    if !label.contains(is_control) {
+        return std::borrow::Cow::Borrowed(label);
+    }
+    let mut out = String::with_capacity(label.len());
+    for c in label.chars() {
+        if is_control(c) {
+            let _ = write!(out, "\\x{:02x}", c as u32);
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 fn format_duration(d: Duration) -> String {
@@ -403,6 +455,48 @@ mod tests {
             #[cfg(feature = "cgroup")]
             resources: None,
         }
+    }
+
+    #[test]
+    fn result_line_defuses_a_name_that_rewrites_the_report() {
+        // The payload a hostile function name carries: address the cursor back
+        // to column 1, erase the line `attest` is in the middle of writing, and
+        // put a green `PASS` where the `FAIL` was. Every byte that makes that
+        // work has to come out inert, and none of it may be lost — the reader
+        // still has to be able to tell which test this was.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut result = result_in(
+            tmp.path(),
+            "test_lie\x1b[1G\x1b[K\x1b[32mPASS\x1b[0m\x1b[2Ctest_lie",
+        );
+        result.timed_out = false;
+
+        assert_eq!(
+            result_line(&result),
+            format!(
+                "{RED}FAIL{RESET}  \
+                 test_lie\\x1b[1G\\x1b[K\\x1b[32mPASS\\x1b[0m\\x1b[2Ctest_lie (1.50s)"
+            )
+        );
+    }
+
+    #[test]
+    fn escape_label_keeps_a_legible_name_as_it_is() {
+        // The names attest makes up for itself (`<file>:<test>`, `#<repeat>`)
+        // and any ordinary one pass through untouched, without a copy.
+        assert!(matches!(
+            escape_label("a.test:test_foo#2"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        // Non-ASCII is text to a UTF-8 terminal, not a control sequence.
+        assert_eq!(escape_label("testユニコード"), "testユニコード");
+        // A newline would forge a whole line of the report and a tab would
+        // shift the columns of one, so a label escapes those as well — unlike
+        // a log, where they are the layout.
+        assert_eq!(
+            escape_label("test_a\nb\tc\rd\x7f"),
+            r"test_a\x0ab\x09c\x0dd\x7f"
+        );
     }
 
     #[test]

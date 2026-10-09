@@ -75,6 +75,12 @@
   annotate-snippets error snippet. Also shows inline character-level diffs for
   failed `[ A = B ]` assertions.
 - `src/output.rs` - ANSI-colored terminal output for PASS/FAIL and summary.
+  Test names and discovered file names go into a report line through
+  `escape_label`, which spells their control characters `\xNN`: both are
+  arbitrary bytes from the tree (a shell takes almost anything as a function
+  name), and raw they let a failing test move the cursor back over its own
+  `FAIL` and print a `PASS` instead. `--json` is unaffected and reports names
+  verbatim.
   Every write to stdout/stderr goes through `write_out`/`write_err` (and the
   `outln!`/`errln!` macros) rather than `println!`: Rust disables `SIGPIPE`, so
   `println!` panics when the reader goes away (`attest | head -1`). Instead the

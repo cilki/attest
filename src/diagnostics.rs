@@ -139,10 +139,15 @@ fn render_snippet(
 ) {
     use annotate_snippets::{AnnotationKind, Level, Renderer, Snippet};
 
-    let path_str = source_path
+    // A file name comes out of the directory walk, so it is as much the tree's
+    // choice as a test name is: annotate-snippets substitutes the control
+    // characters in the rendered *source*, but prints the path it is given
+    // as-is.
+    let file_name = source_path
         .file_name()
         .map(|n| n.to_string_lossy())
         .unwrap_or_else(|| source_path.to_string_lossy());
+    let path_str = crate::output::escape_label(&file_name);
 
     let start = line_idx.saturating_sub(CONTEXT_LINES).max(func_start_line);
     let end = (line_idx + CONTEXT_LINES + 1)

@@ -300,6 +300,13 @@ By default you get a progress bar while the run is in flight, a summary at the
 end, and a report for each failure. Add `-v` if you also want a PASS/FAIL line
 per test.
 
+Control characters in a test or file name are escaped (`\x1b`, `\x0d`, …)
+wherever that name appears in the report. A shell takes almost anything as a
+function name, including bytes a terminal reads as cursor movement — and the
+name sits right next to the `PASS`/`FAIL` the report is for, so a test could
+otherwise erase its own verdict and write a nicer one. `--json` is unaffected:
+nothing interprets a name there, so it comes back byte for byte.
+
 Every test runs in a temporary _context directory_ that collects logs and
 temporary files created by the test.
 
