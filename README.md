@@ -358,7 +358,8 @@ identically, and either line would select both of their tests.
 
 - `--timeout SECS` — kill a test after this much wall-clock time and report it
   as `TIME`
-- `--bail` — stop launching new tests after the first failure
+- `--bail` — end the run at the first failure, killing the tests still running
+  (see [Stopping a run early](#stopping-a-run-early))
 - `--repeat N` — run each test N times
 - `--json` — print one JSON object per test instead of the colored output
 - `--override SPEC` — copy a binary into the test's `bin/` dir so tests resolve
@@ -374,6 +375,43 @@ identically, and either line would select both of their tests.
   working directory
 - `--no-cgroups` — don't track per-test CPU, memory and IO usage with cgroups
 - `-d`, `--debug` — enable debug logging
+
+### Stopping a run early
+
+Normally a run ends once every selected test has finished, and the summary
+counts all of them. Two things cut a run short, and both of them tear it down
+rather than let it drain — the tests still in flight are killed with `SIGKILL`,
+so no `trap` inside a test runs on the way out:
+
+- **`--bail`.** The first failure ends the run. No further tests are launched,
+  _and the tests that were already running are killed where they are_ — they
+  are never reported, as neither failures nor skips, so the summary's total
+  counts only the tests that had finished by then. With `--parallel 4`, a
+  failure in the very first batch can leave a hundred-test selection reporting
+  `1 total`:
+
+  ```
+  ❯ attest . --bail --parallel 4
+  FAIL  testFastFail                             (57ms)
+  ...
+
+  Results: 0 passed, 1 failed, 1 total
+  Time:   1.06s
+  ```
+
+  The exit status is 1, as for any run with a failure in it.
+
+- **`^C` (or `SIGTERM`).** Every running test's process tree is killed and
+  `attest` abandons the run: there is no summary at all, just
+  `Error: interrupted; killed 2 running test(s)` on stderr and exit status 1.
+  Results from tests that already finished are discarded along with it, so use
+  `-v` (or `--json`) if you want a record of them as they go. Tests run in
+  their own sessions, which is why `attest` has to do this killing itself: the
+  terminal's `^C` reaches `attest` only, never the tests.
+
+A run also winds down early if whatever was reading its output goes away:
+`attest . | head -1` kills the running tests and dies of `SIGPIPE` like any
+other filter, rather than finishing the suite with nobody left to report to.
 
 ### Containerized tests
 

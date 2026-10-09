@@ -97,7 +97,10 @@ to tests.
 - `--parallel N` — max concurrent tests (default: CPU cores)
 - `--timeout SECS` — wall-clock timeout per test; timed-out tests show `TIME`
   and count as failures
-- `--bail` — stop after first failure
+- `--bail` — end the run at the first failure. Tests already in flight are
+  dropped unreaped (`PendingTest::drop` kills the tree) and never turned into
+  results, so the summary totals only the tests that finished; `^C`/`SIGTERM`
+  does the same to the whole run and bails out without a summary
 - `--filter [FILE/]PATTERN` — run only matching tests. `FILE` is a path suffix
   (no wildcards); `PATTERN` takes `*` wildcards and matches as a prefix only
   when it has none. Without a `/` the argument is all `PATTERN`
