@@ -86,6 +86,11 @@
   `println!` panics when the reader goes away (`attest | head -1`). Instead the
   first `EPIPE` latches `output_closed()`, the runner winds the run down like an
   interrupt, and `main` re-raises `SIGPIPE` so the shell sees the usual status.
+  A captured log goes out through `write_log_err` instead, which escapes every
+  C0 control byte but `\n`/`\t`: `xtrace.log` carries whatever the test wrote to
+  stderr, and replaying that raw would let a cursor-movement sequence in it
+  erase and rewrite the report around it. `--json`/`--save-context` are
+  unaffected and still carry the bytes verbatim.
 
 ## Key dependencies
 

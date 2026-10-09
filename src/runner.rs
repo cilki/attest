@@ -85,7 +85,7 @@ impl XtraceStreamer {
         if t.file.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
             t.offset += buf.len() as u64;
             output::write_err(b"\x1b[2m");
-            output::write_err(&buf);
+            output::write_log_err(&buf);
             output::write_err(b"\x1b[0m");
         }
     }
@@ -105,6 +105,10 @@ impl XtraceStreamer {
 
 /// Print a test's full xtrace.log, dimmed, under a `--- xtrace: <name> ---`
 /// header. Silent if the log is missing or empty.
+///
+/// The log is whatever the test and the programs it ran wrote to stderr, so it
+/// goes out through [`output::write_log_err`] rather than being replayed
+/// verbatim into the terminal.
 fn dump_xtrace_log(name: &str, context: &Path) {
     // Read the file the runner created, not whatever a symlink left at that
     // name points at: the test can rewrite its own context dir
@@ -117,7 +121,7 @@ fn dump_xtrace_log(name: &str, context: &Path) {
             output::escape_label(name)
         );
         output::write_err(b"\x1b[2m");
-        output::write_err(&content);
+        output::write_log_err(&content);
         output::write_err(b"\x1b[0m");
     }
 }

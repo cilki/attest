@@ -588,6 +588,11 @@ this one shows up
 So send anything you want to see on failure to stderr, and don't redirect either
 stream to `/dev/null`: that throws away the only report you get.
 
+Control bytes in a printed log are escaped (`\x1b`, `\x0d`, …), keeping only
+newlines and tabs: a log is replayed into the terminal reporting on the test, and
+a cursor-movement sequence in it would otherwise erase and rewrite the lines
+around it. `--json` and `--save-context` still give you the log byte for byte.
+
 A test's context directory is live — that's where its logs are written and where
 its working directory sits — so a test can also delete `stdout.log` or
 `xtrace.log` and put something else at the name. `attest` reads back only the
