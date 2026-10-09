@@ -598,6 +598,44 @@ pub fn unlink_if_symlink(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Open `path` for reading without traversing a symlink at its last component
+/// (which fails with `ELOOP` instead).
+///
+/// Everything attest keeps for a test lives in that test's context dir, and
+/// that directory is bind-mounted **live** into the ephemeral root — it has to
+/// be, since the logs are written and the working directory lives there. So a
+/// running test can unlink its own `xtrace.log` and leave a symlink to any
+/// host path in its place, and reading the name afterwards would hand that
+/// file's contents to whatever attest does with the log: print it as the
+/// test's trace, embed it in `--json`, copy it out under `--save-context`.
+pub fn open_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+/// Read all of `path` without traversing a symlink at its last component (see
+/// [`open_nofollow`]).
+pub fn read_nofollow(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let mut buf = Vec::new();
+    open_nofollow(path)?.read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// Is `path` a directory in its own right, rather than a symlink to one?
+///
+/// `Path::is_dir` and `read_dir` both resolve symlinks, so they answer for
+/// wherever a link points — including out of the tree attest meant to read
+/// (see [`open_nofollow`] for how a test gets to plant one).
+pub fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+}
+
 /// Create `base`/`rel` as real directories without following symlinks: a
 /// symlink standing where a component must go is replaced (see
 /// [`unlink_if_symlink`]). `rel` must be relative and contain only plain
@@ -631,8 +669,17 @@ pub fn create_dir_nofollow(base: &Path, rel: &Path) -> std::io::Result<PathBuf> 
 ///
 /// A symlink already sitting at a destination name is replaced rather than
 /// written through, so a test cannot steer part of its own copied-out delta to
-/// a path outside `dst`.
+/// a path outside `dst`. For the same reason a symlink standing where `src`
+/// should be is an error rather than something to follow: every directory
+/// attest copies out of a context is one a test could have replaced with a
+/// link to an arbitrary host tree.
 pub fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if !is_real_dir(src) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("not a directory: {}", src.display()),
+        ));
+    }
     unlink_if_symlink(dst)?;
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -1012,6 +1059,42 @@ mod tests {
                 "{rel} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn nofollow_reads_refuse_a_symlinked_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        let secret = elsewhere.path().join("secret");
+        std::fs::write(&secret, "SECRET").unwrap();
+
+        // The name attest created, replaced by a link out of the tree.
+        let log = dir.path().join("xtrace.log");
+        std::os::unix::fs::symlink(&secret, &log).unwrap();
+        assert!(open_nofollow(&log).is_err());
+        assert!(read_nofollow(&log).is_err());
+
+        // A real file at the same name still reads normally.
+        std::fs::remove_file(&log).unwrap();
+        std::fs::write(&log, "+1: true\n").unwrap();
+        assert_eq!(read_nofollow(&log).unwrap(), b"+1: true\n");
+    }
+
+    #[test]
+    fn copy_dir_refuses_a_symlinked_source() {
+        let dst = tempfile::TempDir::new().unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        std::fs::write(elsewhere.path().join("secret"), "SECRET").unwrap();
+
+        // `upper`, `cwd` and `strace` are all names a test can replace inside
+        // its own context dir; following one would copy the target tree out.
+        let ctx = tempfile::TempDir::new().unwrap();
+        let link = ctx.path().join("upper");
+        std::os::unix::fs::symlink(elsewhere.path(), &link).unwrap();
+
+        assert!(copy_dir_recursive(&link, dst.path()).is_err());
+        assert!(!dst.path().join("secret").exists());
+        assert!(!is_real_dir(&link));
     }
 
     #[test]

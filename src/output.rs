@@ -185,16 +185,23 @@ impl StatusDisplay {
 
 /// Read one of a test's logs out of its context dir. Lossy so a log containing
 /// invalid UTF-8 (e.g. binary output) is still reported rather than silently
-/// becoming empty.
+/// becoming empty, and never through a symlink the test left at that name (see
+/// [`crate::overlay::open_nofollow`]) — a JSON consumer would otherwise be fed
+/// the contents of an arbitrary host file as the test's output.
 fn read_log(path: PathBuf) -> String {
-    String::from_utf8_lossy(&std::fs::read(path).unwrap_or_default()).into_owned()
+    let bytes = crate::overlay::read_nofollow(&path).unwrap_or_default();
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// A test's `--strace` logs as `{"<cmd>": "<log>"}`, read from the
 /// `strace/<cmd>.log` files the runner wrote into its context dir. Empty
 /// without `--strace` (or when nothing was traced).
 fn strace_logs(context: &Path) -> Map<String, Value> {
-    std::fs::read_dir(context.join("strace"))
+    let dir = context.join("strace");
+    if !crate::overlay::is_real_dir(&dir) {
+        return Map::new();
+    }
+    std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()

@@ -71,8 +71,12 @@ pub fn print_failure_snippet(result: &TestResult) {
 
 /// Parse the xtrace log to find the last executed command (which is the one that failed).
 fn parse_xtrace_failure(tmp_dir: &Path) -> Option<FailureInfo> {
-    let xtrace_path = tmp_dir.join("xtrace.log");
-    let content = std::fs::read_to_string(xtrace_path).ok()?;
+    // Read the log the runner opened for the test, never a symlink the test
+    // left at that name (see `overlay::open_nofollow`). Lossy because a test
+    // is free to write non-UTF-8 to its stderr, and a diagnostic is better
+    // than none.
+    let bytes = crate::overlay::read_nofollow(&tmp_dir.join("xtrace.log")).ok()?;
+    let content = String::from_utf8_lossy(&bytes);
 
     // Find the last line starting with `+LINENO: ` (our custom PS4 format).
     // Skip lines with `++ ` prefix (subshell traces) and non-trace lines.
