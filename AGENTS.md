@@ -54,6 +54,12 @@
   probe fails the run loudly rather than silently running unisolated. All
   mounts happen in the forked child's private mount namespace via `pre_exec`,
   so they are torn down automatically on exit and never pollute the host.
+  The test's own context dir is bind-mounted back in **live** (the logs are
+  written and the working directory lives there), so a running test can rewrite
+  it: everything attest reads back out of a context — `stdout.log`,
+  `xtrace.log`, the `upper`/`cwd`/`strace` dirs — goes through
+  `open_nofollow`/`is_real_dir`/`copy_dir_recursive`, which refuse a symlink
+  standing at the name instead of resolving it to some host path.
 - `src/diagnostics.rs` - On failure, parses `xtrace.log` to find the last
   executed command, maps it back to the original source file, and renders an
   annotate-snippets error snippet. Also shows inline character-level diffs for

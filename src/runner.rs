@@ -53,7 +53,7 @@ impl XtraceStreamer {
             return;
         }
         let xtrace_path = pending.context.as_ref().unwrap().join("xtrace.log");
-        if let Ok(file) = std::fs::File::open(&xtrace_path) {
+        if let Ok(file) = overlay::open_nofollow(&xtrace_path) {
             errln!("\x1b[2m--- xtrace: {} ---\x1b[0m", pending.name);
             self.tailed = Some(Tailed {
                 name: pending.name.clone(),
@@ -103,7 +103,10 @@ impl XtraceStreamer {
 /// Print a test's full xtrace.log, dimmed, under a `--- xtrace: <name> ---`
 /// header. Silent if the log is missing or empty.
 fn dump_xtrace_log(name: &str, context: &Path) {
-    if let Ok(content) = std::fs::read(context.join("xtrace.log"))
+    // Read the file the runner created, not whatever a symlink left at that
+    // name points at: the test can rewrite its own context dir
+    // ([`overlay::open_nofollow`]).
+    if let Ok(content) = overlay::read_nofollow(&context.join("xtrace.log"))
         && !content.is_empty()
     {
         errln!("\x1b[2m--- xtrace: {name} ---\x1b[0m");
@@ -834,9 +837,10 @@ fn build_result(mut pending: PendingTest, status: ExitStatus) -> TestResult {
     // dir removal, cgroup drops removing the cgroup directory.
 }
 
-/// Does `dir` exist and contain at least one entry?
+/// Is `dir` a directory of its own (not a symlink to one) holding at least one
+/// entry?
 fn dir_non_empty(dir: &Path) -> bool {
-    std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
+    overlay::is_real_dir(dir) && std::fs::read_dir(dir).is_ok_and(|mut e| e.next().is_some())
 }
 
 /// Copy the files a finished test created or modified (the upper layers of its
@@ -861,7 +865,7 @@ fn save_test_context(result: &TestResult, save_dir: &Path, submounts: &[overlay:
         return;
     };
     let upper = overlay::upper_dir(&result.context);
-    if upper.is_dir() {
+    if overlay::is_real_dir(&upper) {
         if let Err(e) = overlay::copy_dir_recursive(&upper, &dst) {
             warn!("failed to save context for {}: {e}", result.name);
         }
@@ -907,14 +911,19 @@ fn save_test_context(result: &TestResult, save_dir: &Path, submounts: &[overlay:
         warn!("failed to save strace logs for {}: {e}", result.name);
     }
     for log in ["stdout.log", "xtrace.log"] {
-        let src = result.context.join(log);
-        if src.exists() {
-            // A test that created `/stdout.log` as a symlink has had it copied
-            // here verbatim; writing the real log through it would land on
-            // whatever host path it names.
-            let to = dst.join(log);
-            let _ = overlay::unlink_if_symlink(&to);
-            let _ = std::fs::copy(&src, to);
+        // Both ends of this copy are names a test gets to choose. The source
+        // sits in its live context dir, where it can swap the log for a link
+        // to a host file and have it copied out as its own trace; the
+        // destination may already hold a symlink reproduced from the delta (a
+        // test that created `/stdout.log` as one), and writing the log through
+        // that would land on whatever host path it names.
+        let Ok(mut from) = overlay::open_nofollow(&result.context.join(log)) else {
+            continue;
+        };
+        let to = dst.join(log);
+        let _ = overlay::unlink_if_symlink(&to);
+        if let Ok(mut out) = std::fs::File::create(&to) {
+            let _ = std::io::copy(&mut from, &mut out);
         }
     }
 }
@@ -1721,6 +1730,57 @@ mod tests {
             "execve(\"/bin/ls\")\n"
         );
         assert!(saved.join("xtrace.log").exists());
+    }
+
+    #[test]
+    fn save_context_never_reads_a_tests_logs_through_its_own_symlinks() {
+        // A test's context dir is bind-mounted live into its ephemeral root
+        // (the logs are written and the working directory lives there), so a
+        // running test can unlink its own stdout.log/xtrace.log and leave a
+        // symlink to any host path in its place. Reading the name afterwards
+        // would copy that file out as the test's output — an arbitrary-file
+        // read for anything the user running attest can open, landing in a
+        // directory they are about to go and read.
+        let outside = TempDir::new().unwrap();
+        let secret = outside.path().join("secret");
+        fs::write(&secret, "SECRET").unwrap();
+
+        let contexts = TempDir::new().unwrap();
+        let ctx = contexts.path().join("test_leak");
+        fs::create_dir_all(&ctx).unwrap();
+        for log in ["stdout.log", "xtrace.log"] {
+            std::os::unix::fs::symlink(&secret, ctx.join(log)).unwrap();
+        }
+        // The same trick on the directories --save-context walks: a link here
+        // would have the whole target tree copied out instead.
+        std::os::unix::fs::symlink(outside.path(), overlay::upper_dir(&ctx)).unwrap();
+        std::os::unix::fs::symlink(outside.path(), cwd_dir(&ctx)).unwrap();
+        std::os::unix::fs::symlink(outside.path(), ctx.join("strace")).unwrap();
+
+        let result = TestResult {
+            name: "test_leak".to_string(),
+            passed: false,
+            timed_out: false,
+            duration: Duration::from_millis(1),
+            context: ctx,
+            source_path: PathBuf::from("t.sh"),
+            #[cfg(feature = "cgroup")]
+            resources: None,
+        };
+
+        let save = TempDir::new().unwrap();
+        save_test_context(&result, save.path(), &[]);
+
+        // Nothing read through a link: no copy of the secret anywhere, under
+        // any of the names it was linked from.
+        let saved = save.path().join("test_leak");
+        for name in ["stdout.log", "xtrace.log", "cwd/secret", "strace/secret"] {
+            assert!(
+                !saved.join(name).exists(),
+                "{name} was read through the test's own symlink"
+            );
+        }
+        assert!(!saved.join("secret").exists(), "upper layer was followed");
     }
 
     #[test]
