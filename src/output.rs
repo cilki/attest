@@ -54,6 +54,58 @@ pub fn write_err(buf: &[u8]) {
     write_stream(&BROKEN_PIPE, &mut std::io::stderr().lock(), buf);
 }
 
+/// Write a captured log to stderr with the bytes that drive a terminal
+/// escaped, so replaying it cannot rewrite the report around it.
+///
+/// A test's `xtrace.log` holds the shell's trace *and* everything the test and
+/// the programs it ran wrote to stderr, so dumping it puts arbitrary bytes the
+/// test chose on the terminal that is reporting on that test. Raw, those bytes
+/// are commands: `ESC[2A ESC[2K` walks the cursor back over the `FAIL` line
+/// and erases it, `\r` overwrites the line being written, `ESC[0m` escapes the
+/// dim styling the dump is wrapped in, and OSC sequences reach the terminal's
+/// title and (on a few terminals) its clipboard. A test that fails while
+/// echoing content it fetched, generated or was handed as a fixture should not
+/// be able to decide what the reader is told about it.
+///
+/// The full bytes are still reported verbatim where nothing interprets them:
+/// `--json` and `--save-context`.
+pub fn write_log_err(buf: &[u8]) {
+    write_err(&sanitize_log(buf));
+}
+
+/// Whether `byte` has to be escaped before being replayed into a terminal:
+/// every C0 control byte bar the `\n` and `\t` a trace legitimately contains,
+/// plus `DEL`. Bytes >= `0x80` are left alone — a UTF-8 terminal reads them as
+/// text rather than as C1 controls, and escaping them would mangle the logs of
+/// every test that prints non-ASCII.
+fn needs_escape(byte: u8) -> bool {
+    matches!(byte, 0x00..=0x08 | 0x0b..=0x1f | 0x7f)
+}
+
+/// Replace each byte [`needs_escape`] rejects with a `\xNN` spelling of it,
+/// borrowing the input unchanged when there is nothing to escape (the usual
+/// case, since a trace is mostly printable text).
+///
+/// Escaped byte-wise rather than over `char`s: a log is arbitrary bytes and
+/// need not be valid UTF-8, and lossy decoding would turn a test's binary
+/// output into a wall of U+FFFD. Backslashes are left as they are — bash
+/// xtrace is full of them (`$'a\nb'`) and doubling every one would be a worse
+/// trade than the ambiguity with a literal `\x1b` in the log text.
+fn sanitize_log(buf: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if !buf.iter().copied().any(needs_escape) {
+        return std::borrow::Cow::Borrowed(buf);
+    }
+    let mut out = Vec::with_capacity(buf.len());
+    for &byte in buf {
+        if needs_escape(byte) {
+            out.extend_from_slice(format!("\\x{byte:02x}").as_bytes());
+        } else {
+            out.push(byte);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// `println!` that winds the run down instead of panicking once stdout's reader
 /// has gone away. See [`BROKEN_PIPE`].
 macro_rules! outln {
@@ -646,6 +698,36 @@ mod tests {
         let pattern = crate::parser::TestPattern::parse(&selector);
         assert!(pattern.matches(a, "test_foo"));
         assert!(!pattern.matches(b, "test_foo"));
+    }
+
+    #[test]
+    fn sanitize_log_defuses_cursor_control() {
+        // The report-rewriting payload: move up over the `FAIL` line, erase it
+        // and print a `PASS` of the test's own choosing. Every byte that makes
+        // that work has to come out inert.
+        let payload = b"boom\x1b[2A\x1b[2K\x1b[1;32mPASS\x1b[0m\rgone";
+        assert_eq!(
+            sanitize_log(payload).as_ref(),
+            br"boom\x1b[2A\x1b[2K\x1b[1;32mPASS\x1b[0m\x0dgone".as_slice()
+        );
+        // An OSC sequence (terminal title, clipboard on some terminals) is
+        // introduced and terminated by control bytes too.
+        assert_eq!(
+            sanitize_log(b"\x1b]0;owned\x07").as_ref(),
+            br"\x1b]0;owned\x07".as_slice()
+        );
+    }
+
+    #[test]
+    fn sanitize_log_keeps_the_trace_readable() {
+        // Newlines and tabs are what a trace is laid out with, and non-ASCII
+        // bytes are text: escaping either would cost more than it buys.
+        let trace = "+3: printf 'a\\tb'\ncafé\t\u{1f600}\n".as_bytes();
+        assert!(matches!(sanitize_log(trace), std::borrow::Cow::Borrowed(_)));
+        assert_eq!(sanitize_log(trace).as_ref(), trace);
+        // Invalid UTF-8 (a test printing binary) passes through rather than
+        // becoming a wall of replacement characters.
+        assert_eq!(sanitize_log(b"\xff\xfe\n").as_ref(), b"\xff\xfe\n");
     }
 
     /// A stream whose every write fails with a fixed error kind.
