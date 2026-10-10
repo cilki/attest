@@ -598,23 +598,48 @@ pub fn unlink_if_symlink(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Open `path` for reading without traversing a symlink at its last component
-/// (which fails with `ELOOP` instead).
+/// Open `path` for reading, insisting on the regular file attest created there
+/// rather than whatever a test left at the name.
 ///
 /// Everything attest keeps for a test lives in that test's context dir, and
 /// that directory is bind-mounted **live** into the ephemeral root — it has to
 /// be, since the logs are written and the working directory lives there. So a
-/// running test can unlink its own `xtrace.log` and leave a symlink to any
-/// host path in its place, and reading the name afterwards would hand that
-/// file's contents to whatever attest does with the log: print it as the
-/// test's trace, embed it in `--json`, copy it out under `--save-context`.
+/// running test can unlink its own `xtrace.log` and put anything it likes in
+/// its place, and attest reopens those names by path afterwards: to print the
+/// trace under a FAIL line, to build the diagnostic snippet, to fill in the
+/// `stdout`/`xtrace` fields of `--json`, to copy the logs out under
+/// `--save-context`.
+///
+/// Two substitutions have to be refused, not just one:
+///
+/// * A **symlink**, which would resolve to any host path the caller can read
+///   and hand its contents back as the test's own output. `O_NOFOLLOW` turns
+///   that into `ELOOP`.
+/// * A **FIFO** (or any other non-regular file), which `O_NOFOLLOW` says
+///   nothing about. Opening a FIFO read-only blocks until a writer appears, so
+///   a test that does `rm xtrace.log; mkfifo xtrace.log` wedges attest in
+///   `open(2)` forever once it exits — and `std` retries the call on `EINTR`,
+///   so `^C` does not break it out either: the run has to be `SIGKILL`ed, and
+///   the context dirs it was holding are left behind in the temp dir. Hence
+///   `O_NONBLOCK`, so the open itself cannot block, followed by an `fstat` on
+///   the descriptor that actually got opened — the file type is read back from
+///   the thing attest is holding, not from the name a second time.
 pub fn open_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 
-    std::fs::File::options()
+    let file = std::fs::File::options()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
+        // O_NONBLOCK has no effect on reads from a regular file, so it costs
+        // the expected case nothing.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("not a regular file: {}", path.display()),
+        ));
+    }
+    Ok(file)
 }
 
 /// Read all of `path` without traversing a symlink at its last component (see
@@ -1078,6 +1103,31 @@ mod tests {
         std::fs::remove_file(&log).unwrap();
         std::fs::write(&log, "+1: true\n").unwrap();
         assert_eq!(read_nofollow(&log).unwrap(), b"+1: true\n");
+    }
+
+    #[test]
+    fn nofollow_reads_refuse_a_fifo_left_at_the_name() {
+        // `O_NOFOLLOW` says nothing about a FIFO, and a read-only open of one
+        // blocks until a writer appears — which, for a log left behind by a
+        // test that has already exited, is never. So the thing being asserted
+        // is that the call *returns* at all.
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = dir.path().join("xtrace.log");
+        let c = CString::new(log.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+
+        // On another thread with a deadline: a regression here is a wedged
+        // process, not a failed assertion, and `std` retries the open across
+        // `EINTR` so nothing short of `SIGKILL` gets it back.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_nofollow(&log).is_err());
+        });
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(30)),
+            Ok(true),
+            "opening a FIFO left at a log's name must fail, not block"
+        );
     }
 
     #[test]

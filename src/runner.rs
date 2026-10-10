@@ -1784,6 +1784,58 @@ mod tests {
     }
 
     #[test]
+    fn a_fifo_left_at_a_log_name_does_not_wedge_the_run() {
+        // The same live context dir, with a sharper substitution than a
+        // symlink: opening a FIFO read-only blocks until a writer shows up, and
+        // `std` retries that call across `EINTR`. So a test ending in
+        // `rm xtrace.log; mkfifo xtrace.log` used to leave attest stuck in
+        // `open(2)` for good — after the FAIL line, with `^C` no help and the
+        // context dirs it was still holding left behind in the temp dir.
+        let contexts = TempDir::new().unwrap();
+        let ctx = contexts.path().join("test_wedge");
+        fs::create_dir_all(cwd_dir(&ctx)).unwrap();
+        for log in ["stdout.log", "xtrace.log"] {
+            use std::os::unix::ffi::OsStrExt;
+            let path = std::ffi::CString::new(ctx.join(log).as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0);
+        }
+
+        let result = TestResult {
+            name: "test_wedge".to_string(),
+            passed: false,
+            timed_out: false,
+            duration: Duration::from_millis(1),
+            context: ctx,
+            source_path: PathBuf::from("t.sh"),
+            #[cfg(feature = "cgroup")]
+            resources: None,
+        };
+
+        // Every place a finished test's logs are read back, on a deadline: a
+        // regression is a hang rather than a failed assertion, so the test has
+        // to be able to outlive it.
+        let save = TempDir::new().unwrap();
+        let save_dir = save.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            dump_xtrace_log(&result.name, result.context.as_path());
+            crate::diagnostics::print_failure_snippet(&result);
+            output::print_test_result_json(&result);
+            save_test_context(&result, &save_dir, &[]);
+            let _ = tx.send(());
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(30)),
+            Ok(()),
+            "reading a test's logs back blocked on a FIFO it left behind"
+        );
+
+        // Nothing was invented for a log that is no longer a file either.
+        assert!(!save.path().join("test_wedge/xtrace.log").exists());
+        assert!(!save.path().join("test_wedge/stdout.log").exists());
+    }
+
+    #[test]
     fn save_context_never_writes_through_symlinks_from_the_delta() {
         // A test may create symlinks anywhere in its ephemeral root; they land
         // in its upper layer and --save-context copies them out verbatim. The

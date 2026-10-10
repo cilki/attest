@@ -65,6 +65,11 @@
   `xtrace.log`, the `upper`/`cwd`/`strace` dirs — goes through
   `open_nofollow`/`is_real_dir`/`copy_dir_recursive`, which refuse a symlink
   standing at the name instead of resolving it to some host path.
+  `open_nofollow` also insists (`O_NONBLOCK` + an `fstat` on the descriptor it
+  got) that the name is still a regular file: a read-only open of a FIFO blocks
+  until a writer appears and `std` retries it across `EINTR`, so a test that
+  replaced one of its logs with one used to wedge the run in `open(2)` past
+  even `^C`.
 - `src/diagnostics.rs` - On failure, parses `xtrace.log` to find the last
   executed command, maps it back to the original source file, and renders an
   annotate-snippets error snippet. Also shows inline character-level diffs for

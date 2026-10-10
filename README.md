@@ -581,6 +581,13 @@ this one shows up
 So send anything you want to see on failure to stderr, and don't redirect either
 stream to `/dev/null`: that throws away the only report you get.
 
+A test's context directory is live — that's where its logs are written and where
+its working directory sits — so a test can also delete `stdout.log` or
+`xtrace.log` and put something else at the name. `attest` reads back only the
+regular file it opened there itself: a symlink left in a log's place is not
+resolved to whatever host file it names, and a named pipe is not waited on for a
+writer that will never come. Either way the log simply reads as missing.
+
 Standard input, by contrast, is _not_ redirected — every test inherits
 `attest`'s own stdin, and all of them share it. A command inside a test that
 reads stdin therefore consumes whatever `attest` was given, two tests reading it
