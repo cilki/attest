@@ -26,7 +26,10 @@
   suffix (whole components, no wildcards), the name half a `*` glob that
   degrades to a prefix match when it contains no `*`, and either half may be
   empty to mean "unconstrained". Without a `/` the whole pattern is a name, so
-  a file-only filter needs the trailing slash.
+  a file-only filter needs the trailing slash — except for a single component
+  behind a `./`, which `parse` strips and then takes as the file (`./x.test` ==
+  `x.test/`). The split still wins over that marker once anything else
+  contains a `/`, so `./a/x.test` means the name `x.test` in a file `a`.
 - `src/runner.rs` - For each test: writes all extracted functions (test +
   helper) to a temp script, forks a child that execs `<shell> -c` (the shell
   `resolve_shell` picked for the file, or `--shebang`) with the original script
@@ -74,9 +77,13 @@
   replaced one of its logs with one used to wedge the run in `open(2)` past
   even `^C`.
 - `src/diagnostics.rs` - On failure, parses `xtrace.log` to find the last
-  executed command, maps it back to the original source file, and renders an
-  annotate-snippets error snippet. Also shows inline character-level diffs for
-  failed `[ A = B ]` assertions.
+  executed command (skipping `++` subshell traces, so a failure inside
+  `$(...)` is attributed to the statement around it), maps it back to the
+  original source file, and renders an annotate-snippets error snippet.
+  Also shows `left`/`right` operands for a failed `[`/`[[` comparison and,
+  for `=`/`==`/`!=`, an inline character-level diff of them. The report the
+  whole of this adds up to is documented in the README, so keep both in step
+  when changing it.
 - `src/output.rs` - ANSI-colored terminal output for PASS/FAIL and summary, plus
   the `--json` JSONL encoder (`print_test_result_json`): one object per test with
   `name`, `file`, `status` (`pass`/`fail`/`timeout`), `duration_ms`, `stdout`,
@@ -132,7 +139,8 @@ to tests.
   does the same to the whole run and bails out without a summary
 - `--filter [FILE/]PATTERN` — run only matching tests. `FILE` is a path suffix
   (no wildcards); `PATTERN` takes `*` wildcards and matches as a prefix only
-  when it has none. Without a `/` the argument is all `PATTERN`
+  when it has none. Without a `/` the argument is all `PATTERN`, unless it is a
+  single component behind a `./` (`./x.test` == `x.test/`)
 - `--override SPEC` — copy a binary into the test context `bin/` dir so tests
   use it exclusively. SPEC is either a path (`/usr/bin/example` or
   `./bin/example`) or a mapping (`example=/usr/bin/override`)

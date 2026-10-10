@@ -334,7 +334,13 @@ A filter is `[<file>/]<name>`, and the `/` is what tells the two halves apart:
 
 - **With no `/` the whole thing is a test name**, never a file — which is why
   the file-only example above ends in one. `--filter md5sum.test` looks for a
-  test whose name starts with `md5sum.test` and so matches nothing.
+  test whose name starts with `md5sum.test` and so matches nothing. The one
+  exception is a leading `./`, which marks the argument as a path:
+  `--filter ./md5sum.test` means the same as `--filter 'md5sum.test/'`. That
+  only holds for a bare file name, though — anything longer still splits at its
+  last `/`, so `--filter ./examples/md5sum.test` asks for a test named
+  `md5sum.test` in a file `examples` and matches nothing. The trailing-slash
+  form always works.
 - **The file half is a path suffix**, compared a whole component at a time and
   with no wildcards: `md5sum.test/` and `examples/md5sum.test/` both select the
   file, while `um.test/` and `md5*.test/` select nothing. An empty name half
@@ -602,6 +608,62 @@ Failed tests always print their xtrace output. You can also stream the xtrace
 output live with the `-vv` flag:
 
 ![](./.github/assets/xtrace.gif)
+
+### Reading a failure report
+
+A failure is reported in three parts: the `FAIL` line, the test's xtrace log,
+and a snippet of the source. Here's the whole thing for the `md5sum` test from
+the top of this README, with one digit of the expected hash changed:
+
+```
+❯ attest md5sum.test
+FAIL  testHello                                (50ms)
+--- xtrace: testHello ---
++8: testHello
+++5: md5sum
+++5: echo hello
++5: result='b1946ac92492d2347c6235b4d2611184  -'
++7: '[' 'b1946ac92492d2347c6235b4d2611184  -' = 'b1946ac92492d2347c6235b4d2611185  -' ']'
+error: command failed
+ --> md5sum.test:7:2
+  |
+4 | testHello() {
+5 |     result=$(echo hello | md5sum)
+6 |
+7 |     [ "${result}" = "b1946ac92492d2347c6235b4d2611185  -" ]
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+8 | }
+  |
+
+  left: "b1946ac92492d2347c6235b4d2611184  -"
+ right: "b1946ac92492d2347c6235b4d2611185  -"
+  diff: "b1946ac92492d2347c6235b4d2611184  -"
+        "b1946ac92492d2347c6235b4d2611185  -"
+```
+
+Each trace line is prefixed with the line of your file the command came from,
+so `+7:` is the `[` on line 7. A `++` prefix marks a command that ran in a
+subshell — here the two halves of `$(echo hello | md5sum)`. The exception is
+the very first line, which is the runner calling the test function: its number
+belongs to the small script `attest` generates, not to your file.
+
+The snippet points at the last command the trace recorded, with up to three
+lines of context on either side, clamped to the enclosing function so it never
+runs on into the next test. Subshell lines are skipped when locating it, so a
+command that failed inside `$(...)` or in one side of a pipe is reported at the
+statement containing it rather than at the command itself. A timed-out test
+gets the same snippet under `test timed out`, pointing at whatever it was
+running when the clock ran out.
+
+When the failing command is a comparison — `[` or `[[` with `=`, `==`, `!=`,
+`-eq`, `-ne`, `-lt`, `-le`, `-gt` or `-ge` — both operands are recovered from
+the trace and printed as `left` and `right`, so you don't have to pick them out
+of the quoting yourself. For `=`, `==` and `!=` a character-level `diff` of the
+two follows, which is what finds the stray space or the changed digit: the
+characters that differ are colored (red on the first line, green on the
+second), so in the plain text above the `diff` lines look just like the `left`
+and `right` ones. Newlines and tabs in an operand are printed as `\n` and `\t`
+to keep all four lines aligned.
 
 ### Where a test's own output goes
 
