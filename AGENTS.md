@@ -187,10 +187,16 @@ to tests.
 - `--parallel N` — max concurrent tests (default: CPU cores)
 - `--timeout SECS` — wall-clock timeout per test; timed-out tests show `TIME`
   and count as failures
-- `--bail` — end the run at the first failure. Tests already in flight are
-  dropped unreaped (`PendingTest::drop` kills the tree) and never turned into
-  results, so the summary totals only the tests that finished; `^C`/`SIGTERM`
-  does the same to the whole run and bails out without a summary
+- `--bail` — end the run at the first failure. `bail_flag` stops new tests
+  being spawned and makes the poll loop drop each in-flight test instead of
+  turning it into a result, so the summary totals only the tests that finished.
+  It does not kill them: the loop keeps `reap`ing, so every abandoned test runs
+  to its natural end first (`PendingTest::drop` only reaches `kill_tree` for
+  stragglers in its process group) and the run lasts as long as the slowest one
+  — unbounded without `--timeout`, which is the only thing that kills on a
+  deadline. `^C`/`SIGTERM` and a closed output stream are the paths that do
+  kill: they `clear()` the pending list outright, and `^C` bails out without a
+  summary
 - `--filter [FILE/]PATTERN` — run only matching tests. `FILE` is a path suffix
   (no wildcards); `PATTERN` takes `*` wildcards and matches as a prefix only
   when it has none. Without a `/` the argument is all `PATTERN`; behind a `./`

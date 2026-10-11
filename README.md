@@ -396,8 +396,9 @@ With that in place, `attest examples/md5<TAB>` completes the file name and
 
 - `--timeout SECS` — kill a test after this much wall-clock time and report it
   as `TIME`
-- `--bail` — end the run at the first failure, killing the tests still running
-  (see [Stopping a run early](#stopping-a-run-early))
+- `--bail` — end the run at the first failure. The tests still in flight are
+  abandoned rather than killed, so the run itself lasts as long as the slowest
+  of them (see [Stopping a run early](#stopping-a-run-early))
 - `--repeat N` — run each test N times
 - `--json` — print one JSON object per test instead of the colored output
   (schema below)
@@ -418,30 +419,41 @@ With that in place, `attest examples/md5<TAB>` completes the file name and
 ### Stopping a run early
 
 Normally a run ends once every selected test has finished, and the summary
-counts all of them. Two things cut a run short, and both of them tear it down
-rather than let it drain — the tests still in flight are killed with `SIGKILL`,
-so no `trap` inside a test runs on the way out:
+counts all of them. Two things cut a run short, and they do it differently —
+one abandons the tests still in flight, the other kills them:
 
 - **`--bail`.** The first failure ends the run. No further tests are launched,
-  _and the tests that were already running are killed where they are_ — they
-  are never reported, as neither failures nor skips, so the summary's total
-  counts only the tests that had finished by then. With `--parallel 4`, a
-  failure in the very first batch can leave a hundred-test selection reporting
-  `1 total`:
+  _and the tests that were already running are abandoned_ — they are never
+  reported, as neither failures nor skips, so the summary's total counts only
+  the tests that had finished by then. With `--parallel 4`, a failure in the
+  very first batch can leave a hundred-test selection reporting `1 total`:
 
   ```
   ❯ attest . --bail --parallel 4
-  FAIL  testFastFail                             (57ms)
+  FAIL  testAFastFail                            (5ms)
   ...
 
   Results: 0 passed, 1 failed, 1 total
-  Time:   1.06s
+  Time:   4.06s
   ```
+
+  Abandoned is not the same as killed, though, and the `4.06s` is where that
+  shows: the three tests sharing the first batch with the failure were each a
+  `sleep 4`, and `attest` waited for every one of them to exit on its own
+  before giving up on it. So `--bail` makes a run _fail_ fast, not _finish_
+  fast. Everything those tests produced is still discarded — no report line, no
+  `--save-context` directory, nothing in the total — but they do run to the
+  end, traps and side effects included, and nothing bounds the wait: a single
+  `sleep 600` in flight holds the run for ten minutes after the failure has
+  been printed. Pair `--bail` with `--timeout`, which does kill and so caps the
+  wait at one timeout, or with `--parallel 1`, where there is nothing in flight
+  to wait for.
 
   The exit status is 1, as for any run with a failure in it.
 
-- **`^C` (or `SIGTERM`).** Every running test's process tree is killed and
-  `attest` abandons the run: there is no summary at all, just
+- **`^C` (or `SIGTERM`).** This one kills: every running test's process tree is
+  `SIGKILL`ed, so no `trap` inside a test runs on the way out, and `attest`
+  abandons the run. There is no summary at all, just
   `Error: interrupted; killed 2 running test(s)` on stderr and exit status 1.
   Results from tests that already finished are discarded along with it, so use
   `-v` (or `--json`) if you want a record of them as they go. Tests run in
