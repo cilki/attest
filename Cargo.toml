@@ -4,7 +4,7 @@ description = "Dead simple test framework for the age of AI"
 edition = "2024"
 license = "Unlicense"
 name = "attest"
-version = "0.5.5"
+version = "0.6.0"
 
 [features]
 default = ["cgroup"]
@@ -15,7 +15,7 @@ cgroup = []
 [dependencies]
 anyhow = "1.0.100"
 libc = "0.2"
-brush-parser = "0.4.0"
+brush-parser = { git = "https://github.com/cilki/brush" }
 clap = { version = "4", features = ["derive"] }
 clap_complete = { version = "4.5", features = ["unstable-dynamic"] }
 tempfile = "3"

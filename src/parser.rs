@@ -160,7 +160,7 @@ fn extract_from_pipeline(
         match cmd {
             Command::Function(func) => functions.push(func.clone()),
             Command::Compound(compound, _) => extract_from_compound(compound, functions),
-            Command::Simple(_) | Command::ExtendedTest(..) => {}
+            Command::Simple(_) => {}
         }
     }
 }
@@ -200,7 +200,9 @@ fn extract_from_compound(compound: &CompoundCommand, functions: &mut Vec<Functio
             extract_from_compound_list(&w.0, functions);
             extract_from_compound_list(&w.1.list, functions);
         }
-        CompoundCommand::Arithmetic(_) | CompoundCommand::Coprocess(_) => {}
+        CompoundCommand::Arithmetic(_)
+        | CompoundCommand::Coprocess(_)
+        | CompoundCommand::ExtendedTest(_) => {}
     }
 }
 
