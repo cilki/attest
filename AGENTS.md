@@ -84,6 +84,11 @@
   for `=`/`==`/`!=`, an inline character-level diff of them. The report the
   whole of this adds up to is documented in the README, so keep both in step
   when changing it.
+  The source lines the snippet renders go through `escape_c1` first:
+  `annotate_snippets` substitutes the C0 controls in the source it is given
+  but prints `U+0080`–`U+009F` through, and those are controls a UTF-8
+  terminal obeys (`U+009B` is `CSI`). Escaping happens before the annotation
+  span is measured, since it moves the offsets the span is built from.
 - `src/output.rs` - ANSI-colored terminal output for PASS/FAIL and summary, plus
   the `--json` JSONL encoder (`print_test_result_json`): one object per test with
   `name`, `file`, `status` (`pass`/`fail`/`timeout`), `duration_ms`, `stdout`,
@@ -93,18 +98,25 @@
   `escape_label`, which spells their control characters `\xNN`: both are
   arbitrary bytes from the tree (a shell takes almost anything as a function
   name), and raw they let a failing test move the cursor back over its own
-  `FAIL` and print a `PASS` instead. `--json` is unaffected and reports names
-  verbatim.
+  `FAIL` and print a `PASS` instead. The C1 block (`U+0080`–`U+009F`) counts as
+  control there, not as text: a terminal in UTF-8 mode decodes those code
+  points and acts on them, and `U+009B` is `CSI` — an exact stand-in for
+  `ESC [`. `--json` is unaffected and reports names verbatim.
   Every write to stdout/stderr goes through `write_out`/`write_err` (and the
   `outln!`/`errln!` macros) rather than `println!`: Rust disables `SIGPIPE`, so
   `println!` panics when the reader goes away (`attest | head -1`). Instead the
   first `EPIPE` latches `output_closed()`, the runner winds the run down like an
   interrupt, and `main` re-raises `SIGPIPE` so the shell sees the usual status.
   A captured log goes out through `write_log_err` instead, which escapes every
-  C0 control byte but `\n`/`\t`: `xtrace.log` carries whatever the test wrote to
+  C0 control byte but `\n`/`\t`, plus the two-byte UTF-8 spelling of a C1
+  control (`c2 80`–`c2 9f`): `xtrace.log` carries whatever the test wrote to
   stderr, and replaying that raw would let a cursor-movement sequence in it
-  erase and rewrite the report around it. `--json`/`--save-context` are
-  unaffected and still carry the bytes verbatim.
+  erase and rewrite the report around it. Raw bytes in `80..=bf` stay as they
+  are — most of them are the continuation bytes of ordinary non-ASCII text, and
+  alone none of them is valid UTF-8 for a C1 control. The `-vv` streamer tails
+  the log a read at a time, so it holds a trailing `c2` back until the byte
+  after it arrives rather than sanitizing half a control. `--json`/`--save-context`
+  are unaffected and still carry the bytes verbatim.
 
 ## Key dependencies
 

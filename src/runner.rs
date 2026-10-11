@@ -74,7 +74,14 @@ impl XtraceStreamer {
     }
 
     /// Print any bytes appended to the tailed xtrace.log since the last flush.
-    fn flush_new(&mut self) {
+    ///
+    /// `last` says there will be no more: the test has finished, so whatever is
+    /// in the file is all of it. Until then a trailing [`output::C1_LEAD`] is
+    /// left unconsumed, because an encoded C1 control is two bytes and a test is
+    /// free to write them one at a time — `printf '\302'; sleep 1; printf '\233'`
+    /// puts them in different reads of the tail, where sanitizing each read on
+    /// its own would pass both halves through and hand the terminal a `CSI`.
+    fn flush_new(&mut self, last: bool) {
         let Some(t) = self.tailed.as_mut() else {
             return;
         };
@@ -82,12 +89,19 @@ impl XtraceStreamer {
             return;
         }
         let mut buf = Vec::new();
-        if t.file.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
-            t.offset += buf.len() as u64;
-            output::write_err(b"\x1b[2m");
-            output::write_log_err(&buf);
-            output::write_err(b"\x1b[0m");
+        if t.file.read_to_end(&mut buf).is_err() {
+            return;
         }
+        if !last && buf.last() == Some(&output::C1_LEAD) {
+            buf.pop();
+        }
+        if buf.is_empty() {
+            return;
+        }
+        t.offset += buf.len() as u64;
+        output::write_err(b"\x1b[2m");
+        output::write_log_err(&buf);
+        output::write_err(b"\x1b[0m");
     }
 
     /// Settle a finished test's trace output: flush and release the lock if it
@@ -95,7 +109,7 @@ impl XtraceStreamer {
     /// before the parent could open the file).
     fn finish(&mut self, pending: &PendingTest) {
         if self.tailed.as_ref().is_some_and(|t| t.name == pending.name) {
-            self.flush_new();
+            self.flush_new(true);
             self.tailed = None;
         } else {
             dump_xtrace_log(&pending.name, pending.context.as_ref().unwrap());
@@ -437,7 +451,7 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
         if let Some(ref mut xt) = xtrace
             && xt.has_new()
         {
-            status.suspend(|| xt.flush_new());
+            status.suspend(|| xt.flush_new(false));
         }
 
         // Kill any tests that have exceeded the wall-clock timeout.
@@ -1843,6 +1857,44 @@ mod tests {
         // Nothing was invented for a log that is no longer a file either.
         assert!(!save.path().join("test_wedge/xtrace.log").exists());
         assert!(!save.path().join("test_wedge/stdout.log").exists());
+    }
+
+    #[test]
+    fn xtrace_streaming_holds_back_a_c1_control_split_across_reads() {
+        // `-vv` tails a running test's xtrace.log and sanitizes whatever each
+        // read turned up. An encoded C1 control is two bytes, so a test that
+        // writes them one at a time (`printf '\302'; printf '\233'`) can land
+        // them in different reads — and `\xc2` alone then looks like ordinary
+        // text to the sanitizer, as does `\x9b` alone. Nothing may be printed
+        // until the byte after a trailing `\xc2` has been seen.
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("xtrace.log");
+        fs::write(&log, b"+1: payload\xc2").unwrap();
+
+        let mut streamer = XtraceStreamer::new();
+        streamer.tailed = Some(Tailed {
+            name: "test_split".to_string(),
+            file: overlay::open_nofollow(&log).unwrap(),
+            offset: 0,
+        });
+
+        streamer.flush_new(false);
+        let consumed = streamer.tailed.as_ref().unwrap().offset;
+        assert_eq!(
+            consumed, 11,
+            "the trailing \\xc2 was printed before its second byte arrived"
+        );
+
+        // The second half lands: the pair is now sanitized together.
+        fs::write(&log, b"+1: payload\xc2\x9b2K").unwrap();
+        streamer.flush_new(false);
+        assert_eq!(streamer.tailed.as_ref().unwrap().offset, 15);
+
+        // Once the test is done there is no more to wait for, so a log that
+        // really does end in a lone `\xc2` is not held back forever.
+        fs::write(&log, b"+1: payload\xc2\x9b2K\xc2").unwrap();
+        streamer.flush_new(true);
+        assert_eq!(streamer.tailed.as_ref().unwrap().offset, 16);
     }
 
     #[test]

@@ -54,13 +54,16 @@ pub fn print_failure_snippet(result: &TestResult) {
     let (func_start_line, func_end_line) =
         enclosing_function_bounds(&source, line_idx).unwrap_or((line_idx, line_idx));
 
-    render_snippet(
-        title,
-        &result.source_path,
-        &lines,
-        line_idx,
-        func_start_line,
-        func_end_line,
+    outln!(
+        "{}",
+        render_snippet(
+            title,
+            &result.source_path,
+            &lines,
+            line_idx,
+            func_start_line,
+            func_end_line,
+        )
     );
 
     // If the failing command is a `[` expression, show operand details
@@ -126,6 +129,38 @@ fn enclosing_function_bounds(source: &str, target_line: usize) -> Option<(usize,
 /// How many lines of context to show on each side of the annotated line.
 const CONTEXT_LINES: usize = 3;
 
+/// Spell the C1 controls in a line of source as `\xNN`, leaving the rest of it
+/// (whitespace and layout included) exactly as written.
+///
+/// `annotate_snippets` substitutes the C0 controls in the source it renders — a
+/// raw `ESC` in a script comes back as the `␛` picture — but passes
+/// `U+0080`–`U+009F` through as ordinary text. They are not ordinary text: a
+/// terminal in UTF-8 mode decodes those code points and acts on them, and
+/// `U+009B` is `CSI`, an exact stand-in for `ESC [` (see
+/// [`crate::output::escape_label`]). A shell script may hold them anywhere — in
+/// a quoted string, in a comment — and a snippet prints the lines around the
+/// failure, so without this a failing file gets to redraw the report blaming it.
+fn escape_c1(line: &str) -> std::borrow::Cow<'_, str> {
+    use std::fmt::Write as _;
+
+    fn is_c1(c: char) -> bool {
+        matches!(c, '\u{80}'..='\u{9f}')
+    }
+
+    if !line.contains(is_c1) {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let mut out = String::with_capacity(line.len());
+    for c in line.chars() {
+        if is_c1(c) {
+            let _ = write!(out, "\\x{:02x}", c as u32);
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Render an annotate-snippets diagnostic highlighting `lines[line_idx]`, with
 /// up to [`CONTEXT_LINES`] lines of surrounding context on each side, clamped
 /// to the enclosing function so a snippet never leaks into an adjacent test.
@@ -136,7 +171,7 @@ fn render_snippet(
     line_idx: usize,
     func_start_line: usize,
     func_end_line: usize,
-) {
+) -> String {
     use annotate_snippets::{AnnotationKind, Level, Renderer, Snippet};
 
     // A file name comes out of the directory walk, so it is as much the tree's
@@ -153,13 +188,16 @@ fn render_snippet(
     let end = (line_idx + CONTEXT_LINES + 1)
         .min(lines.len())
         .min(func_end_line + 1);
-    let window = &lines[start..end];
+    // Escaped before anything is measured, so every offset below is an offset
+    // into the text that actually gets rendered (see `escape_c1`).
+    let window: Vec<std::borrow::Cow<str>> =
+        lines[start..end].iter().copied().map(escape_c1).collect();
     let source = window.join("\n");
 
     // Annotate the whole failing line within the rendered window, skipping its
     // leading indentation. `join("\n")` puts one byte between lines.
     let line_start: usize = window[..line_idx - start].iter().map(|l| l.len() + 1).sum();
-    let failing = lines[line_idx];
+    let failing = &*window[line_idx - start];
     let indent = failing.len() - failing.trim_start().len();
 
     let report = &[Level::ERROR.primary_title(title).element(
@@ -172,7 +210,7 @@ fn render_snippet(
             ),
     )];
 
-    outln!("{}", Renderer::styled().render(report));
+    Renderer::styled().render(report).to_string()
 }
 
 /// Comparison operators we know how to render a diff for. `==` is how `[[`
@@ -512,6 +550,68 @@ mod tests {
         let info = parse_xtrace_failure(tmp.path()).unwrap();
         assert_eq!(info.lineno, 5);
         assert_eq!(info.command, "false");
+    }
+
+    #[test]
+    fn snippet_defuses_c1_controls_in_the_source_it_renders() {
+        // A script may hold a C1 control anywhere, and the snippet prints the
+        // lines around the failure. `annotate_snippets` substitutes the C0
+        // controls it renders but not these, and a terminal in UTF-8 mode
+        // obeys them — `U+009B` is `CSI` — so the file would get to redraw the
+        // report blaming it.
+        let lines = [
+            "test_sneak() {",
+            "  : \"\u{9b}2A\u{9b}2K\u{9b}32mPASS\u{9b}0m\"",
+            "  false",
+            "}",
+        ];
+        let rendered = render_snippet("command failed", Path::new("t.sh"), &lines, 2, 0, 3);
+
+        assert!(
+            !rendered.contains('\u{9b}'),
+            "a C1 control reached the terminal: {rendered:?}"
+        );
+        assert!(
+            rendered.contains(r"\x9b2A\x9b2K\x9b32mPASS\x9b0m"),
+            "{rendered}"
+        );
+
+        // Escaping widens the line the annotation is measured against, so the
+        // span has to be computed after it: the caret still has to land under
+        // `false` and nowhere else.
+        let underline: Vec<&str> = rendered.lines().filter(|l| l.contains("^^^")).collect();
+        assert_eq!(underline.len(), 1, "{rendered}");
+        let caret_col = strip_ansi(underline[0]).find('^').unwrap();
+        let false_line = rendered
+            .lines()
+            .find(|l| strip_ansi(l).contains("false"))
+            .unwrap();
+        assert_eq!(
+            strip_ansi(false_line).find("false"),
+            Some(caret_col),
+            "{rendered}"
+        );
+        assert_eq!(strip_ansi(underline[0]).trim_end().len() - caret_col, 5);
+    }
+
+    /// Drop the SGR sequences `Renderer::styled` wraps the snippet in, so a
+    /// column in the rendered line is a column on screen.
+    fn strip_ansi(line: &str) -> String {
+        let mut out = String::new();
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            if c != '\x1b' {
+                out.push(c);
+                continue;
+            }
+            // `ESC [ ... m`: skip to the final byte of the sequence.
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+        out
     }
 
     #[test]

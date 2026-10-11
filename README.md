@@ -300,7 +300,8 @@ By default you get a progress bar while the run is in flight, a summary at the
 end, and a report for each failure. Add `-v` if you also want a PASS/FAIL line
 per test.
 
-Control characters in a test or file name are escaped (`\x1b`, `\x0d`, …)
+Control characters in a test or file name are escaped (`\x1b`, `\x0d`, and the
+C1 forms such as `\x9b`, which a terminal in UTF-8 mode obeys just the same)
 wherever that name appears in the report. A shell takes almost anything as a
 function name, including bytes a terminal reads as cursor movement — and the
 name sits right next to the `PASS`/`FAIL` the report is for, so a test could
@@ -702,10 +703,11 @@ this one shows up
 So send anything you want to see on failure to stderr, and don't redirect either
 stream to `/dev/null`: that throws away the only report you get.
 
-Control bytes in a printed log are escaped (`\x1b`, `\x0d`, …), keeping only
-newlines and tabs: a log is replayed into the terminal reporting on the test, and
-a cursor-movement sequence in it would otherwise erase and rewrite the lines
-around it. `--json` and `--save-context` still give you the log byte for byte.
+Control bytes in a printed log are escaped (`\x1b`, `\x0d`, and the C1 controls
+spelled out in UTF-8 as `\xc2\x9b`, …), keeping only newlines and tabs: a log is
+replayed into the terminal reporting on the test, and a cursor-movement sequence
+in it would otherwise erase and rewrite the lines around it. `--json` and
+`--save-context` still give you the log byte for byte.
 
 A test's context directory is live — that's where its logs are written and where
 its working directory sits — so a test can also delete `stdout.log` or

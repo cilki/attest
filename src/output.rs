@@ -73,18 +73,44 @@ pub fn write_log_err(buf: &[u8]) {
     write_err(&sanitize_log(buf));
 }
 
-/// Whether `byte` has to be escaped before being replayed into a terminal:
-/// every C0 control byte bar the `\n` and `\t` a trace legitimately contains,
-/// plus `DEL`. Bytes >= `0x80` are left alone — a UTF-8 terminal reads them as
-/// text rather than as C1 controls, and escaping them would mangle the logs of
-/// every test that prints non-ASCII.
+/// Whether `byte` on its own has to be escaped before being replayed into a
+/// terminal: every C0 control byte bar the `\n` and `\t` a trace legitimately
+/// contains, plus `DEL`.
+///
+/// A raw byte in `0x80..=0xbf` is left alone: it is not valid UTF-8 on its own,
+/// so a UTF-8 terminal does not read it as a C1 control, and most of them are
+/// the continuation bytes of ordinary non-ASCII text (`日` is `e6 97 a5`, whose
+/// `97` sits squarely in the C1 range). The *encoded* C1 controls are a
+/// different matter — see [`C1_LEAD`].
 fn needs_escape(byte: u8) -> bool {
     matches!(byte, 0x00..=0x08 | 0x0b..=0x1f | 0x7f)
 }
 
-/// Replace each byte [`needs_escape`] rejects with a `\xNN` spelling of it,
-/// borrowing the input unchanged when there is nothing to escape (the usual
-/// case, since a trace is mostly printable text).
+/// Lead byte of the two-byte UTF-8 encoding of a C1 control, `U+0080..=U+009F`
+/// (`c2 80` … `c2 9f`).
+///
+/// A terminal in UTF-8 mode decodes those code points and then *acts* on them:
+/// they are the single-byte forms of the escape sequences, and `U+009B` (`CSI`)
+/// stands in for `ESC [` exactly. xterm spells this out — its `allowC1Printable`
+/// resource, off by default, is what "overrides the mapping of C1 control
+/// characters (code 128-159) to treat them as printable" — and the VTE-based
+/// terminals do the same. So escaping only `ESC` leaves the whole of
+/// [`write_log_err`]'s job undone: `\u{9b}2K` erases a line just as `\x1b[2K`
+/// does.
+///
+/// `0xc2` can never be a continuation byte (those are `0x80..=0xbf`), so the
+/// pair is unambiguous: `c2` followed by `80..=9f` is always one encoded C1
+/// control and never part of some longer character.
+pub(crate) const C1_LEAD: u8 = 0xc2;
+
+/// Does `buf` begin with the UTF-8 encoding of a C1 control? See [`C1_LEAD`].
+fn starts_with_c1(buf: &[u8]) -> bool {
+    matches!(buf, [C1_LEAD, 0x80..=0x9f, ..])
+}
+
+/// Replace each byte [`needs_escape`] rejects, and each encoded C1 control,
+/// with a `\xNN` spelling of it, borrowing the input unchanged when there is
+/// nothing to escape (the usual case, since a trace is mostly printable text).
 ///
 /// Escaped byte-wise rather than over `char`s: a log is arbitrary bytes and
 /// need not be valid UTF-8, and lossy decoding would turn a test's binary
@@ -92,15 +118,23 @@ fn needs_escape(byte: u8) -> bool {
 /// xtrace is full of them (`$'a\nb'`) and doubling every one would be a worse
 /// trade than the ambiguity with a literal `\x1b` in the log text.
 fn sanitize_log(buf: &[u8]) -> std::borrow::Cow<'_, [u8]> {
-    if !buf.iter().copied().any(needs_escape) {
+    // A `0xc2` that turns out not to lead a C1 control only costs the slow
+    // path, which copies it through unchanged.
+    if !buf.iter().copied().any(|b| needs_escape(b) || b == C1_LEAD) {
         return std::borrow::Cow::Borrowed(buf);
     }
     let mut out = Vec::with_capacity(buf.len());
-    for &byte in buf {
-        if needs_escape(byte) {
+    let mut rest = buf;
+    while let Some((&byte, tail)) = rest.split_first() {
+        if starts_with_c1(rest) {
+            out.extend_from_slice(format!("\\x{C1_LEAD:02x}\\x{:02x}", rest[1]).as_bytes());
+            rest = &rest[2..];
+        } else if needs_escape(byte) {
             out.extend_from_slice(format!("\\x{byte:02x}").as_bytes());
+            rest = tail;
         } else {
             out.push(byte);
+            rest = tail;
         }
     }
     std::borrow::Cow::Owned(out)
@@ -453,18 +487,22 @@ pub fn print_test_list(tests: &[(&Path, &str)]) {
 ///
 /// A label is one field *inside* a line, so `\n`, `\r` and `\t` are escaped
 /// here too: a newline in a name forges a whole extra line of the report rather
-/// than merely mangling the layout of one. Characters outside ASCII are left
-/// alone — a UTF-8 terminal reads them as text, and a test named in Japanese
-/// should still say so.
+/// than merely mangling the layout of one. Printable characters outside ASCII
+/// are left alone — a UTF-8 terminal reads them as text, and a test named in
+/// Japanese should still say so.
 ///
 /// `--json` reports names verbatim: nothing interprets them there, and
 /// `serde_json` escapes what its own grammar needs.
 pub(crate) fn escape_label(label: &str) -> std::borrow::Cow<'_, str> {
     use std::fmt::Write as _;
 
-    /// C0 controls and `DEL`: everything a terminal acts on rather than shows.
+    /// C0 controls, `DEL` and the C1 controls: everything a terminal acts on
+    /// rather than shows. The C1 block matters because a terminal in UTF-8
+    /// mode decodes those code points and obeys them — `U+009B` is `CSI`, so
+    /// `test_lie\u{9b}1G\u{9b}K` reaches back over the verdict next to it
+    /// exactly as the `ESC [` spelling does (see [`C1_LEAD`]).
     fn is_control(c: char) -> bool {
-        matches!(c, '\0'..='\u{1f}' | '\u{7f}')
+        matches!(c, '\0'..='\u{1f}' | '\u{7f}'..='\u{9f}')
     }
 
     if !label.contains(is_control) {
@@ -548,6 +586,24 @@ mod tests {
         assert_eq!(
             escape_label("test_a\nb\tc\rd\x7f"),
             r"test_a\x0ab\x09c\x0dd\x7f"
+        );
+    }
+
+    #[test]
+    fn escape_label_defuses_a_name_spelled_with_c1_controls() {
+        // The verdict-forging name of `result_line_escapes_a_hostile_name`,
+        // rewritten with `U+009B` (`CSI`) in place of every `ESC [`. A UTF-8
+        // terminal decodes those code points and acts on them, so leaving them
+        // alone as "non-ASCII text" hands the test back the cursor.
+        assert_eq!(
+            escape_label("test_lie\u{9b}1G\u{9b}K\u{9b}32mPASS\u{9b}0m"),
+            r"test_lie\x9b1G\x9bK\x9b32mPASS\x9b0m"
+        );
+        // The rest of the block goes too: `U+0085` is `NEL`, a line break of
+        // its own, and `U+009D` opens an OSC string.
+        assert_eq!(
+            escape_label("test_a\u{85}\u{9d}0;owned"),
+            r"test_a\x85\x9d0;owned"
         );
     }
 
@@ -728,6 +784,48 @@ mod tests {
         // Invalid UTF-8 (a test printing binary) passes through rather than
         // becoming a wall of replacement characters.
         assert_eq!(sanitize_log(b"\xff\xfe\n").as_ref(), b"\xff\xfe\n");
+    }
+
+    #[test]
+    fn sanitize_log_defuses_encoded_c1_controls() {
+        // `U+009B` is `CSI`: the same payload as above, spelled with the
+        // single-code-point C1 controls a UTF-8 terminal decodes and obeys
+        // just the same. Escaping only `ESC` would let every one of these
+        // through.
+        assert_eq!(
+            sanitize_log("boom\u{9b}2A\u{9b}2K\u{9b}1;32mPASS\u{9b}0m".as_bytes()).as_ref(),
+            br"boom\xc2\x9b2A\xc2\x9b2K\xc2\x9b1;32mPASS\xc2\x9b0m".as_slice()
+        );
+        // `U+009D` is `OSC`, and `U+009C` the string terminator that closes it.
+        assert_eq!(
+            sanitize_log("\u{9d}0;owned\u{9c}".as_bytes()).as_ref(),
+            br"\xc2\x9d0;owned\xc2\x9c".as_slice()
+        );
+    }
+
+    #[test]
+    fn sanitize_log_keeps_non_ascii_text_that_is_not_a_c1_control() {
+        // Only `c2` followed by `80..=9f` is an encoded C1 control. A `c2`
+        // leading anything else is ordinary text (`¡` is `c2 a1`)...
+        assert_eq!(
+            sanitize_log("¡olé!\n".as_bytes()).as_ref(),
+            "¡olé!\n".as_bytes()
+        );
+        // ...and a byte in the C1 range that is *not* behind a `c2` is a
+        // continuation byte of some other character, not a control: `日` is
+        // `e6 97 a5`, and mangling its `97` would wreck every log with CJK text
+        // in it.
+        assert_eq!(
+            sanitize_log("日本語\n".as_bytes()).as_ref(),
+            "日本語\n".as_bytes()
+        );
+        // A lone `c2` (truncated or binary output) is not a control either.
+        assert_eq!(sanitize_log(b"\xc2").as_ref(), b"\xc2");
+        // Pairs are taken two bytes at a time, so a `c2` that only leads
+        // another `c2` stays as it is and the pair behind it is still caught.
+        let mut expected = vec![C1_LEAD];
+        expected.extend_from_slice(br"\xc2\x9b");
+        assert_eq!(sanitize_log(b"\xc2\xc2\x9b").as_ref(), expected.as_slice());
     }
 
     /// A stream whose every write fails with a fixed error kind.

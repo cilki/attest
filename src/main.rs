@@ -230,8 +230,15 @@ fn parse_discovered(
             Err(e) if explicit_file => return Err(e),
             // Printed directly rather than logged: dropping a file changes
             // what the run covers, so it must show up whatever the log level
-            // happens to be.
-            Err(e) => errln!("warning: {e}; skipping this file"),
+            // happens to be. Escaped because the message carries the path the
+            // directory walk turned up, and a file name is as much the tree's
+            // choice as a test name is (see `output::escape_label`): raw, a
+            // `touch $'x\e[2K.sh'` holding unparseable shell gets to redraw
+            // the line that says it was skipped.
+            Err(e) => errln!(
+                "warning: {}; skipping this file",
+                output::escape_label(&e.to_string())
+            ),
         }
     }
     Ok(parsed)
