@@ -84,6 +84,11 @@
   for `=`/`==`/`!=`, an inline character-level diff of them. The report the
   whole of this adds up to is documented in the README, so keep both in step
   when changing it.
+  The log is scanned a line at a time, keeping at most `MAX_LINE` bytes of any
+  one of them, rather than read whole: the failing command's own output sits
+  between its trace line and the end of the file, so the trace cannot be found
+  by reading a tail — but the output it has to be found behind is as big as the
+  test made it, and need not contain a newline at all.
   The source lines the snippet renders go through `escape_c1` first:
   `annotate_snippets` substitutes the C0 controls in the source it is given
   but prints `U+0080`–`U+009F` through, and those are controls a UTF-8
@@ -107,15 +112,20 @@
   `println!` panics when the reader goes away (`attest | head -1`). Instead the
   first `EPIPE` latches `output_closed()`, the runner winds the run down like an
   interrupt, and `main` re-raises `SIGPIPE` so the shell sees the usual status.
-  A captured log goes out through `write_log_err` instead, which escapes every
+  A captured log goes out through `replay_log_err` instead, which escapes every
   C0 control byte but `\n`/`\t`, plus the two-byte UTF-8 spelling of a C1
   control (`c2 80`–`c2 9f`): `xtrace.log` carries whatever the test wrote to
   stderr, and replaying that raw would let a cursor-movement sequence in it
   erase and rewrite the report around it. Raw bytes in `80..=bf` stay as they
   are — most of them are the continuation bytes of ordinary non-ASCII text, and
-  alone none of them is valid UTF-8 for a C1 control. The `-vv` streamer tails
-  the log a read at a time, so it holds a trailing `c2` back until the byte
-  after it arrives rather than sanitizing half a control. `--json`/`--save-context`
+  alone none of them is valid UTF-8 for a C1 control. It replays from a reader a
+  bounded chunk at a time rather than taking the log as one buffer: a log is as
+  big as the test that wrote it chose to make it, and holding one whole — plus
+  the escaped copy, up to four bytes per byte — is how one noisy failing test
+  used to get the whole run OOM-killed. A trailing `c2` is held back until the
+  byte after it arrives (the next chunk, or the next tail of a `-vv` stream)
+  rather than sanitizing half a control, and the dimming the replay is wrapped
+  in is only emitted if there is anything to put in it. `--json`/`--save-context`
   are unaffected and still carry the bytes verbatim.
 
 ## Key dependencies

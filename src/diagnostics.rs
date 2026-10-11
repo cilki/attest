@@ -74,33 +74,81 @@ pub fn print_failure_snippet(result: &TestResult) {
 
 /// Parse the xtrace log to find the last executed command (which is the one that failed).
 fn parse_xtrace_failure(tmp_dir: &Path) -> Option<FailureInfo> {
-    // Read the log the runner opened for the test, never a symlink the test
-    // left at that name (see `overlay::open_nofollow`). Lossy because a test
-    // is free to write non-UTF-8 to its stderr, and a diagnostic is better
-    // than none.
-    let bytes = crate::overlay::read_nofollow(&tmp_dir.join("xtrace.log")).ok()?;
-    let content = String::from_utf8_lossy(&bytes);
+    // Open the log the runner created for the test, never a symlink the test
+    // left at that name (see `overlay::open_nofollow`).
+    let file = crate::overlay::open_nofollow(&tmp_dir.join("xtrace.log")).ok()?;
+    let mut reader = std::io::BufReader::new(file);
 
-    // Find the last line starting with `+LINENO: ` (our custom PS4 format).
-    // Skip lines with `++ ` prefix (subshell traces) and non-trace lines.
+    // Walk it a line at a time rather than reading it whole: the log holds
+    // everything the test and the programs it ran sent to stderr, so it is as
+    // big as the test chose to make it, and the failing command's own output
+    // sits between its trace line and the end of the file — a tail would miss
+    // exactly the command a noisy failure needs attributing to.
     let mut last_match: Option<FailureInfo> = None;
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix('+') {
-            // Skip subshell traces (++, +++, etc.)
-            if rest.starts_with('+') {
-                continue;
-            }
-            if let Some((lineno_str, command)) = rest.split_once(": ")
-                && let Ok(lineno) = lineno_str.trim().parse::<usize>()
-            {
-                last_match = Some(FailureInfo {
-                    lineno,
-                    command: command.to_string(),
-                });
-            }
+    let mut line = Vec::new();
+    while read_capped_line(&mut reader, &mut line).unwrap_or(false) {
+        // Lossy because a test is free to write non-UTF-8 to its stderr, and a
+        // diagnostic is better than none.
+        if let Some(info) = parse_trace_line(&String::from_utf8_lossy(&line)) {
+            last_match = Some(info);
         }
     }
     last_match
+}
+
+/// The most a single line of the log is held in memory for. A trace line is a
+/// command as the shell echoed it, so this is far more than one ever needs;
+/// what it bounds is a *test* writing megabytes to stderr without a newline in
+/// them, which is one "line" as far as this scan is concerned.
+const MAX_LINE: usize = 64 * 1024;
+
+/// Read up to the next `\n` from `reader` into `line`, keeping at most
+/// [`MAX_LINE`] bytes and discarding the rest of an over-long line. Returns
+/// whether anything was read at all (false at EOF).
+///
+/// `BufRead::read_until` would be this function, minus the cap: it grows the
+/// buffer to hold the whole line however long that is.
+fn read_capped_line(
+    reader: &mut impl std::io::BufRead,
+    line: &mut Vec<u8>,
+) -> std::io::Result<bool> {
+    line.clear();
+    let mut any = false;
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            return Ok(any);
+        }
+        any = true;
+        let newline = buf.iter().position(|&b| b == b'\n');
+        let len = newline.unwrap_or(buf.len());
+        let room = MAX_LINE.saturating_sub(line.len());
+        line.extend_from_slice(&buf[..room.min(len)]);
+        // The newline itself is consumed with the line it ends but kept out of
+        // it, the way `str::lines` splits.
+        reader.consume(len + usize::from(newline.is_some()));
+        if newline.is_some() {
+            return Ok(true);
+        }
+    }
+}
+
+/// One line of an xtrace log as a [`FailureInfo`], if it traces a command at
+/// the top level: `+<lineno>: <command>` in the runner's `PS4` format.
+/// Subshell traces (`++`, `+++`, …) and anything the test printed itself are
+/// not commands this failure can be attributed to.
+fn parse_trace_line(line: &str) -> Option<FailureInfo> {
+    // A `\r` before the newline belongs to the terminal conventions of
+    // whatever wrote the line, not to the trace (`str::lines` drops it too).
+    let rest = line.strip_suffix('\r').unwrap_or(line).strip_prefix('+')?;
+    if rest.starts_with('+') {
+        return None;
+    }
+    let (lineno, command) = rest.split_once(": ")?;
+    Some(FailureInfo {
+        lineno: lineno.trim().parse().ok()?,
+        command: command.to_string(),
+    })
 }
 
 /// 0-based line range `(start, end)` of the function definition enclosing
@@ -549,6 +597,64 @@ mod tests {
 
         let info = parse_xtrace_failure(tmp.path()).unwrap();
         assert_eq!(info.lineno, 5);
+        assert_eq!(info.command, "false");
+    }
+
+    #[test]
+    fn parse_xtrace_finds_the_command_behind_a_wall_of_its_own_output() {
+        // The shape of a realistic noisy failure: the command that failed
+        // printed far more than it traced, so its trace line is a long way
+        // from the end of the log and the tail of the file holds no trace at
+        // all. The scan has to reach it without holding the whole log, and
+        // without holding one of its lines either — the output here has no
+        // newlines in it, so it is a single line as far as the scan can tell.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut log = String::from("+3: setup\n+7: noisy_command\n");
+        log.push_str(&"x".repeat(MAX_LINE * 3));
+        std::fs::write(tmp.path().join("xtrace.log"), &log).unwrap();
+
+        let info = parse_xtrace_failure(tmp.path()).unwrap();
+        assert_eq!(info.lineno, 7);
+        assert_eq!(info.command, "noisy_command");
+    }
+
+    #[test]
+    fn parse_xtrace_resumes_after_an_over_long_line() {
+        // An over-long line is truncated, not treated as the end of the log:
+        // the trace lines after it still have to be found.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut log = String::from("+3: setup\n");
+        log.push_str(&"y".repeat(MAX_LINE * 2));
+        log.push_str("\n+9: false\n");
+        std::fs::write(tmp.path().join("xtrace.log"), &log).unwrap();
+
+        let info = parse_xtrace_failure(tmp.path()).unwrap();
+        assert_eq!(info.lineno, 9);
+        assert_eq!(info.command, "false");
+    }
+
+    #[test]
+    fn parse_xtrace_keeps_the_line_number_of_an_over_long_trace() {
+        // A trace line longer than the cap loses its tail, so no operand diff
+        // comes out of it — but the line number is at the front of the line,
+        // so the snippet still points at the command that failed.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log = format!("+4: '[' {} = b ']'\n", "a".repeat(MAX_LINE * 2));
+        std::fs::write(tmp.path().join("xtrace.log"), &log).unwrap();
+
+        let info = parse_xtrace_failure(tmp.path()).unwrap();
+        assert_eq!(info.lineno, 4);
+        assert_eq!(info.command.len(), MAX_LINE - "+4: ".len());
+        assert!(parse_bracket_expr(&info.command).is_none());
+    }
+
+    #[test]
+    fn parse_xtrace_reads_the_last_line_without_a_trailing_newline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("xtrace.log"), "+3: echo hi\n+4: false").unwrap();
+
+        let info = parse_xtrace_failure(tmp.path()).unwrap();
+        assert_eq!(info.lineno, 4);
         assert_eq!(info.command, "false");
     }
 

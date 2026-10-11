@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 
 use crate::output;
-use crate::output::errln;
+use crate::output::{DIM, RESET, errln};
 use crate::overlay;
 
 /// Set by the SIGINT/SIGTERM handler. Tests run in their own sessions (see the
@@ -55,7 +55,7 @@ impl XtraceStreamer {
         let xtrace_path = pending.context.as_ref().unwrap().join("xtrace.log");
         if let Ok(file) = overlay::open_nofollow(&xtrace_path) {
             errln!(
-                "\x1b[2m--- xtrace: {} ---\x1b[0m",
+                "{DIM}--- xtrace: {} ---{RESET}",
                 output::escape_label(&pending.name)
             );
             self.tailed = Some(Tailed {
@@ -77,10 +77,7 @@ impl XtraceStreamer {
     ///
     /// `last` says there will be no more: the test has finished, so whatever is
     /// in the file is all of it. Until then a trailing [`output::C1_LEAD`] is
-    /// left unconsumed, because an encoded C1 control is two bytes and a test is
-    /// free to write them one at a time — `printf '\302'; sleep 1; printf '\233'`
-    /// puts them in different reads of the tail, where sanitizing each read on
-    /// its own would pass both halves through and hand the terminal a `CSI`.
+    /// left unconsumed and re-read next time (see [`output::replay_log_err`]).
     fn flush_new(&mut self, last: bool) {
         let Some(t) = self.tailed.as_mut() else {
             return;
@@ -88,20 +85,7 @@ impl XtraceStreamer {
         if t.file.seek(SeekFrom::Start(t.offset)).is_err() {
             return;
         }
-        let mut buf = Vec::new();
-        if t.file.read_to_end(&mut buf).is_err() {
-            return;
-        }
-        if !last && buf.last() == Some(&output::C1_LEAD) {
-            buf.pop();
-        }
-        if buf.is_empty() {
-            return;
-        }
-        t.offset += buf.len() as u64;
-        output::write_err(b"\x1b[2m");
-        output::write_log_err(&buf);
-        output::write_err(b"\x1b[0m");
+        t.offset += output::replay_log_err(&mut t.file, last);
     }
 
     /// Settle a finished test's trace output: flush and release the lock if it
@@ -121,23 +105,24 @@ impl XtraceStreamer {
 /// header. Silent if the log is missing or empty.
 ///
 /// The log is whatever the test and the programs it ran wrote to stderr, so it
-/// goes out through [`output::write_log_err`] rather than being replayed
-/// verbatim into the terminal.
+/// goes out through [`output::replay_log_err`] rather than being replayed
+/// verbatim into the terminal, and a chunk at a time rather than all at once —
+/// a failing test's log can be arbitrarily large.
 fn dump_xtrace_log(name: &str, context: &Path) {
-    // Read the file the runner created, not whatever a symlink left at that
+    // Open the file the runner created, not whatever a symlink left at that
     // name points at: the test can rewrite its own context dir
     // ([`overlay::open_nofollow`]).
-    if let Ok(content) = overlay::read_nofollow(&context.join("xtrace.log"))
-        && !content.is_empty()
-    {
-        errln!(
-            "\x1b[2m--- xtrace: {} ---\x1b[0m",
-            output::escape_label(name)
-        );
-        output::write_err(b"\x1b[2m");
-        output::write_log_err(&content);
-        output::write_err(b"\x1b[0m");
+    let Ok(mut log) = overlay::open_nofollow(&context.join("xtrace.log")) else {
+        return;
+    };
+    // Nothing to show for a test that wrote nothing to stderr. `open_nofollow`
+    // has established that this is a regular file, so its length is the whole
+    // of what the replay below would print.
+    if !log.metadata().is_ok_and(|m| m.len() > 0) {
+        return;
     }
+    errln!("{DIM}--- xtrace: {} ---{RESET}", output::escape_label(name));
+    output::replay_log_err(&mut log, true);
 }
 
 pub struct TestResult {

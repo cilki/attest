@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -10,6 +10,7 @@ use crate::runner::TestResult;
 
 pub(crate) const GREEN: &str = "\x1b[32m";
 pub(crate) const RED: &str = "\x1b[31m";
+pub(crate) const DIM: &str = "\x1b[2m";
 pub(crate) const RESET: &str = "\x1b[0m";
 
 /// Set once the reader on the other end of one of our streams has gone away, as
@@ -54,8 +55,9 @@ pub fn write_err(buf: &[u8]) {
     write_stream(&BROKEN_PIPE, &mut std::io::stderr().lock(), buf);
 }
 
-/// Write a captured log to stderr with the bytes that drive a terminal
-/// escaped, so replaying it cannot rewrite the report around it.
+/// Replay a captured log to stderr, dimmed, with the bytes that drive a
+/// terminal escaped, so replaying it cannot rewrite the report around it.
+/// Returns how many bytes of `log` were consumed.
 ///
 /// A test's `xtrace.log` holds the shell's trace *and* everything the test and
 /// the programs it ran wrote to stderr, so dumping it puts arbitrary bytes the
@@ -67,10 +69,97 @@ pub fn write_err(buf: &[u8]) {
 /// echoing content it fetched, generated or was handed as a fixture should not
 /// be able to decide what the reader is told about it.
 ///
+/// `last` says there will be no more of the log. Until then a trailing
+/// [`C1_LEAD`] is left unconsumed, because an encoded C1 control is two bytes
+/// and a test is free to write them one at a time — `printf '\302'; sleep 1;
+/// printf '\233'` puts them either side of a chunk boundary, where sanitizing
+/// each chunk on its own would pass both halves through and hand the terminal
+/// a `CSI`.
+///
 /// The full bytes are still reported verbatim where nothing interprets them:
 /// `--json` and `--save-context`.
-pub fn write_log_err(buf: &[u8]) {
-    write_err(&sanitize_log(buf));
+pub fn replay_log_err(log: &mut impl Read, last: bool) -> u64 {
+    stream_log(&BROKEN_PIPE, &mut std::io::stderr().lock(), log, last)
+}
+
+/// How much of a log is held in memory at a time while it is replayed.
+const LOG_CHUNK: usize = 64 * 1024;
+
+/// Replay `log` to `stream` a [`LOG_CHUNK`] at a time, wrapping whatever it
+/// prints in [`DIM`]. Returns the number of bytes consumed: all of them, bar a
+/// trailing [`C1_LEAD`] when `last` is false.
+///
+/// Bounded rather than read whole because a log is as big as the test that
+/// wrote it chose to make it: `xtrace.log` carries everything the test and the
+/// programs it ran sent to stderr, and a test that fails after a verbose build
+/// spewed a few hundred megabytes can easily have left a bigger log than the
+/// machine has memory to hold — twice over, since escaping allocates a copy of
+/// up to four bytes per byte. Reading it in one go made one noisy test enough
+/// to get `attest` OOM-killed, losing the results of every *other* test in the
+/// run along with it.
+fn stream_log(
+    closed: &AtomicBool,
+    stream: &mut impl Write,
+    log: &mut impl Read,
+    last: bool,
+) -> u64 {
+    /// Open the dimmed region, once, and only if there is anything to put in
+    /// it: a flush that finds nothing new must print nothing at all.
+    fn open_dim(closed: &AtomicBool, stream: &mut impl Write, opened: &mut bool) {
+        if !std::mem::replace(opened, true) {
+            write_stream(closed, stream, DIM.as_bytes());
+        }
+    }
+
+    let mut buf = vec![0u8; LOG_CHUNK];
+    let mut consumed = 0u64;
+    // A `C1_LEAD` the previous chunk ended on, left for this one: it goes at
+    // the front of the buffer, so the pair it may be the first half of is
+    // sanitized as a pair rather than a chunk boundary apart.
+    let mut carry = false;
+    let mut opened = false;
+    loop {
+        // Nowhere left to replay it to (`attest | head -1`): stop reading
+        // rather than walking the whole log to write none of it.
+        if closed.load(Ordering::Relaxed) {
+            break;
+        }
+        let start = usize::from(carry);
+        if carry {
+            buf[0] = C1_LEAD;
+        }
+        let n = match log.read(&mut buf[start..]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        consumed += n as u64;
+        let mut end = start + n;
+        carry = buf[end - 1] == C1_LEAD;
+        if carry {
+            end -= 1;
+        }
+        // The whole chunk was the lead byte now being held back.
+        if end == 0 {
+            continue;
+        }
+        open_dim(closed, stream, &mut opened);
+        write_stream(closed, stream, &sanitize_log(&buf[..end]));
+    }
+    if carry {
+        if last {
+            // Nothing follows it after all, so it was never half of anything.
+            open_dim(closed, stream, &mut opened);
+            write_stream(closed, stream, &sanitize_log(&[C1_LEAD]));
+        } else {
+            consumed -= 1; // left for the call that has the byte after it
+        }
+    }
+    if opened {
+        write_stream(closed, stream, RESET.as_bytes());
+    }
+    consumed
 }
 
 /// Whether `byte` on its own has to be escaped before being replayed into a
@@ -826,6 +915,101 @@ mod tests {
         let mut expected = vec![C1_LEAD];
         expected.extend_from_slice(br"\xc2\x9b");
         assert_eq!(sanitize_log(b"\xc2\xc2\x9b").as_ref(), expected.as_slice());
+    }
+
+    /// Replay `log` into a buffer, the way [`replay_log_err`] replays it into
+    /// stderr. Returns what was written and how much of `log` was consumed.
+    fn replayed(log: &[u8], last: bool) -> (Vec<u8>, u64) {
+        let closed = AtomicBool::new(false);
+        let mut sink: Vec<u8> = Vec::new();
+        let consumed = stream_log(&closed, &mut sink, &mut std::io::Cursor::new(log), last);
+        (sink, consumed)
+    }
+
+    /// The same, for a replay whose output is text (everything but a lone
+    /// [`C1_LEAD`] comes out as ASCII or as the bytes of the log).
+    fn replayed_text(log: &[u8], last: bool) -> (String, u64) {
+        let (out, consumed) = replayed(log, last);
+        (
+            String::from_utf8(out).expect("escaped output is text"),
+            consumed,
+        )
+    }
+
+    #[test]
+    fn a_log_is_replayed_wrapped_in_one_dimmed_region() {
+        let (out, consumed) = replayed_text(b"+1: false\n", true);
+        assert_eq!(out, format!("{DIM}+1: false\n{RESET}"));
+        assert_eq!(consumed, 10);
+    }
+
+    #[test]
+    fn replaying_nothing_prints_nothing() {
+        // The live tail flushes on every poll, so most flushes find no new
+        // bytes: those must not each leave a stray escape sequence behind.
+        assert_eq!(replayed(b"", false), (Vec::new(), 0));
+    }
+
+    #[test]
+    fn a_log_too_big_for_one_chunk_is_replayed_whole() {
+        // Logs are read a bounded chunk at a time (a test can leave one bigger
+        // than memory), so the chunking must be invisible in the result: every
+        // byte, once, in order, inside a single dimmed region.
+        let log: Vec<u8> = (0..LOG_CHUNK * 2 + 7)
+            .map(|i| b'a' + (i % 26) as u8)
+            .collect();
+        let (out, consumed) = replayed_text(&log, true);
+        assert_eq!(consumed, log.len() as u64);
+        assert_eq!(
+            out,
+            format!("{DIM}{}{RESET}", String::from_utf8_lossy(&log))
+        );
+    }
+
+    #[test]
+    fn an_encoded_c1_control_split_across_a_chunk_is_still_escaped() {
+        // The chunk boundary is attacker-chosen: a test can place the two
+        // bytes of `U+009B` (`CSI`) either side of it, and a chunk sanitized
+        // on its own passes a lone `c2` through as text and a lone `9b` as a
+        // continuation byte — handing the terminal the control they spell
+        // together.
+        let mut log = vec![b'.'; LOG_CHUNK - 1];
+        log.extend_from_slice(b"\xc2\x9b2K");
+        let (out, consumed) = replayed_text(&log, true);
+        assert_eq!(consumed, log.len() as u64);
+        assert!(!out.contains('\u{9b}'), "a CSI reached the terminal");
+        assert_eq!(
+            out,
+            format!("{DIM}{}\\xc2\\x9b2K{RESET}", ".".repeat(LOG_CHUNK - 1))
+        );
+    }
+
+    #[test]
+    fn a_trailing_lead_byte_waits_for_the_byte_after_it() {
+        // Same payload, arriving a byte at a time down a live tail: the `c2`
+        // ends the log for now, so it is neither printed nor counted as read,
+        // and the next flush starts again from it.
+        let (out, consumed) = replayed_text(b"ok\xc2", false);
+        assert_eq!(out, format!("{DIM}ok{RESET}"));
+        assert_eq!(consumed, 2, "the lead byte must be re-read next time");
+
+        // Once the test has finished there is no byte after it after all, and
+        // a lone `c2` is not a control: it goes out as it is.
+        let (out, consumed) = replayed(b"ok\xc2", true);
+        assert_eq!(out, [DIM.as_bytes(), b"ok\xc2", RESET.as_bytes()].concat());
+        assert_eq!(consumed, 3);
+    }
+
+    #[test]
+    fn nothing_is_read_once_the_reader_is_gone() {
+        // `attest | head -1` on a run with a huge log: there is nobody left to
+        // print it to, so it must not be walked to print none of it.
+        let closed = AtomicBool::new(true);
+        let mut sink: Vec<u8> = Vec::new();
+        let mut log = std::io::Cursor::new(vec![b'x'; LOG_CHUNK * 4]);
+        assert_eq!(stream_log(&closed, &mut sink, &mut log, true), 0);
+        assert!(sink.is_empty());
+        assert_eq!(log.position(), 0);
     }
 
     /// A stream whose every write fails with a fixed error kind.
