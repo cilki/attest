@@ -23,6 +23,9 @@ pub struct TestFile {
 /// - `file`: if present, the test's file must end with this path
 /// - `name`: if present, matches the test function name; `*` is a wildcard;
 ///   a pattern without `*` matches any name that starts with the pattern
+///
+/// A leading `./` marks the argument as a path: all of it is the `file` half
+/// and `name` is left unconstrained, so `./a/x.test` == `a/x.test/`.
 pub struct TestPattern {
     pub file: Option<PathBuf>,
     pub name: Option<String>,
@@ -30,15 +33,21 @@ pub struct TestPattern {
 
 impl TestPattern {
     pub fn parse(s: &str) -> Self {
-        let is_path = s.starts_with("./");
-        let s = s.strip_prefix("./").unwrap_or(s);
-        // A `/` splits file from name; without one, a `./`-prefixed argument is
-        // a bare file and anything else a bare test name. Either side may come
-        // out empty (`foo.sh/`, `/test_x`), which means "unconstrained".
-        let (file_part, name_part) = match s.rsplit_once('/') {
-            Some(parts) => parts,
-            None if is_path => (s, ""),
-            None => ("", s),
+        // A leading `./` marks the argument as a path, so all of it is the file
+        // half and there is no name to split off: `./a/x.test` == `a/x.test/`.
+        // The marker has to win over the split however many components follow
+        // it — honouring it only for a bare name (`./x.test`) made the whole
+        // thing collapse back into a file/name split the moment a directory was
+        // put in front, which is where a `./` comes from in the first place.
+        //
+        // Without the marker the last `/` splits file from name, and an
+        // argument with no `/` at all is a bare test name. Either side may come
+        // out empty (`foo.sh/`, `/test_x`), which means "unconstrained"; a name
+        // is attached to a path by spelling the selector out without the `./`
+        // (`a/x.test/test_foo`), which is the form `list` prints.
+        let (file_part, name_part) = match s.strip_prefix("./") {
+            Some(path) => (path, ""),
+            None => s.rsplit_once('/').unwrap_or(("", s)),
         };
         Self {
             file: (!file_part.is_empty()).then(|| PathBuf::from(file_part)),
@@ -235,8 +244,36 @@ mod tests {
         let p = TestPattern::parse("./foo.sh");
         assert_eq!(p.file.as_deref(), Some(Path::new("foo.sh")));
         assert!(p.name.is_none());
+    }
 
+    #[test]
+    fn pattern_dot_slash_marker_survives_a_directory() {
+        // The `./` says "this is a path", so every component of it belongs to
+        // the file half — a `./` in front of a multi-component path used to be
+        // dropped and the path then split at its last `/`, which asked for a
+        // test named `foo.sh` in a file called `tests` and matched nothing.
+        let p = TestPattern::parse("./tests/foo.sh");
+        assert_eq!(p.file.as_deref(), Some(Path::new("tests/foo.sh")));
+        assert!(p.name.is_none());
+        assert!(p.matches(Path::new("/repo/tests/foo.sh"), "test_bar"));
+        assert!(!p.matches(Path::new("/repo/other/foo.sh"), "test_bar"));
+
+        // Identical to the trailing-slash spelling of the same selector.
+        let slash = TestPattern::parse("tests/foo.sh/");
+        assert_eq!(p.file, slash.file);
+        assert_eq!(p.name, slash.name);
+    }
+
+    #[test]
+    fn pattern_dot_slash_takes_the_whole_path() {
+        // Consequence of the marker winning: a name cannot be appended behind
+        // a `./`. It is spelled without the marker instead, which is the form
+        // `list` prints.
         let p = TestPattern::parse("./foo.sh/test_bar");
+        assert_eq!(p.file.as_deref(), Some(Path::new("foo.sh/test_bar")));
+        assert!(p.name.is_none());
+
+        let p = TestPattern::parse("foo.sh/test_bar");
         assert_eq!(p.file.as_deref(), Some(Path::new("foo.sh")));
         assert_eq!(p.name.as_deref(), Some("test_bar"));
     }

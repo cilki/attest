@@ -200,6 +200,12 @@ fn split_path_arg(arg: &str) -> (PathBuf, Option<String>) {
             let filter = if name_part.is_empty() {
                 None
             } else {
+                // The `./` of a `./a/x.test/test_foo` target is noise in the
+                // selector and, as a prefix, tells `TestPattern::parse` that
+                // the whole argument is a path — which would swallow the name
+                // half we just established is one. The file half matches as a
+                // suffix, so dropping it changes nothing else.
+                let file_part = file_part.strip_prefix("./").unwrap_or(file_part);
                 Some(format!("{file_part}/{name_part}"))
             };
             return (path.to_path_buf(), filter);
@@ -507,6 +513,38 @@ mod tests {
             panic!("a file the user named must not be skipped silently");
         };
         assert!(err.to_string().starts_with("parse error in "), "{err}");
+    }
+
+    /// A `./`-prefixed target keeps selecting the test it names.
+    ///
+    /// `./` in front of a filter means "all of this is a path", so the
+    /// synthesized filter must not carry the marker over from the target: the
+    /// name half the split just established would be read as the last
+    /// component of a file path and match nothing.
+    #[test]
+    fn split_path_arg_drops_the_dot_slash_from_the_filter() {
+        // `split_path_arg` decides the split from the filesystem, so a `./`
+        // target needs a file that really is one relative to the working
+        // directory — which cargo sets to the package root for a test binary.
+        // Done against the repository's own example rather than a temp dir
+        // because a relative path cannot name one, and chdir'ing to it would
+        // race every other test in this binary.
+        assert!(
+            Path::new("examples/md5sum.test").is_file(),
+            "expected to run from the package root"
+        );
+
+        let (path, filter) = split_path_arg("./examples/md5sum.test/testHello");
+        assert_eq!(path, Path::new("./examples/md5sum.test"));
+        assert_eq!(filter.as_deref(), Some("examples/md5sum.test/testHello"));
+
+        // Both spellings of the target select the same test.
+        let (_, bare) = split_path_arg("examples/md5sum.test/testHello");
+        assert_eq!(filter, bare);
+
+        let pattern = parser::TestPattern::parse(&filter.unwrap());
+        assert!(pattern.matches(Path::new("./examples/md5sum.test"), "testHello"));
+        assert!(!pattern.matches(Path::new("./examples/md5sum.test"), "testHelp"));
     }
 
     #[test]

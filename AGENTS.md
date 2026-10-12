@@ -26,10 +26,16 @@
   suffix (whole components, no wildcards), the name half a `*` glob that
   degrades to a prefix match when it contains no `*`, and either half may be
   empty to mean "unconstrained". Without a `/` the whole pattern is a name, so
-  a file-only filter needs the trailing slash — except for a single component
-  behind a `./`, which `parse` strips and then takes as the file (`./x.test` ==
-  `x.test/`). The split still wins over that marker once anything else
-  contains a `/`, so `./a/x.test` means the name `x.test` in a file `a`.
+  a file-only filter needs the trailing slash — except behind a `./`, which
+  marks the whole argument as a path: `parse` strips the marker and takes
+  everything after it as the file, however many components that is
+  (`./a/x.test` == `a/x.test/`). The marker wins over the last-`/` split rather
+  than only applying when there is nothing to split, so a name is attached by
+  spelling the selector without the `./` (`a/x.test/test_foo`, the form `list`
+  prints). `split_path_arg` therefore drops a `./` from the filter it
+  synthesizes for a positional target: there the split is decided by the
+  filesystem, so `./a/x.test/test_foo` is a file plus a name, and carrying the
+  marker into the filter would turn the name back into a path component.
 - `src/runner.rs` - For each test: writes all extracted functions (test +
   helper) to a temp script, forks a child that execs `<shell> -c` (the shell
   `resolve_shell` picked for the file, or `--shebang`) with the original script
@@ -178,8 +184,9 @@ to tests.
   does the same to the whole run and bails out without a summary
 - `--filter [FILE/]PATTERN` — run only matching tests. `FILE` is a path suffix
   (no wildcards); `PATTERN` takes `*` wildcards and matches as a prefix only
-  when it has none. Without a `/` the argument is all `PATTERN`, unless it is a
-  single component behind a `./` (`./x.test` == `x.test/`)
+  when it has none. Without a `/` the argument is all `PATTERN`; behind a `./`
+  it is all `FILE`, however many components it has (`./a/x.test` ==
+  `a/x.test/`)
 - `--override SPEC` — copy a binary into the test context `bin/` dir so tests
   use it exclusively. SPEC is either a path (`/usr/bin/example` or
   `./bin/example`) or a mapping (`example=/usr/bin/override`)

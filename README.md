@@ -336,12 +336,15 @@ A filter is `[<file>/]<name>`, and the `/` is what tells the two halves apart:
 - **With no `/` the whole thing is a test name**, never a file — which is why
   the file-only example above ends in one. `--filter md5sum.test` looks for a
   test whose name starts with `md5sum.test` and so matches nothing. The one
-  exception is a leading `./`, which marks the argument as a path:
-  `--filter ./md5sum.test` means the same as `--filter 'md5sum.test/'`. That
-  only holds for a bare file name, though — anything longer still splits at its
-  last `/`, so `--filter ./examples/md5sum.test` asks for a test named
-  `md5sum.test` in a file `examples` and matches nothing. The trailing-slash
-  form always works.
+  exception is a leading `./`, which marks the argument as a path: all of it is
+  then the file half, so `--filter ./md5sum.test` and
+  `--filter ./examples/md5sum.test` mean the same as `'md5sum.test/'` and
+  `'examples/md5sum.test/'`. Nothing is left for a name, so one cannot be
+  appended behind the marker: as a *filter*,
+  `./examples/md5sum.test/testHello` asks for a file at that whole path. Spell
+  a filter that carries a name without the `./`, the way `list` prints it. As a
+  *target* the same string still works — there the split is decided by the
+  filesystem, and only where the left half is a file that exists.
 - **The file half is a path suffix**, compared a whole component at a time and
   with no wildcards: `md5sum.test/` and `examples/md5sum.test/` both select the
   file, while `um.test/` and `md5*.test/` select nothing. An empty name half
