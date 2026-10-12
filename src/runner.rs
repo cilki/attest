@@ -1593,7 +1593,10 @@ mod tests {
 "#,
             "test_mask",
         );
-        assert!(result.passed, "the test ran with a signal blocked");
+        assert!(
+            result.outcome.passed(),
+            "the test ran with a signal blocked"
+        );
     }
 
     #[test]
