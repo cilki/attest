@@ -3,7 +3,7 @@ use std::path::Path;
 use brush_parser::ast::SourceLocation;
 
 use crate::output::{GREEN, RED, RESET, outln};
-use crate::runner::TestResult;
+use crate::runner::{Outcome, TestResult};
 
 /// Information extracted from an xtrace log about the failing command.
 struct FailureInfo {
@@ -43,7 +43,7 @@ pub fn print_failure_snippet(result: &TestResult) {
 
     // A timed-out test did not fail a command; the highlighted line is simply
     // where it was still running when the clock ran out.
-    let title = if result.timed_out {
+    let title = if result.outcome == Outcome::Timeout {
         "test timed out"
     } else {
         "command failed"
@@ -189,24 +189,11 @@ const CONTEXT_LINES: usize = 3;
 /// a quoted string, in a comment — and a snippet prints the lines around the
 /// failure, so without this a failing file gets to redraw the report blaming it.
 fn escape_c1(line: &str) -> std::borrow::Cow<'_, str> {
-    use std::fmt::Write as _;
-
     fn is_c1(c: char) -> bool {
         matches!(c, '\u{80}'..='\u{9f}')
     }
 
-    if !line.contains(is_c1) {
-        return std::borrow::Cow::Borrowed(line);
-    }
-    let mut out = String::with_capacity(line.len());
-    for c in line.chars() {
-        if is_c1(c) {
-            let _ = write!(out, "\\x{:02x}", c as u32);
-        } else {
-            out.push(c);
-        }
-    }
-    std::borrow::Cow::Owned(out)
+    crate::output::escape_chars(line, is_c1)
 }
 
 /// Render an annotate-snippets diagnostic highlighting `lines[line_idx]`, with

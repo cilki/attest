@@ -125,10 +125,32 @@ fn dump_xtrace_log(name: &str, context: &Path) {
     output::replay_log_err(&mut log, true);
 }
 
+/// How a test ended. A timeout is a failure, but a distinguishable one: it
+/// gets its own verdict in the report, its own `status` in `--json`, and a
+/// snippet that points at where the test still was rather than at a command
+/// that returned nonzero.
+///
+/// One field rather than a `passed`/`timed_out` pair, which could also spell
+/// the fourth thing a test can never be — timed out *and* passed — and left
+/// every reader of a result to re-derive these three cases for itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Outcome {
+    Pass,
+    Fail,
+    Timeout,
+}
+
+impl Outcome {
+    /// Did the test pass? The two ways of not passing are told apart by the
+    /// report, not by anything that only has to count failures.
+    pub fn passed(self) -> bool {
+        self == Outcome::Pass
+    }
+}
+
 pub struct TestResult {
     pub name: String,
-    pub passed: bool,
-    pub timed_out: bool,
+    pub outcome: Outcome,
     pub duration: Duration,
     pub context: PathBuf,
     pub source_path: PathBuf,
@@ -492,11 +514,11 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
             if config.json {
                 output::print_test_result_json(&result);
             } else {
-                status.record(result.passed);
-                if config.verbose >= 1 || !result.passed {
+                status.record(result.outcome.passed());
+                if config.verbose >= 1 || !result.outcome.passed() {
                     status.suspend(|| output::print_test_result(&result));
                 }
-                if !result.passed {
+                if !result.outcome.passed() {
                     // At -vv the streamer already showed this test's xtrace.
                     if config.verbose < 2 {
                         status.suspend(|| dump_xtrace_log(&result.name, &result.context));
@@ -504,7 +526,7 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
                     status.suspend(|| crate::diagnostics::print_failure_snippet(&result));
                 }
             }
-            if !result.passed && config.bail {
+            if !result.outcome.passed() && config.bail {
                 bail_flag = true;
             }
             results.push(result);
@@ -825,8 +847,13 @@ fn spawn_test(
 /// with the given status.
 fn build_result(mut pending: PendingTest, status: ExitStatus) -> TestResult {
     let duration = pending.start.elapsed();
-    let timed_out = pending.timed_out;
-    let passed = !timed_out && status.success();
+    let outcome = if pending.timed_out {
+        Outcome::Timeout
+    } else if status.success() {
+        Outcome::Pass
+    } else {
+        Outcome::Fail
+    };
 
     // Read stats before dropping cgroup (which removes the directory).
     #[cfg(feature = "cgroup")]
@@ -834,8 +861,7 @@ fn build_result(mut pending: PendingTest, status: ExitStatus) -> TestResult {
 
     TestResult {
         name: pending.name.clone(),
-        passed,
-        timed_out,
+        outcome,
         duration,
         context: pending.context.take().unwrap(),
         source_path: pending.source_path.clone(),
@@ -1285,6 +1311,21 @@ mod tests {
             .collect()
     }
 
+    /// A finished test named `name` whose context dir is `context`. Neither
+    /// the outcome nor the source path matters to the code that reads a
+    /// context back out, which is what this stands in for.
+    fn result_in(context: PathBuf, name: &str) -> TestResult {
+        TestResult {
+            name: name.to_string(),
+            outcome: Outcome::Fail,
+            duration: Duration::from_millis(1),
+            context,
+            source_path: PathBuf::from("t.sh"),
+            #[cfg(feature = "cgroup")]
+            resources: None,
+        }
+    }
+
     /// Run `test_name` from `script` without isolation or extra configuration.
     fn run_inline(script: &str, test_name: &str) -> TestResult {
         let tmp = TempDir::new().unwrap();
@@ -1356,7 +1397,7 @@ mod tests {
             &config,
         )
         .unwrap();
-        assert!(results[0].passed);
+        assert!(results[0].outcome.passed());
         // The display name is untouched; only the directory derived from it is.
         assert_eq!(results[0].name, display);
 
@@ -1402,20 +1443,25 @@ mod tests {
 
     #[test]
     fn execute_passing_test() {
-        assert!(run_inline("test_pass() {\n  true\n}\n", "test_pass").passed);
+        let r = run_inline("test_pass() {\n  true\n}\n", "test_pass");
+        assert_eq!(r.outcome, Outcome::Pass);
     }
 
     #[test]
     fn execute_failing_test() {
-        assert!(!run_inline("test_fail() {\n  false\n}\n", "test_fail").passed);
+        // A command that exits nonzero fails the test, and does so as a
+        // failure rather than as a timeout.
+        let r = run_inline("test_fail() {\n  false\n}\n", "test_fail");
+        assert_eq!(r.outcome, Outcome::Fail);
     }
 
     #[test]
     fn execute_test_with_helper() {
-        assert!(run_inline(
+        let r = run_inline(
             "get_value() {\n  echo 42\n}\ntest_helper() {\n  val=$(get_value)\n  test \"$val\" = \"42\"\n}\n",
             "test_helper",
-        ).passed);
+        );
+        assert_eq!(r.outcome, Outcome::Pass);
     }
 
     #[test]
@@ -1424,7 +1470,7 @@ mod tests {
             "test_cwd() {\n  test -z \"$(ls -A .)\"\n  echo data > f.txt\n}\n",
             "test_cwd",
         );
-        assert!(r.passed);
+        assert!(r.outcome.passed());
         assert!(cwd_dir(&r.context).join("f.txt").exists());
     }
 
@@ -1434,7 +1480,7 @@ mod tests {
             "test_bg() {\n  sleep 300 &\n  echo $! > pid\n}\n",
             "test_bg",
         );
-        assert!(r.passed);
+        assert!(r.outcome.passed());
         let pid: u32 = fs::read_to_string(cwd_dir(&r.context).join("pid"))
             .unwrap()
             .trim()
@@ -1530,7 +1576,7 @@ mod tests {
             &config,
             &no_overlay_env(tmp.path()),
         );
-        assert!(result.passed);
+        assert!(result.outcome.passed());
         // bin/true should exist in the context dir
         assert!(result.context.join("bin/true").exists());
     }
@@ -1556,7 +1602,7 @@ mod tests {
             &config,
             &no_overlay_env(tmp.path()),
         );
-        assert!(result.passed);
+        assert!(result.outcome.passed());
         // The tool is referenced in place, not copied into the context bin/.
         assert!(!result.context.join("bin/mytool").exists());
     }
@@ -1597,7 +1643,7 @@ mod tests {
         ) else {
             return; // overlays unavailable here
         };
-        assert!(result.passed);
+        assert!(result.outcome.passed());
         assert!(
             overlay::upper_dir(&result.context)
                 .join("attest_root_marker.txt")
@@ -1619,7 +1665,7 @@ mod tests {
         ) else {
             return; // overlays unavailable here
         };
-        assert!(result.passed);
+        assert!(result.outcome.passed());
         assert!(!Path::new("/tmp").join(marker).exists());
 
         let mut uppers = vec![overlay::upper_dir(&result.context).join("tmp")];
@@ -1719,16 +1765,7 @@ mod tests {
         fs::write(ctx.join("strace/ls.log"), "execve(\"/bin/ls\")\n").unwrap();
         fs::write(ctx.join("xtrace.log"), "+1: ls\n").unwrap();
 
-        let result = TestResult {
-            name: "test_traced".to_string(),
-            passed: true,
-            timed_out: false,
-            duration: Duration::from_millis(1),
-            context: ctx,
-            source_path: PathBuf::from("t.sh"),
-            #[cfg(feature = "cgroup")]
-            resources: None,
-        };
+        let result = result_in(ctx, "test_traced");
 
         let save = TempDir::new().unwrap();
         save_test_context(&result, save.path(), &[]);
@@ -1766,16 +1803,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), cwd_dir(&ctx)).unwrap();
         std::os::unix::fs::symlink(outside.path(), ctx.join("strace")).unwrap();
 
-        let result = TestResult {
-            name: "test_leak".to_string(),
-            passed: false,
-            timed_out: false,
-            duration: Duration::from_millis(1),
-            context: ctx,
-            source_path: PathBuf::from("t.sh"),
-            #[cfg(feature = "cgroup")]
-            resources: None,
-        };
+        let result = result_in(ctx, "test_leak");
 
         let save = TempDir::new().unwrap();
         save_test_context(&result, save.path(), &[]);
@@ -1809,16 +1837,7 @@ mod tests {
             assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0);
         }
 
-        let result = TestResult {
-            name: "test_wedge".to_string(),
-            passed: false,
-            timed_out: false,
-            duration: Duration::from_millis(1),
-            context: ctx,
-            source_path: PathBuf::from("t.sh"),
-            #[cfg(feature = "cgroup")]
-            resources: None,
-        };
+        let result = result_in(ctx, "test_wedge");
 
         // Every place a finished test's logs are read back, on a deadline: a
         // regression is a hang rather than a failed assertion, so the test has
@@ -1913,16 +1932,7 @@ mod tests {
         fs::create_dir_all(&sub_upper).unwrap();
         fs::write(sub_upper.join("scratch"), "submount artifact").unwrap();
 
-        let result = TestResult {
-            name: "test_evil".to_string(),
-            passed: true,
-            timed_out: false,
-            duration: Duration::from_millis(1),
-            context: ctx,
-            source_path: PathBuf::from("t.sh"),
-            #[cfg(feature = "cgroup")]
-            resources: None,
-        };
+        let result = result_in(ctx, "test_evil");
         let submounts = [overlay::Submount {
             source: PathBuf::from("/var/tmp"),
             is_dir: true,
@@ -1972,7 +1982,7 @@ mod tests {
 
         let results = run_all_tests(test_refs(&tf), &config).unwrap();
         assert_eq!(results.len(), 2);
-        assert!(results.iter().all(|r| r.passed));
+        assert!(results.iter().all(|r| r.outcome.passed()));
     }
 
     #[test]
@@ -1992,7 +2002,7 @@ mod tests {
         let results = run_all_tests(test_refs(&tf), &config).unwrap();
         // Only the failing test ran; bail stopped execution
         assert_eq!(results.len(), 1);
-        assert!(!results[0].passed);
+        assert!(!results[0].outcome.passed());
     }
 
     #[test]
@@ -2009,8 +2019,8 @@ mod tests {
 
         let results = run_all_tests(test_refs(&tf), &config).unwrap();
         assert_eq!(results.len(), 2);
-        assert!(results.iter().any(|r| r.passed));
-        assert!(results.iter().any(|r| !r.passed));
+        assert!(results.iter().any(|r| r.outcome.passed()));
+        assert!(results.iter().any(|r| !r.outcome.passed()));
     }
 
     #[test]
@@ -2025,8 +2035,7 @@ mod tests {
 
         let results = run_all_tests(test_refs(&tf), &config).unwrap();
         assert_eq!(results.len(), 1);
-        assert!(!results[0].passed);
-        assert!(results[0].timed_out);
+        assert_eq!(results[0].outcome, Outcome::Timeout);
     }
 
     /// Wait (up to `secs`) for `pid` to reach process state `want`.
@@ -2196,7 +2205,7 @@ mod tests {
         // line-preserving functions.sh, the xtrace PS4 must report `+7:`.
         let source = "helper() {\n  echo setup\n}\n\ntest_foo() {\n  echo a\n  false\n}\n";
         let r = run_inline(source, "test_foo");
-        assert!(!r.passed);
+        assert!(!r.outcome.passed());
 
         let xtrace = fs::read_to_string(r.context.join("xtrace.log")).unwrap();
         // Last non-subshell trace line is the failing command.

@@ -450,7 +450,7 @@ fn main() -> anyhow::Result<()> {
                 .collect();
 
             let results = runner::run_all_tests(test_refs, &config)?;
-            any_failed = results.iter().any(|r| !r.passed);
+            any_failed = results.iter().any(|r| !r.outcome.passed());
         }
     }
 

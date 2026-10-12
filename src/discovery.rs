@@ -107,21 +107,29 @@ fn shebang_interpreter(line: &str) -> Option<&str> {
     }
 }
 
-/// Returns the shell interpreter to use for a script file. Reads the shebang
-/// line and extracts the interpreter; falls back to "bash" if absent or unrecognized.
+/// The shell a shebang line asks for, or `None` when it names no shell we
+/// recognize (or is not a shebang at all).
+///
+/// The one place that answers both questions asked of a shebang — whether the
+/// file is a shell script and which shell it wants — so the two can never
+/// disagree about an interpreter.
+fn shebang_shell(line: &str) -> Option<&str> {
+    let interpreter = shebang_interpreter(line)?;
+    let basename = interpreter.rsplit('/').next().unwrap_or(interpreter);
+    matches!(basename, "sh" | "bash" | "zsh" | "dash" | "ash" | "ksh").then_some(interpreter)
+}
+
+/// The shell to run a script file under: the one its shebang names, falling
+/// back to `bash` when there is no shebang or it names something else.
 pub(crate) fn get_script_shell(path: &Path) -> String {
-    read_first_line(path)
-        .filter(|line| is_shell_interpreter(line))
-        .and_then(|line| shebang_interpreter(&line).map(str::to_string))
-        .unwrap_or_else(|| "bash".to_string())
+    let Some(line) = read_first_line(path) else {
+        return "bash".to_string();
+    };
+    shebang_shell(&line).unwrap_or("bash").to_string()
 }
 
 pub(crate) fn is_shell_interpreter(shebang: &str) -> bool {
-    let Some(interpreter) = shebang_interpreter(shebang) else {
-        return false;
-    };
-    let basename = interpreter.rsplit('/').next().unwrap_or(interpreter);
-    matches!(basename, "sh" | "bash" | "zsh" | "dash" | "ash" | "ksh")
+    shebang_shell(shebang).is_some()
 }
 
 #[cfg(test)]

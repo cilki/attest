@@ -49,17 +49,18 @@ impl TestCgroup {
         let count = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = base.join(format!("{safe_id}_{count}"));
 
-        if let Err(e) = std::fs::create_dir(&path) {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                let _ = std::fs::remove_dir(&path);
-                if let Err(e2) = std::fs::create_dir(&path) {
-                    trace!("failed to create test cgroup: {e2}");
-                    return None;
-                }
-            } else {
-                trace!("failed to create test cgroup: {e}");
-                return None;
+        // A directory left behind by a crashed earlier run is reclaimed: the
+        // counter only makes the name unique within this process.
+        let created = std::fs::create_dir(&path).or_else(|e| {
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(e);
             }
+            let _ = std::fs::remove_dir(&path);
+            std::fs::create_dir(&path)
+        });
+        if let Err(e) = created {
+            trace!("failed to create test cgroup: {e}");
+            return None;
         }
 
         Some(Self { path })

@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use indicatif::{ProgressBar, ProgressStyle};
-use serde_json::{Map, Value};
+use serde_json::Value;
 
-use crate::runner::TestResult;
+use crate::runner::{Outcome, TestResult};
 
 pub(crate) const GREEN: &str = "\x1b[32m";
 pub(crate) const RED: &str = "\x1b[31m";
@@ -513,7 +513,7 @@ fn resource_stats_json(stats: Option<&crate::cgroup::ResourceStats>) -> Value {
     ]
     .into_iter()
     .filter_map(|(key, value)| value.map(|v| (key.to_owned(), v.into())))
-    .collect::<Map<String, Value>>()
+    .collect::<serde_json::Map<String, Value>>()
     .into()
 }
 
@@ -529,12 +529,10 @@ impl serde::Serialize for TestResultJson<'_> {
         use serde::ser::SerializeMap;
 
         let result = self.0;
-        let status = if result.passed {
-            "pass"
-        } else if result.timed_out {
-            "timeout"
-        } else {
-            "fail"
+        let status = match result.outcome {
+            Outcome::Pass => "pass",
+            Outcome::Fail => "fail",
+            Outcome::Timeout => "timeout",
         };
         #[cfg(feature = "cgroup")]
         let resources = resource_stats_json(result.resources.as_ref());
@@ -573,12 +571,10 @@ pub fn print_test_result_json(result: &TestResult) {
 
 /// The one-line `PASS`/`FAIL`/`TIME` report for a finished test.
 fn result_line(result: &TestResult) -> String {
-    let (label, color) = if result.passed {
-        ("PASS", GREEN)
-    } else if result.timed_out {
-        ("TIME", RED)
-    } else {
-        ("FAIL", RED)
+    let (label, color) = match result.outcome {
+        Outcome::Pass => ("PASS", GREEN),
+        Outcome::Fail => ("FAIL", RED),
+        Outcome::Timeout => ("TIME", RED),
     };
     let duration = format_duration(result.duration);
     let name = escape_label(&result.name);
@@ -645,7 +641,7 @@ fn format_bytes(b: u64) -> String {
 }
 
 pub fn print_summary(results: &[TestResult], wall_duration: Duration) {
-    let passed = results.iter().filter(|r| r.passed).count();
+    let passed = results.iter().filter(|r| r.outcome.passed()).count();
     let failed = results.len() - passed;
 
     outln!();
@@ -713,8 +709,6 @@ pub fn print_test_list(tests: &[(&Path, &str)]) {
 /// `--json` reports names verbatim: nothing interprets them there, and
 /// `serde_json` escapes what its own grammar needs.
 pub(crate) fn escape_label(label: &str) -> std::borrow::Cow<'_, str> {
-    use std::fmt::Write as _;
-
     /// C0 controls, `DEL` and the C1 controls: everything a terminal acts on
     /// rather than shows. The C1 block matters because a terminal in UTF-8
     /// mode decodes those code points and obeys them — `U+009B` is `CSI`, so
@@ -724,12 +718,27 @@ pub(crate) fn escape_label(label: &str) -> std::borrow::Cow<'_, str> {
         matches!(c, '\0'..='\u{1f}' | '\u{7f}'..='\u{9f}')
     }
 
-    if !label.contains(is_control) {
-        return std::borrow::Cow::Borrowed(label);
+    escape_chars(label, is_control)
+}
+
+/// Spell every character `escape` picks out as `\xNN`, borrowing `s` unchanged
+/// when it holds none of them — which is the usual case, since the text this
+/// runs over is a name or a line of shell.
+///
+/// Who has to escape what differs, so the predicate is the caller's: a label
+/// attest prints itself has to defuse every control character
+/// ([`escape_label`]), while a source line reaches the terminal through
+/// `annotate_snippets`, which already substitutes the C0 controls and leaves
+/// only the C1 block to deal with (`diagnostics::escape_c1`).
+pub(crate) fn escape_chars(s: &str, escape: fn(char) -> bool) -> std::borrow::Cow<'_, str> {
+    use std::fmt::Write as _;
+
+    if !s.contains(escape) {
+        return std::borrow::Cow::Borrowed(s);
     }
-    let mut out = String::with_capacity(label.len());
-    for c in label.chars() {
-        if is_control(c) {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if escape(c) {
             let _ = write!(out, "\\x{:02x}", c as u32);
         } else {
             out.push(c);
@@ -775,8 +784,7 @@ mod tests {
     fn result_in(context: &Path, name: &str) -> TestResult {
         TestResult {
             name: name.to_string(),
-            passed: false,
-            timed_out: true,
+            outcome: Outcome::Timeout,
             duration: Duration::from_millis(1500),
             context: context.to_path_buf(),
             source_path: PathBuf::from("/repo/a b.test"),
@@ -797,7 +805,7 @@ mod tests {
             tmp.path(),
             "test_lie\x1b[1G\x1b[K\x1b[32mPASS\x1b[0m\x1b[2Ctest_lie",
         );
-        result.timed_out = false;
+        result.outcome = Outcome::Fail;
 
         assert_eq!(
             result_line(&result),
