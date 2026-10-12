@@ -437,10 +437,21 @@ struct RunEnv {
     submounts: Vec<overlay::Submount>,
 }
 
-/// One test to run: its unique display name, the shell function to invoke, all
-/// functions extracted from its file (the test plus any helpers), and the path
-/// of that file.
-pub type TestSpec<'a> = (&'a str, &'a str, &'a [FunctionDefinition], &'a Path);
+/// One test to run: the name it is reported under, the shell function to
+/// invoke, and the file both came from.
+///
+/// The file is borrowed whole rather than taken apart into "the functions" and
+/// "the path": those are two halves of the same parse, every test in a file
+/// shares them, and a run may hold several `TestSpec`s per file (one per
+/// `--repeat`).
+pub struct TestSpec<'a> {
+    /// Unique within the run: results, per-test context dirs and
+    /// `--save-context` dirs are all keyed by it.
+    pub display: String,
+    /// Name of the shell function to invoke, as written in the file.
+    pub name: &'a str,
+    pub file: &'a crate::parser::TestFile,
+}
 
 pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec<TestResult>> {
     // First thing in the run: the block has to be in place before any thread
@@ -510,17 +521,9 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
     }
 
     let mut context_names = std::collections::HashSet::new();
-    let mut spawn = |(display_name, fn_name, all_functions, source_path): TestSpec| {
-        let dir = context_dir_name(display_name, &mut context_names);
-        spawn_test(
-            display_name,
-            fn_name,
-            all_functions,
-            source_path,
-            contexts_dir.join(dir),
-            config,
-            &env,
-        )
+    let mut spawn = |spec: TestSpec| {
+        let dir = context_dir_name(&spec.display, &mut context_names);
+        spawn_test(&spec, contexts_dir.join(dir), config, &env)
     };
 
     // Seed the initial batch up to max_parallel.
@@ -795,14 +798,12 @@ fn build_functions_source(functions: &[FunctionDefinition], source: Option<&str>
 /// the caller must reap (or simply drop to kill+clean up). `context` must be
 /// unique per test (the caller derives it from the unique display name).
 fn spawn_test(
-    display_name: &str,
-    fn_name: &str,
-    all_functions: &[FunctionDefinition],
-    source_path: &Path,
+    spec: &TestSpec,
     context: PathBuf,
     config: &RunConfig,
     env: &RunEnv,
 ) -> Result<PendingTest> {
+    let display_name = &spec.display;
     std::fs::create_dir_all(&context)?;
 
     // Fresh, empty working directory for the test. It lives in the context dir
@@ -825,8 +826,8 @@ fn spawn_test(
     let script_path = context.join("functions.sh");
     // Read the original source so functions can be emitted verbatim at their
     // original line numbers (see build_functions_source).
-    let source = std::fs::read_to_string(source_path).ok();
-    let script = build_functions_source(all_functions, source.as_deref());
+    let source = std::fs::read_to_string(&spec.file.path).ok();
+    let script = build_functions_source(&spec.file.functions, source.as_deref());
     std::fs::write(&script_path, &script)?;
 
     if !config.override_cmds.is_empty() {
@@ -852,9 +853,11 @@ fn spawn_test(
         create_strace_wrappers(&context, &config.strace)?;
     }
 
-    let source_path_owned = source_path
+    let source_path_owned = spec
+        .file
+        .path
         .canonicalize()
-        .unwrap_or_else(|_| source_path.to_path_buf());
+        .unwrap_or_else(|_| spec.file.path.clone());
     let shell = if let Some(s) = config.shebang.as_deref() {
         resolve_shell(s)
     } else {
@@ -869,7 +872,7 @@ fn spawn_test(
     };
 
     let runner_content = build_runner_script(
-        fn_name,
+        spec.name,
         &script_path,
         &context,
         &config.bin_dirs,
@@ -941,7 +944,7 @@ fn spawn_test(
         child,
         reaped: false,
         timed_out: false,
-        name: display_name.to_string(),
+        name: display_name.clone(),
         start,
         context: Some(context),
         source_path: source_path_owned,
@@ -1378,6 +1381,15 @@ mod tests {
         }
     }
 
+    /// One test of `tf`, reported under `display`.
+    fn spec<'a>(tf: &'a crate::parser::TestFile, name: &'a str, display: &str) -> TestSpec<'a> {
+        TestSpec {
+            display: display.to_string(),
+            name,
+            file: tf,
+        }
+    }
+
     /// Spawn `test_name` out of `script` (written under `srcdir`) and block
     /// until it finishes.
     fn run_script(
@@ -1389,33 +1401,14 @@ mod tests {
     ) -> TestResult {
         let tf = parse_script(srcdir, script);
         let ctx = TempDir::new().unwrap().keep();
-        let mut pending = spawn_test(
-            test_name,
-            test_name,
-            &tf.functions,
-            &tf.path,
-            ctx,
-            config,
-            env,
-        )
-        .unwrap();
+        let mut pending = spawn_test(&spec(&tf, test_name, test_name), ctx, config, env).unwrap();
         let status = reap_blocking(&mut pending);
         build_result(pending, status)
     }
 
     /// `run_all_tests` input running every test in `tf` under its own name.
     fn test_refs(tf: &crate::parser::TestFile) -> Vec<TestSpec<'_>> {
-        tf.tests
-            .iter()
-            .map(|name| {
-                (
-                    name.as_str(),
-                    name.as_str(),
-                    tf.functions.as_slice(),
-                    tf.path.as_path(),
-                )
-            })
-            .collect()
+        tf.tests.iter().map(|name| spec(tf, name, name)).collect()
     }
 
     /// A finished test named `name` whose context dir is `context`. Neither
@@ -1499,11 +1492,7 @@ mod tests {
             ..RunConfig::default()
         };
 
-        let results = run_all_tests(
-            vec![(display, "test_escape", tf.functions.as_slice(), &tf.path)],
-            &config,
-        )
-        .unwrap();
+        let results = run_all_tests(vec![spec(&tf, "test_escape", display)], &config).unwrap();
         assert!(results[0].outcome.passed());
         // The display name is untouched; only the directory derived from it is.
         assert_eq!(results[0].name, display);
@@ -1697,10 +1686,7 @@ mod tests {
         let ctx = TempDir::new().unwrap().keep();
         let config = RunConfig::default();
         let mut pending = spawn_test(
-            "test_bg",
-            "test_bg",
-            &tf.functions,
-            &tf.path,
+            &spec(&tf, "test_bg", "test_bg"),
             ctx,
             &config,
             &no_overlay_env(tmp.path()),

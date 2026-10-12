@@ -186,32 +186,34 @@ fn display_base(
     }
 }
 
-/// Split a positional argument into a file path and an optional test filter.
+/// Split a `<file>/<name>` argument on its last `/`, but only where the left
+/// half is an existing file — otherwise the whole argument is a path.
 ///
-/// If the argument contains a `/` where the left side is an existing file,
-/// it is treated as `file/filter`. Otherwise the whole string is a path.
+/// The single home of that rule: a positional target, and the completion of
+/// one, have to split identically or a completed selector names something
+/// other than the test it was completed from.
+fn split_file_and_name(arg: &str) -> Option<(&str, &str)> {
+    let (file, name) = arg.rsplit_once('/')?;
+    Path::new(file).is_file().then_some((file, name))
+}
+
+/// Split a positional argument into a file path and an optional test filter.
 fn split_path_arg(arg: &str) -> (PathBuf, Option<String>) {
-    // Try splitting from the right on `/` — the left side must be an existing file
-    if let Some(slash) = arg.rfind('/') {
-        let file_part = &arg[..slash];
-        let name_part = &arg[slash + 1..];
-        let path = Path::new(file_part);
-        if path.is_file() {
-            let filter = if name_part.is_empty() {
-                None
-            } else {
-                // The `./` of a `./a/x.test/test_foo` target is noise in the
-                // selector and, as a prefix, tells `TestPattern::parse` that
-                // the whole argument is a path — which would swallow the name
-                // half we just established is one. The file half matches as a
-                // suffix, so dropping it changes nothing else.
-                let file_part = file_part.strip_prefix("./").unwrap_or(file_part);
-                Some(format!("{file_part}/{name_part}"))
-            };
-            return (path.to_path_buf(), filter);
-        }
-    }
-    (PathBuf::from(arg), None)
+    let Some((file, name)) = split_file_and_name(arg) else {
+        return (PathBuf::from(arg), None);
+    };
+    // A trailing `/` names the file and nothing within it, so there is no
+    // filter to derive — the file half alone is already the whole selection.
+    let filter = (!name.is_empty()).then(|| {
+        // The `./` of a `./a/x.test/test_foo` target is noise in the selector
+        // and, as a prefix, tells `TestPattern::parse` that the whole argument
+        // is a path — which would swallow the name half we just established is
+        // one. The file half matches as a suffix, so dropping it changes
+        // nothing else.
+        let file = file.strip_prefix("./").unwrap_or(file);
+        format!("{file}/{name}")
+    });
+    (PathBuf::from(file), filter)
 }
 
 /// Parse every discovered file, returning the files that parsed. Each
@@ -250,26 +252,73 @@ fn parse_discovered(
     Ok(parsed)
 }
 
+/// What a positional target plus an optional `--filter` select.
+///
+/// `list` and a run have to answer that identically: a listed selector is
+/// documented to be re-runnable as a target, which only holds while both go
+/// through the same split, the same discovery, the same tolerance for an
+/// unparseable file and the same pattern match.
+struct Selection {
+    /// The path half of the target, kept for the "nothing found" message.
+    path: PathBuf,
+    /// `--filter`, or the name half the target carried.
+    filter: Option<String>,
+    /// The files that parsed, in discovery order. Each file is parsed exactly
+    /// once and kept alive here, so every test can borrow its path and
+    /// extracted functions rather than cloning the whole AST per test (and
+    /// again per `--repeat`).
+    files: Vec<parser::TestFile>,
+}
+
+impl Selection {
+    /// Resolve `target` and `filter`: split the target, discover and parse what
+    /// its path half names, and take the name half as the filter unless
+    /// `--filter` gave one explicitly.
+    fn resolve(target: &str, filter: Option<String>) -> anyhow::Result<Self> {
+        let (path, inline_filter) = split_path_arg(target);
+        let files = parse_discovered(discovery::discover_test_files(&path)?, path.is_file())?;
+        Ok(Self {
+            path,
+            filter: filter.or(inline_filter),
+            files,
+        })
+    }
+
+    /// The selected tests as `(function name, the file defining it)`, in
+    /// discovery order.
+    fn tests(&self) -> Vec<(&str, &parser::TestFile)> {
+        let pattern = self.filter.as_deref().map(parser::TestPattern::parse);
+        self.files
+            .iter()
+            .flat_map(|file| file.tests.iter().map(move |name| (name.as_str(), file)))
+            .filter(|&(name, file)| pattern.as_ref().is_none_or(|p| p.matches(&file.path, name)))
+            .collect()
+    }
+
+    /// Why nothing was selected: a filter that matched nothing is a different
+    /// mistake from a target that holds no tests at all.
+    fn nothing_selected(&self) -> anyhow::Error {
+        match &self.filter {
+            Some(f) => anyhow::anyhow!("no tests match filter '{f}'"),
+            None => anyhow::anyhow!("no test functions found in {}", self.path.display()),
+        }
+    }
+}
+
 fn complete_tests(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
     let current = current.to_string_lossy();
     let mut candidates = Vec::new();
 
-    // If input contains `/` and left side is a file, complete test names within it
-    if let Some(slash) = current.rfind('/') {
-        let file_part = &current[..slash];
-        let name_prefix = &current[slash + 1..];
-        let path = Path::new(file_part);
-
-        if path.is_file() {
-            if let Ok(test_file) = parser::parse_test_file(path) {
-                for name in &test_file.tests {
-                    if name.starts_with(name_prefix) {
-                        candidates.push(CompletionCandidate::new(format!("{file_part}/{name}")));
-                    }
+    // The left half already names a file, so the rest is a test name in it.
+    if let Some((file, name_prefix)) = split_file_and_name(&current) {
+        if let Ok(test_file) = parser::parse_test_file(Path::new(file)) {
+            for name in &test_file.tests {
+                if name.starts_with(name_prefix) {
+                    candidates.push(CompletionCandidate::new(format!("{file}/{name}")));
                 }
             }
-            return candidates;
         }
+        return candidates;
     }
 
     // No file/test split — complete with discovered files and all file/test patterns
@@ -329,22 +378,12 @@ fn main() -> anyhow::Result<()> {
             output::write_out(include_str!("../SKILL.md").as_bytes());
         }
         Some(Commands::List { path, filter }) => {
-            let (path, inline_filter) = split_path_arg(&path);
-            let filter = filter.or(inline_filter);
-            let pattern = filter.as_deref().map(parser::TestPattern::parse);
-            let files = discovery::discover_test_files(&path)?;
-            let parsed = parse_discovered(files, path.is_file())?;
-            let mut tests: Vec<(&Path, &str)> = Vec::new();
-            for test_file in &parsed {
-                for name in &test_file.tests {
-                    if let Some(ref p) = pattern
-                        && !p.matches(&test_file.path, name)
-                    {
-                        continue;
-                    }
-                    tests.push((&test_file.path, name));
-                }
-            }
+            let selection = Selection::resolve(&path, filter)?;
+            let tests: Vec<(&Path, &str)> = selection
+                .tests()
+                .into_iter()
+                .map(|(name, file)| (file.path.as_path(), name))
+                .collect();
             output::print_test_list(&tests);
         }
         None => {
@@ -353,53 +392,36 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             });
 
-            let (path, inline_filter) = split_path_arg(&path_arg);
-            let filter = cli.filter.or(inline_filter);
-            let pattern = filter.as_deref().map(parser::TestPattern::parse);
-            let files = discovery::discover_test_files(&path)?;
-
-            // Parse each file exactly once and keep the owning `TestFile`s
-            // alive, so every test can borrow its file's name, path and
-            // extracted functions rather than cloning the whole AST per test
-            // (and again per repeat).
-            let parsed = parse_discovered(files, path.is_file())?;
-
-            // Collect matching tests, tallying how often each name occurs so
-            // duplicates across files can be given distinct display names. Each
-            // selection borrows the file it came from.
-            let mut selected: Vec<(&str, &parser::TestFile)> = Vec::new();
-            let mut name_counts: std::collections::HashMap<&str, usize> = Default::default();
-            for test_file in &parsed {
-                for name in &test_file.tests {
-                    if let Some(ref p) = pattern
-                        && !p.matches(&test_file.path, name)
-                    {
-                        continue;
-                    }
-                    *name_counts.entry(name).or_default() += 1;
-                    selected.push((name, test_file));
-                }
-            }
+            let selection = Selection::resolve(&path_arg, cli.filter)?;
+            let selected = selection.tests();
             if selected.is_empty() {
-                match &filter {
-                    Some(f) => anyhow::bail!("no tests match filter '{f}'"),
-                    None => anyhow::bail!("no test functions found in {}", path.display()),
-                }
+                return Err(selection.nothing_selected());
+            }
+
+            // How often each name occurs, so duplicates across files can be
+            // given distinct display names.
+            let mut name_counts: std::collections::HashMap<&str, usize> = Default::default();
+            for &(name, _) in &selected {
+                *name_counts.entry(name).or_default() += 1;
             }
 
             // Display names key result output, per-test context dirs, and
             // --save-context dirs, so they must be unique per test.
             let mut taken = std::collections::HashSet::new();
-            let mut all_tests: Vec<(String, &str, &parser::TestFile)> = Vec::new();
-            for (name, test_file) in selected {
-                let base = display_base(name, &test_file.path, name_counts[name] > 1, &mut taken);
+            let mut all_tests: Vec<runner::TestSpec> = Vec::new();
+            for (name, file) in selected {
+                let base = display_base(name, &file.path, name_counts[name] > 1, &mut taken);
                 for i in 1..=cli.repeat {
                     let display = if cli.repeat > 1 {
                         format!("{base}#{i}")
                     } else {
                         base.clone()
                     };
-                    all_tests.push((display, name, test_file));
+                    all_tests.push(runner::TestSpec {
+                        display,
+                        name,
+                        file,
+                    });
                 }
             }
 
@@ -443,19 +465,7 @@ fn main() -> anyhow::Result<()> {
                 no_cgroups: cli.no_cgroups,
             };
 
-            let test_refs: Vec<runner::TestSpec> = all_tests
-                .iter()
-                .map(|(display, fn_name, test_file)| {
-                    (
-                        display.as_str(),
-                        *fn_name,
-                        test_file.functions.as_slice(),
-                        test_file.path.as_path(),
-                    )
-                })
-                .collect();
-
-            let results = runner::run_all_tests(test_refs, &config)?;
+            let results = runner::run_all_tests(all_tests, &config)?;
             any_failed = results.iter().any(|r| !r.outcome.passed());
         }
     }
