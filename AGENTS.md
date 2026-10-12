@@ -41,7 +41,14 @@
   available, runs in its own
   session (so timeouts and ^C kill the whole process tree via its process group
   and, when cgroups are active, `cgroup.kill`). Parallel by default via
-  `fork(2)` with configurable parallelism (`--parallel`). Supports `--timeout`,
+  `fork(2)` with configurable parallelism (`--parallel`). The poll loop that
+  reaps the children and spawns their replacements waits on `SIGCHLD`
+  (`ChildWaiter`, blocking it for the length of the run) with the 50ms poll
+  interval only as a timeout, so a finished test is noticed and replaced at
+  once instead of on the next tick — that interval used to be a floor under
+  every test's duration. The mask is emptied again in the child's `pre_exec`,
+  since a shell that inherited a blocked `SIGCHLD` would not see its own
+  background jobs finish. Supports `--timeout`,
   `--bail`, `--override`, `--bin-dir`, and `--strace`. With `--save-context`,
   copies each test's filesystem delta plus logs to the output dir. Display
   names (and thus context dirs) are unique per test: a test name defined in

@@ -22,6 +22,96 @@ extern "C" fn mark_interrupted(_: libc::c_int) {
     INTERRUPTED.store(true, Ordering::Relaxed);
 }
 
+/// How long the poll loop waits before going round again when nothing else
+/// wakes it. It is the cadence of the work that is driven by the clock rather
+/// than by a test finishing: `--timeout` expiry, `--fuzz` ticks, the live
+/// xtrace tail and the status line.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Blocks `SIGCHLD` for the length of a run so the poll loop can *wait* for a
+/// test to finish instead of sleeping [`POLL_INTERVAL`] and asking afterwards.
+///
+/// Sleeping made that interval a floor under every test: one that finished in a
+/// millisecond was still only noticed — and its successor only spawned — on the
+/// next tick, so a suite of fast tests cost 50ms per test per worker on top of
+/// what the tests themselves took. With the signal blocked, an exiting child
+/// leaves a `SIGCHLD` pending and [`ChildWaiter::wait`] returns as soon as it
+/// does; the timeout stays so the clock-driven work above keeps its cadence.
+///
+/// Blocking is per-thread and inherited by threads started afterwards, so this
+/// has to be armed before the run starts anything else — the status bar's
+/// steady-tick thread being the one in play here. A thread that does not block
+/// `SIGCHLD` can take the delivery instead, and the default disposition
+/// discards it; that only costs the early wakeup, since the wait still ends on
+/// its timeout, but it would cost it for the whole run.
+struct ChildWaiter {
+    /// The signal set waited on: `SIGCHLD` alone.
+    set: libc::sigset_t,
+    /// The mask to put back when the run is over.
+    previous: libc::sigset_t,
+    /// Whether `SIGCHLD` really is blocked. If it is not, waiting for it would
+    /// race with its delivery, so [`Self::wait`] just sleeps the interval out —
+    /// exactly what the loop did before.
+    armed: bool,
+}
+
+impl ChildWaiter {
+    fn new() -> Self {
+        // Zeroed rather than `MaybeUninit`: an all-zero `sigset_t` is the empty
+        // set, so the value is valid even if `sigemptyset` were to fail.
+        let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let mut previous: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let armed = unsafe {
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGCHLD);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut previous) == 0
+        };
+        if !armed {
+            debug!("could not block SIGCHLD; the poll loop will wait on its timer alone");
+        }
+        Self {
+            set,
+            previous,
+            armed,
+        }
+    }
+
+    /// Wait until a test child exits or `timeout` elapses, whichever happens
+    /// first.
+    fn wait(&self, timeout: Duration) {
+        if !self.armed {
+            std::thread::sleep(timeout);
+            return;
+        }
+        let ts = libc::timespec {
+            tv_sec: timeout.as_secs() as libc::time_t,
+            tv_nsec: timeout.subsec_nanos() as libc::c_long,
+        };
+        if unsafe { libc::sigtimedwait(&self.set, std::ptr::null_mut(), &ts) } >= 0 {
+            return; // a child exited
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            // Nothing finished within the interval — the ordinary case while
+            // tests are running — or a handled signal (^C) cut the wait short.
+            // Either way the loop goes round and looks for itself.
+            Some(libc::EAGAIN) | Some(libc::EINTR) => {}
+            // `sigtimedwait` is not doing what we take it for. Sleep the
+            // interval out rather than spinning the poll loop at full speed.
+            _ => std::thread::sleep(timeout),
+        }
+    }
+}
+
+impl Drop for ChildWaiter {
+    fn drop(&mut self) {
+        if self.armed {
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut())
+            };
+        }
+    }
+}
+
 /// The test whose xtrace.log is currently being tailed to stderr.
 struct Tailed {
     /// Name of the test holding the xtrace output lock.
@@ -353,6 +443,11 @@ struct RunEnv {
 pub type TestSpec<'a> = (&'a str, &'a str, &'a [FunctionDefinition], &'a Path);
 
 pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec<TestResult>> {
+    // First thing in the run: the block has to be in place before any thread
+    // that could take a `SIGCHLD` delivery instead of leaving it pending — the
+    // status bar's ticker, below, is one (see `ChildWaiter`).
+    let waiter = ChildWaiter::new();
+
     let mut results = Vec::new();
     let total = tests.len();
     let mut status = output::StatusDisplay::new(total, config.json);
@@ -565,7 +660,7 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
             .collect();
         status.update(&running, results.len());
 
-        std::thread::sleep(Duration::from_millis(50));
+        waiter.wait(POLL_INTERVAL);
     }
 
     status.finish();
@@ -788,9 +883,21 @@ fn spawn_test(
 
     // Detach into a fresh session/process group so timeouts and cleanup can
     // kill the whole test tree with one kill(-pgid).
+    //
+    // The signal mask is emptied in the same hook: the run blocks SIGCHLD in
+    // the parent (see `ChildWaiter`) and a mask survives both fork and exec, so
+    // a test's shell would otherwise start with SIGCHLD blocked — and a shell
+    // that cannot take SIGCHLD does not notice its own background jobs
+    // finishing, which is `wait` in a test hanging. `std` happens to reset the
+    // mask before exec as well, but that is not something it promises, and the
+    // promise is one tests depend on. Nothing here allocates, as the hook
+    // requires.
     unsafe {
         cmd.pre_exec(|| {
             libc::setsid();
+            let mut empty: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut empty);
+            libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
             Ok(())
         });
     }
@@ -1423,6 +1530,70 @@ mod tests {
             .collect();
         assert_eq!(saved.len(), 1, "unexpected save dir contents: {saved:?}");
         assert!(saved[0].join("stdout.log").exists());
+    }
+
+    /// Is SIGCHLD blocked for the calling thread? Read by passing a null set to
+    /// `pthread_sigmask`, which then only reports the current mask.
+    fn sigchld_blocked() -> bool {
+        let mut current: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let ret = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut current) };
+        assert_eq!(ret, 0, "could not read the signal mask");
+        let member = unsafe { libc::sigismember(&current, libc::SIGCHLD) };
+        member == 1
+    }
+
+    #[test]
+    fn child_waiter_blocks_sigchld_only_for_the_length_of_a_run() {
+        let before = sigchld_blocked();
+        {
+            let waiter = ChildWaiter::new();
+            assert!(waiter.armed, "SIGCHLD could not be blocked");
+            assert!(sigchld_blocked(), "SIGCHLD was not blocked for the run");
+        }
+        assert_eq!(
+            sigchld_blocked(),
+            before,
+            "the run's signal mask outlived it"
+        );
+    }
+
+    /// The wait has to end the moment a test exits rather than when its timer
+    /// next comes round: that interval used to be a floor under every test (see
+    /// [`ChildWaiter`]). `raise` leaves the signal pending on this thread, which
+    /// is what an exiting child leaves pending on the run's.
+    #[test]
+    fn child_waiter_returns_at_once_for_a_child_that_has_already_signalled() {
+        let waiter = ChildWaiter::new();
+        assert!(waiter.armed, "SIGCHLD could not be blocked");
+        unsafe { libc::raise(libc::SIGCHLD) };
+        let start = Instant::now();
+        waiter.wait(Duration::from_secs(30));
+        let waited = start.elapsed();
+        assert!(
+            waited < Duration::from_secs(5),
+            "waited {waited:?} for a child that had already signalled"
+        );
+    }
+
+    /// Whatever the parent does to its own mask, a test gets a clean one: masks
+    /// survive fork and exec, and a shell that cannot take SIGCHLD does not see
+    /// its own background jobs finish.
+    #[test]
+    fn a_test_does_not_inherit_the_runs_blocked_sigchld() {
+        let _waiter = ChildWaiter::new();
+        assert!(sigchld_blocked(), "SIGCHLD was not blocked for the run");
+        let result = run_inline(
+            r#"test_mask() {
+  blocked=
+  while read -r key value rest; do
+    if [ "$key" = SigBlk: ]; then blocked=$value; fi
+  done < /proc/self/status
+  [ "$blocked" = 0000000000000000 ]
+}
+"#,
+            "test_mask",
+        );
+        assert!(result.passed, "the test ran with a signal blocked");
     }
 
     #[test]
