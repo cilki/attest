@@ -601,6 +601,13 @@ working directory under `cwd/` (so a scratch file written to `$PWD` shows up at
 out by absolute path (a write to `/tmp/x` shows up at
 `results/<test>/tmp/x`).
 
+Saved files keep their permissions, minus the set-user-ID, set-group-ID and
+sticky bits: those files are whatever the test chose to write, and the copy is
+owned by whoever ran attest (root, when it runs under `sudo` so that overlays
+can be mounted), so a test that left a `chmod u+s` binary behind must not get
+one carried out of its sandbox for anyone with access to the saved context to
+run.
+
 To see the syscalls a command makes, trace it with `--strace` and save the
 context — the log lands at `results/<test>/strace/<cmd>.log`:
 

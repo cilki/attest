@@ -678,6 +678,37 @@ pub fn create_dir_nofollow(base: &Path, rel: &Path) -> std::io::Result<PathBuf> 
     Ok(path)
 }
 
+/// Copy the regular file `from` to `to` with the set-user-ID, set-group-ID and
+/// sticky bits cleared.
+///
+/// `std::fs::copy` reproduces the source's permission bits whole, and every
+/// source this module copies is a file a *test* created. A test that does
+/// `cp /bin/sh x; chmod u+s x` inside its ephemeral root would otherwise have
+/// that file land in the `--save-context` directory still set-user-ID, owned
+/// by whoever ran attest — root, when attest runs under `sudo` so that
+/// overlays can be mounted at all. Anyone able to execute the saved context
+/// would then have that user's privileges: the sandbox escaped by way of the
+/// artifact copied out of it. Nothing about reading a delta back needs those
+/// bits, so they do not survive the copy.
+///
+/// The mode is set on the descriptor before any content is written, so the
+/// destination is never both executable and set-user-ID even momentarily, and
+/// it is set explicitly rather than left to `O_CREAT` so that a file left
+/// set-user-ID at that name by an earlier run is corrected rather than reused.
+fn copy_file_without_setid(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // `from` is a regular file as of the `lstat` the directory walk did; open
+    // it the way every other read of a test's own files goes, so a symlink or
+    // FIFO swapped in since then is refused instead of followed.
+    let mut src = open_nofollow(from)?;
+    let mode = src.metadata()?.permissions().mode() & 0o777;
+    let mut out = std::fs::File::create(to)?;
+    out.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    std::io::copy(&mut src, &mut out)?;
+    Ok(())
+}
+
 /// Recursively copy `src` into `dst`, creating `dst` if needed. Regular files,
 /// directories, and symlinks are reproduced; other special files (e.g. overlay
 /// whiteout device nodes for deletions) are skipped.
@@ -688,6 +719,9 @@ pub fn create_dir_nofollow(base: &Path, rel: &Path) -> std::io::Result<PathBuf> 
 /// should be is an error rather than something to follow: every directory
 /// attest copies out of a context is one a test could have replaced with a
 /// link to an arbitrary host tree.
+///
+/// File permissions come out stripped of the set-user-ID, set-group-ID and
+/// sticky bits (see [`copy_file_without_setid`]).
 pub fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     if !is_real_dir(src) {
         return Err(std::io::Error::new(
@@ -710,7 +744,7 @@ pub fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
             std::os::unix::fs::symlink(target, &to)?;
         } else if file_type.is_file() {
             unlink_if_symlink(&to)?;
-            std::fs::copy(&from, &to)?;
+            copy_file_without_setid(&from, &to)?;
         }
     }
     Ok(())
@@ -1167,5 +1201,49 @@ mod tests {
             std::fs::read_link(&link).unwrap(),
             PathBuf::from("sub/f.txt")
         );
+    }
+
+    #[test]
+    fn copy_dir_strips_setid_bits_but_keeps_the_rest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let src = tempfile::TempDir::new().unwrap();
+        let dst = tempfile::TempDir::new().unwrap();
+
+        // What a test gets to put in its own delta: `cp /bin/sh x; chmod u+s x`
+        // inside the ephemeral root. Copied out verbatim it would be a
+        // set-user-ID binary in the user's tree, owned by whoever ran attest.
+        std::fs::write(src.path().join("suid"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            src.path().join("suid"),
+            std::fs::Permissions::from_mode(0o6755),
+        )
+        .unwrap();
+        std::fs::create_dir(src.path().join("sub")).unwrap();
+        std::fs::write(src.path().join("sub/plain"), "data").unwrap();
+        std::fs::set_permissions(
+            src.path().join("sub/plain"),
+            std::fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+
+        // A name already left set-user-ID by an earlier run of the same save
+        // dir has to be corrected, not reused.
+        let stale = dst.path().join("suid");
+        std::fs::write(&stale, "old").unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o4755)).unwrap();
+
+        copy_dir_recursive(src.path(), dst.path()).unwrap();
+
+        let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode(&stale),
+            0o755,
+            "the set-user-ID and set-group-ID bits must not survive the copy"
+        );
+        assert_eq!(std::fs::read_to_string(&stale).unwrap(), "#!/bin/sh\n");
+        // Everything else about the mode is left alone: a delta is read back to
+        // debug a failure, and which files were executable is part of that.
+        assert_eq!(mode(&dst.path().join("sub/plain")), 0o640);
     }
 }

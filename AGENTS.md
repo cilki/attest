@@ -89,6 +89,15 @@
   until a writer appears and `std` retries it across `EINTR`, so a test that
   replaced one of its logs with one used to wedge the run in `open(2)` past
   even `^C`.
+  `copy_dir_recursive` reproduces a file's permissions but never its
+  set-user-ID/set-group-ID/sticky bits (`copy_file_without_setid`, which is why
+  it is not `fs::copy`): a delta is whatever the test wrote, the copy is owned
+  by whoever ran attest — root under `sudo`, which is how overlays usually get
+  mounted — and `--save-context` puts it in a directory of the user's choosing,
+  so a `chmod u+s` inside the sandbox must not come out of it as a setuid
+  binary anyone with access to the saved context can run. The mode is set on
+  the descriptor before any content is written, and set explicitly rather than
+  left to `O_CREAT`, so a name an earlier run left setuid is corrected.
 - `src/diagnostics.rs` - On failure, parses `xtrace.log` to find the last
   executed command (skipping `++` subshell traces, so a failure inside
   `$(...)` is attributed to the statement around it), maps it back to the
