@@ -113,6 +113,7 @@ dependencies = [
  "clap_complete",
  "indicatif",
  "libc",
+ "serde",
  "serde_json",
  "similar",
  "tempfile",

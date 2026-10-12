@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,6 +50,24 @@ fn write_stream(closed: &AtomicBool, stream: &mut impl Write, buf: &[u8]) {
 
 pub fn write_out(buf: &[u8]) {
     write_stream(&BROKEN_PIPE, &mut std::io::stdout().lock(), buf);
+}
+
+/// Stdout as a [`Write`], so something that writes incrementally (the
+/// `--json` serializer) can go straight out instead of being assembled in
+/// memory first. Every write goes through [`write_out`], so a vanished reader
+/// still latches [`BROKEN_PIPE`] rather than failing the write.
+struct StdoutSink;
+
+impl Write for StdoutSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        write_out(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        // `write_out` flushes what it writes.
+        Ok(())
+    }
 }
 
 pub fn write_err(buf: &[u8]) {
@@ -360,23 +379,110 @@ impl StatusDisplay {
     }
 }
 
-/// Read one of a test's logs out of its context dir. Lossy so a log containing
-/// invalid UTF-8 (e.g. binary output) is still reported rather than silently
-/// becoming empty, and never through a symlink the test left at that name (see
-/// [`crate::overlay::open_nofollow`]) — a JSON consumer would otherwise be fed
-/// the contents of an arbitrary host file as the test's output.
-fn read_log(path: PathBuf) -> String {
-    let bytes = crate::overlay::read_nofollow(&path).unwrap_or_default();
-    String::from_utf8_lossy(&bytes).into_owned()
+/// One of a test's logs as a JSON string, read out of its context dir while it
+/// is being written out rather than beforehand.
+///
+/// `serde_json`'s `collect_str` escapes and emits a string a fragment at a
+/// time, so a log reaches the output stream a [`LOG_CHUNK`] at a time and never
+/// has to fit in memory — the same reason [`stream_log`] replays one in chunks.
+/// Holding it whole is how one test that fails after printing a few hundred
+/// megabytes used to get `attest` OOM-killed under `--json`, losing the results
+/// of every *other* test in the run with it.
+///
+/// Opened with [`crate::overlay::open_nofollow`]: a test's context dir is live,
+/// so it can put a symlink where its log was and a plain open would hand a JSON
+/// consumer the contents of an arbitrary host file as the test's output. A log
+/// that cannot be opened reports as the empty string.
+struct LogField(PathBuf);
+
+impl serde::Serialize for LogField {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&LogText(&self.0))
+    }
+}
+
+/// The text of a log, written out a chunk at a time. Lossy so a log holding
+/// invalid UTF-8 (a test printing binary) is still reported rather than
+/// silently becoming empty.
+struct LogText<'a>(&'a Path);
+
+impl std::fmt::Display for LogText<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Ok(mut log) = crate::overlay::open_nofollow(self.0) else {
+            return Ok(());
+        };
+        // Room for one read plus the up-to-three bytes of a character the
+        // previous read stopped in the middle of.
+        let mut buf = vec![0u8; LOG_CHUNK + 3];
+        let mut held = 0usize;
+        loop {
+            let n = match log.read(&mut buf[held..held + LOG_CHUNK]) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            held = write_lossy(f, &mut buf, held + n)?;
+        }
+        // Nothing follows the bytes still held back, so they were truncated by
+        // the end of the log rather than by a chunk boundary after all.
+        if held > 0 {
+            f.write_str("\u{fffd}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Write `buf[..len]` as text, standing in `U+FFFD` for each invalid sequence
+/// the way [`String::from_utf8_lossy`] does.
+///
+/// Returns how many trailing bytes were *not* written because they may be the
+/// start of a character the next chunk completes, having moved them to the
+/// front of `buf`. Decoding them on their own would spell each one `U+FFFD` and
+/// lose the character: the chunk boundary falls wherever the log's length puts
+/// it, which is not a place the test has to avoid.
+fn write_lossy(
+    f: &mut std::fmt::Formatter<'_>,
+    buf: &mut [u8],
+    len: usize,
+) -> Result<usize, std::fmt::Error> {
+    let mut start = 0;
+    while start < len {
+        let e = match std::str::from_utf8(&buf[start..len]) {
+            Ok(text) => {
+                f.write_str(text)?;
+                start = len;
+                break;
+            }
+            Err(e) => e,
+        };
+        let good = e.valid_up_to();
+        if good > 0 {
+            // Valid by construction: `valid_up_to` is where it stops being so.
+            f.write_str(std::str::from_utf8(&buf[start..start + good]).unwrap_or_default())?;
+            start += good;
+        }
+        match e.error_len() {
+            // Invalid however the log continues, so it is reported now.
+            Some(bad) => {
+                f.write_str("\u{fffd}")?;
+                start += bad;
+            }
+            // Cut short by the end of the chunk: hold it for the next one.
+            None => break,
+        }
+    }
+    buf.copy_within(start..len, 0);
+    Ok(len - start)
 }
 
 /// A test's `--strace` logs as `{"<cmd>": "<log>"}`, read from the
 /// `strace/<cmd>.log` files the runner wrote into its context dir. Empty
 /// without `--strace` (or when nothing was traced).
-fn strace_logs(context: &Path) -> Map<String, Value> {
+fn strace_logs(context: &Path) -> BTreeMap<String, LogField> {
     let dir = context.join("strace");
     if !crate::overlay::is_real_dir(&dir) {
-        return Map::new();
+        return BTreeMap::new();
     }
     std::fs::read_dir(dir)
         .into_iter()
@@ -385,7 +491,7 @@ fn strace_logs(context: &Path) -> Map<String, Value> {
         .map(|entry| {
             let file = entry.file_name().to_string_lossy().into_owned();
             let cmd = file.strip_suffix(".log").unwrap_or(&file).to_owned();
-            (cmd, read_log(entry.path()).into())
+            (cmd, LogField(entry.path()))
         })
         .collect()
 }
@@ -412,33 +518,57 @@ fn resource_stats_json(stats: Option<&crate::cgroup::ResourceStats>) -> Value {
 }
 
 /// One finished test as the JSON object `--json` reports it by.
-fn test_result_json(result: &TestResult) -> Value {
-    let status = if result.passed {
-        "pass"
-    } else if result.timed_out {
-        "timeout"
-    } else {
-        "fail"
-    };
-    #[cfg(feature = "cgroup")]
-    let resources = resource_stats_json(result.resources.as_ref());
-    #[cfg(not(feature = "cgroup"))]
-    let resources = Value::Null;
+///
+/// Serialized straight to the output stream rather than built up as a
+/// [`Value`]: three of its fields are whole logs, and a log is as big as the
+/// test that wrote it chose to make it (see [`LogField`]).
+struct TestResultJson<'a>(&'a TestResult);
 
-    serde_json::json!({
-        "name": result.name,
-        "file": result.source_path.display().to_string(),
-        "status": status,
-        "duration_ms": result.duration.as_millis() as u64,
-        "stdout": read_log(result.context.join("stdout.log")),
-        "xtrace": read_log(result.context.join("xtrace.log")),
-        "strace": strace_logs(&result.context),
-        "resources": resources,
-    })
+impl serde::Serialize for TestResultJson<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+
+        let result = self.0;
+        let status = if result.passed {
+            "pass"
+        } else if result.timed_out {
+            "timeout"
+        } else {
+            "fail"
+        };
+        #[cfg(feature = "cgroup")]
+        let resources = resource_stats_json(result.resources.as_ref());
+        #[cfg(not(feature = "cgroup"))]
+        let resources = Value::Null;
+
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("name", &result.name)?;
+        map.serialize_entry("file", &result.source_path.display().to_string())?;
+        map.serialize_entry("status", status)?;
+        map.serialize_entry("duration_ms", &(result.duration.as_millis() as u64))?;
+        map.serialize_entry("stdout", &LogField(result.context.join("stdout.log")))?;
+        map.serialize_entry("xtrace", &LogField(result.context.join("xtrace.log")))?;
+        map.serialize_entry("strace", &strace_logs(&result.context))?;
+        map.serialize_entry("resources", &resources)?;
+        map.end()
+    }
+}
+
+/// Write the one JSONL line for `result` to `out`.
+fn write_test_result_json(result: &TestResult, out: &mut impl Write) -> std::io::Result<()> {
+    let mut serializer = serde_json::Serializer::new(&mut *out);
+    serde::Serialize::serialize(&TestResultJson(result), &mut serializer)
+        .map_err(std::io::Error::other)?;
+    out.write_all(b"\n")
 }
 
 pub fn print_test_result_json(result: &TestResult) {
-    outln!("{}", test_result_json(result));
+    // Buffered: `serde_json` emits a string in fragments split at every byte it
+    // has to escape, and an xtrace log has a `\n` on most of its lines, so
+    // unbuffered this would be two writes (and two flushes) per line of log.
+    let mut out = std::io::BufWriter::with_capacity(LOG_CHUNK, StdoutSink);
+    let _ = write_test_result_json(result, &mut out);
+    let _ = out.flush();
 }
 
 /// The one-line `PASS`/`FAIL`/`TIME` report for a finished test.
@@ -622,6 +752,25 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The JSONL line `--json` prints for `result`.
+    fn json_line(result: &TestResult) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        write_test_result_json(result, &mut out).expect("serializing a result");
+        out
+    }
+
+    /// The same line, parsed back. Going through the real writer rather than a
+    /// `Value` is the point: the logs are streamed into it as it is written,
+    /// so nothing else exercises the chunking.
+    fn test_result_json(result: &TestResult) -> Value {
+        let line = json_line(result);
+        assert!(
+            line.ends_with(b"\n"),
+            "a JSONL line has to end in a newline"
+        );
+        serde_json::from_slice(&line).expect("emitted a parseable line")
+    }
+
     /// A finished test whose logs live in `context`.
     fn result_in(context: &Path, name: &str) -> TestResult {
         TestResult {
@@ -718,8 +867,7 @@ mod tests {
         .unwrap();
 
         let result = result_in(tmp.path(), "test_\"odd\"\n\tname");
-        let line = test_result_json(&result).to_string();
-        let parsed: Value = serde_json::from_str(&line).expect("emitted a parseable line");
+        let parsed = test_result_json(&result);
 
         assert_eq!(parsed["name"], json!("test_\"odd\"\n\tname"));
         assert_eq!(parsed["file"], json!("/repo/a b.test"));
@@ -747,6 +895,77 @@ mod tests {
         assert_eq!(parsed["stdout"], json!(""));
         assert_eq!(parsed["xtrace"], json!(""));
         assert_eq!(parsed["strace"], json!({}));
+    }
+
+    #[test]
+    fn a_json_log_too_big_for_one_chunk_is_reported_whole() {
+        // Logs go into the line a bounded chunk at a time (a test can leave one
+        // bigger than memory), so the chunking must be invisible in the result:
+        // every character, once, in order. The payload carries the bytes
+        // `serde_json` escapes, so fragments are split inside chunks too.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log: String = (0..LOG_CHUNK * 2 + 7)
+            .map(|i| match i % 5 {
+                0 => '\n',
+                1 => '"',
+                2 => '\\',
+                3 => '\u{7}',
+                _ => 'x',
+            })
+            .collect();
+        std::fs::write(tmp.path().join("stdout.log"), &log).unwrap();
+
+        let parsed = test_result_json(&result_in(tmp.path(), "test_big"));
+        assert_eq!(parsed["stdout"], json!(log));
+    }
+
+    #[test]
+    fn a_character_straddling_a_json_chunk_survives_it() {
+        // The read boundary falls wherever the log's length puts it, which is
+        // not somewhere the test has to avoid. Decoding each chunk on its own
+        // turns both halves of a character sitting across one into U+FFFD, so
+        // a log with a single emoji in the wrong place came out corrupt.
+        let tmp = tempfile::TempDir::new().unwrap();
+        for lead in 1..=3 {
+            // Place the character so that `lead` of its bytes land in the first
+            // chunk and the rest in the second.
+            let mut log = "x".repeat(LOG_CHUNK - lead);
+            log.push('\u{1f600}'); // four bytes
+            log.push_str("tail\n");
+            std::fs::write(tmp.path().join("xtrace.log"), &log).unwrap();
+
+            let parsed = test_result_json(&result_in(tmp.path(), "test_split"));
+            assert_eq!(parsed["xtrace"], json!(log), "split after {lead} byte(s)");
+        }
+    }
+
+    #[test]
+    fn a_json_log_cut_off_mid_character_ends_in_one_replacement() {
+        // A log is whatever the test wrote, and a test killed by `--timeout`
+        // mid-`printf` leaves a truncated character at the end of it. That one
+        // is never completed, so it reports as a single U+FFFD — the same as
+        // reading the log whole and converting it lossily.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("stdout.log"), b"ok\xf0\x9f\x98").unwrap();
+
+        let parsed = test_result_json(&result_in(tmp.path(), "test_cut"));
+        assert_eq!(parsed["stdout"], json!("ok\u{fffd}"));
+    }
+
+    #[test]
+    fn a_symlinked_json_log_reports_as_empty() {
+        // A test's context dir is live, so it can delete `stdout.log` and leave
+        // a link to a host file at the name. Streaming the log must not resolve
+        // that any more than reading it whole did: a JSON consumer would be fed
+        // the file's contents as the test's own output.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        let secret = elsewhere.path().join("secret");
+        std::fs::write(&secret, "SECRET").unwrap();
+        std::os::unix::fs::symlink(&secret, tmp.path().join("stdout.log")).unwrap();
+
+        let parsed = test_result_json(&result_in(tmp.path(), "test_link"));
+        assert_eq!(parsed["stdout"], json!(""));
     }
 
     #[cfg(feature = "cgroup")]

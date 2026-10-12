@@ -642,16 +642,6 @@ pub fn open_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
-/// Read all of `path` without traversing a symlink at its last component (see
-/// [`open_nofollow`]).
-pub fn read_nofollow(path: &Path) -> std::io::Result<Vec<u8>> {
-    use std::io::Read;
-
-    let mut buf = Vec::new();
-    open_nofollow(path)?.read_to_end(&mut buf)?;
-    Ok(buf)
-}
-
 /// Is `path` a directory in its own right, rather than a symlink to one?
 ///
 /// `Path::is_dir` and `read_dir` both resolve symlinks, so they answer for
@@ -1084,6 +1074,16 @@ mod tests {
                 "{rel} should be rejected"
             );
         }
+    }
+
+    /// Read all of `path` through [`open_nofollow`], the way every caller that
+    /// reads back one of a test's logs does.
+    fn read_nofollow(path: &Path) -> std::io::Result<Vec<u8>> {
+        use std::io::Read;
+
+        let mut buf = Vec::new();
+        open_nofollow(path)?.read_to_end(&mut buf)?;
+        Ok(buf)
     }
 
     #[test]

@@ -126,7 +126,17 @@
   byte after it arrives (the next chunk, or the next tail of a `-vv` stream)
   rather than sanitizing half a control, and the dimming the replay is wrapped
   in is only emitted if there is anything to put in it. `--json`/`--save-context`
-  are unaffected and still carry the bytes verbatim.
+  do no escaping and still carry the bytes verbatim, but they are bounded the
+  same way: `--save-context` copies a log with `io::copy`, and `--json`
+  serializes each result straight to stdout (`write_test_result_json`, a
+  `serde::Serialize` impl over a `BufWriter<StdoutSink>`) instead of building a
+  `serde_json::Value` first. The `stdout`/`xtrace`/`strace` fields are
+  `LogField`s, which `collect_str` a chunk at a time out of `open_nofollow`, so
+  no log is ever held whole — building the `Value` meant holding the log, the
+  escaped JSON copy of it and the serialized line all at once, which is the same
+  OOM one noisy test used to cause on the terminal path. Lossy decoding happens
+  per chunk, so a character straddling a read boundary is held back rather than
+  being decoded as two `U+FFFD`s (`write_lossy`).
 
 ## Key dependencies
 
