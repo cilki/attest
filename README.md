@@ -405,6 +405,40 @@ The directories are part of the selector because the file half is only a
 suffix: two files named `x.test` in different directories would otherwise list
 identically, and either line would select both of their tests.
 
+### The name in a result line
+
+The name a result line carries is a _display name_, which `attest` keeps unique
+across the run so that two results can always be told apart and no two tests
+share a context directory. Usually that is just the test function's own name,
+but not always:
+
+- A name defined in more than one of the selected files is qualified with that
+  file's base name — `a.test:testShared` rather than `testShared`.
+- `--repeat N` appends `#1` … `#N`, one per run of the test. A run without
+  `--repeat` (or with `--repeat 1`) adds nothing.
+
+Both can apply at once, so `attest . --repeat 2` over a tree with `testShared`
+in two files reports four lines: `a.test:testShared#1`, `a.test:testShared#2`,
+`b.test:testShared#1` and `b.test:testShared#2`.
+
+A display name is for reading, not for selecting. `--filter` and the positional
+target match the *function* name, so pasting one of those qualified names back
+in doesn't work — `--filter 'a.test:testShared'` fails with `no tests match
+filter`. Narrow by file instead, which is what `attest list` prints anyway:
+
+```sh
+❯ attest . --filter 'a.test/testShared'
+```
+
+That filter also shows why the qualification is only ever a reporting detail:
+it describes what the run selected, not what the tree holds. With one
+`testShared` left in the run there is nothing to tell it apart from, so the
+result line says plain `testShared` again.
+
+`--json` reports the display name in `name` and the file the test came from in
+`file`, so a consumer never has to take the qualification apart to find out
+which file a result belongs to.
+
 ### Shell completion
 
 `attest` completes targets for you: the script files it would discover, and the
@@ -646,6 +680,12 @@ working directory under `cwd/` (so a scratch file written to `$PWD` shows up at
 `results/<test>/cwd/x`), and every file it created or modified elsewhere, laid
 out by absolute path (a write to `/tmp/x` shows up at
 `results/<test>/tmp/x`).
+
+`<test>` is the [display name](#the-name-in-a-result-line) from the report, so
+`--repeat 3` gives you `results/testHello#1/` … `results/testHello#3/` and a
+name defined in two files lands under `results/a.test:testHello/`. Only path
+separators are substituted, keeping the name one directory: a function named
+`test_a/b` is saved at `results/test_a_b/`.
 
 Saved files keep their permissions, minus the set-user-ID, set-group-ID and
 sticky bits: those files are whatever the test chose to write, and the copy is

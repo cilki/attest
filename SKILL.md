@@ -181,6 +181,9 @@ testHello() {
 - Use tabs for indentation
 - Group related tests in the same `.test` file
 - Name files after the command or feature under test (e.g., `md5sum.test`)
+- Keep test function names unique across the whole suite: a name defined in two
+  files is reported as `a.test:testName`, not `testName`, and that qualified
+  form is not something `--filter` accepts
 - Keep tests focused: one logical check per test function when practical
 - Use comments to explain non-obvious assertions, not obvious ones
 - Comments on test functions themselves should be "documentation style" with

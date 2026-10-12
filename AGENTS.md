@@ -58,7 +58,10 @@
   `--bail`, `--override`, `--bin-dir`, and `--strace`. With `--save-context`,
   copies each test's filesystem delta plus logs to the output dir. Display
   names (and thus context dirs) are unique per test: a test name defined in
-  more than one file is qualified as `file.test:test_name`.
+  more than one file is qualified as `file.test:test_name`, and `--repeat`
+  appends `#<n>`. Both are report labels, not selectors — `TestPattern` matches
+  the function name — so the README documents them next to the filter grammar
+  they cannot be used with; keep the two in step.
   Every context lives under the run's one temp dir, which
   `private_temp_dir` creates mode `0700`: a context holds the test's working
   directory, every file it wrote in its ephemeral root, and an `xtrace.log`
