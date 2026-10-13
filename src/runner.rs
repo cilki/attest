@@ -478,7 +478,7 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
         None
     };
 
-    let tmp = tempfile::TempDir::new()?;
+    let tmp = private_temp_dir()?;
 
     // Tests run in their own sessions (setsid in spawn_test), so the terminal
     // no longer delivers ^C to them; catch it here and tear the run down.
@@ -673,6 +673,34 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
     }
 
     Ok(results)
+}
+
+/// Create the temporary directory that holds every test context of one run,
+/// readable and writable by its owner alone.
+///
+/// A context dir is the whole record of what a test did: `stdout.log` and
+/// `xtrace.log`, the test's working directory, the generated `functions.sh`,
+/// any `--override` binaries, and the overlay upper layers — which is every
+/// file the test wrote anywhere in its ephemeral root. The runner enables
+/// `set -x`, so `xtrace.log` holds each command with its arguments already
+/// expanded: a test that passes a token, a password or a key to anything has
+/// it written out verbatim.
+///
+/// None of that may be left for the rest of the machine to read. `tempfile`
+/// makes temporary *files* private but creates temporary *directories* with
+/// the plain umask (its own documentation calls them "world-readable by
+/// default"), and the default parent is the shared `/tmp` — so by default
+/// every local user could read all of the above, including when attest runs
+/// under `sudo` (which is how privileged overlay isolation is usually
+/// obtained). The per-test dirs underneath need no mode of their own: a
+/// private parent cannot be traversed, so nothing inside it can be reached.
+///
+/// This narrows the mode, and can only ever narrow it: `mkdir(2)` still
+/// applies the umask, so a stricter umask stays in force.
+fn private_temp_dir() -> std::io::Result<tempfile::TempDir> {
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
 }
 
 /// Derive the name of a test's context directory from its display name,
@@ -1390,6 +1418,30 @@ mod tests {
         }
     }
 
+    /// A finished test together with the temp dir its context lives in.
+    ///
+    /// `build_result` moves the context path out of the `PendingTest`, so from
+    /// then on nothing removes that directory any more — in a real run the
+    /// run's own temp dir is what finally takes it away. A unit test has no
+    /// run, so it has to hold the guard for as long as it inspects the result:
+    /// without one, every `cargo test` leaves one context per test behind in
+    /// `/tmp` for good, each holding that test's script, logs, working
+    /// directory and overlay delta.
+    ///
+    /// Derefs to the result, so a caller reads `.outcome`/`.context` as before.
+    struct Finished {
+        result: TestResult,
+        _context: TempDir,
+    }
+
+    impl std::ops::Deref for Finished {
+        type Target = TestResult;
+
+        fn deref(&self) -> &TestResult {
+            &self.result
+        }
+    }
+
     /// Spawn `test_name` out of `script` (written under `srcdir`) and block
     /// until it finishes.
     fn run_script(
@@ -1398,12 +1450,21 @@ mod tests {
         test_name: &str,
         config: &RunConfig,
         env: &RunEnv,
-    ) -> TestResult {
+    ) -> Finished {
         let tf = parse_script(srcdir, script);
-        let ctx = TempDir::new().unwrap().keep();
-        let mut pending = spawn_test(&spec(&tf, test_name, test_name), ctx, config, env).unwrap();
+        let ctx = private_temp_dir().unwrap();
+        let mut pending = spawn_test(
+            &spec(&tf, test_name, test_name),
+            ctx.path().to_path_buf(),
+            config,
+            env,
+        )
+        .unwrap();
         let status = reap_blocking(&mut pending);
-        build_result(pending, status)
+        Finished {
+            result: build_result(pending, status),
+            _context: ctx,
+        }
     }
 
     /// `run_all_tests` input running every test in `tf` under its own name.
@@ -1427,7 +1488,7 @@ mod tests {
     }
 
     /// Run `test_name` from `script` without isolation or extra configuration.
-    fn run_inline(script: &str, test_name: &str) -> TestResult {
+    fn run_inline(script: &str, test_name: &str) -> Finished {
         let tmp = TempDir::new().unwrap();
         run_script(
             tmp.path(),
@@ -1436,6 +1497,24 @@ mod tests {
             &RunConfig::default(),
             &no_overlay_env(tmp.path()),
         )
+    }
+
+    /// The run's temp dir carries every test's logs, working directory and
+    /// filesystem delta, and `xtrace.log` carries each command with its
+    /// arguments expanded — tokens and keys included. Its default parent is
+    /// the shared `/tmp`, so nobody but its owner may be able to look inside.
+    #[test]
+    fn the_runs_temp_dir_is_private_to_its_owner() {
+        let tmp = private_temp_dir().unwrap();
+        let mode = fs::metadata(tmp.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "the run's temp dir is reachable by other users (mode {mode:04o})"
+        );
+        // Owner access is what the run itself needs, so narrowing must not
+        // have taken that away either.
+        assert_eq!(mode & 0o700, 0o700, "mode {mode:04o}");
     }
 
     #[test]
@@ -1683,11 +1762,11 @@ mod tests {
             tmp.path(),
             "test_bg() {\n  sleep 300 &\n  echo $! > pid\n}\n",
         );
-        let ctx = TempDir::new().unwrap().keep();
+        let ctx = private_temp_dir().unwrap();
         let config = RunConfig::default();
         let mut pending = spawn_test(
             &spec(&tf, "test_bg", "test_bg"),
-            ctx,
+            ctx.path().to_path_buf(),
             &config,
             &no_overlay_env(tmp.path()),
         )
@@ -1780,7 +1859,7 @@ mod tests {
     }
 
     /// Run one test function with full isolation; skip (None) when unsupported.
-    fn run_isolated(script: &str, test_name: &str) -> Option<TestResult> {
+    fn run_isolated(script: &str, test_name: &str) -> Option<Finished> {
         let tmp = TempDir::new().unwrap();
         let srcdir = TempDir::new().unwrap();
         let env = overlay_env(tmp.path(), srcdir.path())?;

@@ -338,7 +338,12 @@ otherwise erase its own verdict and write a nicer one. `--json` is unaffected:
 nothing interprets a name there, so it comes back byte for byte.
 
 Every test runs in a temporary _context directory_ that collects logs and
-temporary files created by the test.
+temporary files created by the test. All of a run's context directories live
+under one temporary directory that only the user running attest can open: a
+context holds the test's working directory, the files it wrote anywhere in its
+ephemeral root, and an `xtrace.log` of every command it ran with its arguments
+already expanded — so a token or a key a test handled is in there verbatim, and
+the default place for all of it is the shared `/tmp`.
 
 ### Selecting tests
 

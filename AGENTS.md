@@ -59,6 +59,16 @@
   copies each test's filesystem delta plus logs to the output dir. Display
   names (and thus context dirs) are unique per test: a test name defined in
   more than one file is qualified as `file.test:test_name`.
+  Every context lives under the run's one temp dir, which
+  `private_temp_dir` creates mode `0700`: a context holds the test's working
+  directory, every file it wrote in its ephemeral root, and an `xtrace.log`
+  of each command with its arguments already expanded, so whatever secret a
+  test handled is in there verbatim — and `tempfile` gives a temporary
+  *directory* the plain umask (`0755` in practice) under the shared `/tmp`,
+  unlike a temporary file. The per-test dirs underneath keep the umask: a
+  private parent cannot be traversed, so nothing inside it is reachable
+  either way. `--save-context` is deliberately left alone — that is a path
+  the user named, and a copy they asked for.
 - `src/overlay.rs` - Per-test whole-root overlayfs isolation. Each test pivots
   into a private copy-on-write view of `/`: writes land in per-test upper
   layers and are discarded on exit. The project mount (the one holding the
