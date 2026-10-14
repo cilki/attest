@@ -25,7 +25,14 @@
   functions, not just `.test` files.
 - `src/parser.rs` - Parses shell scripts with `brush_parser::Parser`, walks the
   AST to extract all `FunctionDefinition` nodes. Test functions start with
-  `test`. Also holds `TestPattern`, the `[<file>/]<name>` selector behind
+  `test`. A `TestFile` keeps the names of its tests and the script the runner
+  sources (`build_functions_source`), not the nodes: the script is the same
+  text for every test in the file, and rendering it walks each function's AST
+  for its source span — which cost more than reading and writing the file it
+  is built from, and a file holding 25 tests paid it 25 times over, once more
+  for every `--repeat`. Rendering at parse time also means the script and the
+  spans it is cut with come from one read of the file, so the two cannot
+  disagree. Also holds `TestPattern`, the `[<file>/]<name>` selector behind
   `--filter` and the positional target: the file half is a `Path::ends_with`
   suffix (whole components, no wildcards), the name half a `*` glob that
   degrades to a prefix match when it contains no `*`, and either half may be
