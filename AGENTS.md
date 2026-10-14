@@ -121,6 +121,13 @@
   between its trace line and the end of the file, so the trace cannot be found
   by reading a tail — but the output it has to be found behind is as big as the
   test made it, and need not contain a newline at all.
+  The source file behind a snippet is read, and parsed for the function bounds
+  that clamp the rendered window, once per file per run (`SourceCache`, owned
+  by the run loop): the text and the bounds depend only on the file, while a
+  failing suite reports one failure per *test*, so a file with n failing tests
+  in it used to cost n reads and n shell parses on the parent's critical path.
+  One read also keeps a snippet self-consistent — the annotated line and the
+  bounds come from the same text rather than from two reads a test apart.
   The source lines the snippet renders go through `escape_c1` first:
   `annotate_snippets` substitutes the C0 controls in the source it is given
   but prints `U+0080`–`U+009F` through, and those are controls a UTF-8

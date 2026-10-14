@@ -477,6 +477,9 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
     } else {
         None
     };
+    // Shared by every failure report in the run: a file is read and parsed the
+    // first time one of its tests fails, not once per failing test.
+    let mut sources = crate::diagnostics::SourceCache::default();
 
     let tmp = private_temp_dir()?;
 
@@ -621,7 +624,9 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
                     if config.verbose < 2 {
                         status.suspend(|| dump_xtrace_log(&result.name, &result.context));
                     }
-                    status.suspend(|| crate::diagnostics::print_failure_snippet(&result));
+                    status.suspend(|| {
+                        crate::diagnostics::print_failure_snippet(&result, &mut sources)
+                    });
                 }
             }
             if !result.outcome.passed() && config.bail {
@@ -2086,7 +2091,10 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             dump_xtrace_log(&result.name, result.context.as_path());
-            crate::diagnostics::print_failure_snippet(&result);
+            crate::diagnostics::print_failure_snippet(
+                &result,
+                &mut crate::diagnostics::SourceCache::default(),
+            );
             output::print_test_result_json(&result);
             save_test_context(&result, &save_dir, &[]);
             let _ = tx.send(());
