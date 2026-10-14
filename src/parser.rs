@@ -70,6 +70,39 @@ impl TestPattern {
     }
 }
 
+/// The file half of a selector: the path a test was discovered at, with a
+/// leading `./` dropped.
+///
+/// The path, not just the base name. Two things need it that way: the file half
+/// of a selector is matched as a path *suffix*, so a bare `x.test/test_foo`
+/// names every `x.test` in the tree while `a/x.test/test_foo` names exactly
+/// one; and a positional target has to have a real path on its left
+/// (`split_path_arg` only splits where the left side is an existing file), so
+/// only a selector carrying the directories it was found under can be pasted
+/// back as `attest <selector>` from the directory it was printed in.
+///
+/// Dropping the `./` is not cosmetic. Behind one, [`TestPattern::parse`] takes
+/// the *whole* argument as a path, so `./a/x.test/test_foo` as a `--filter`
+/// asks for a file named `a/x.test/test_foo` and matches nothing. A walk
+/// rooted at `.` yields `./a/x.test`, so the marker is exactly what discovery
+/// hands over.
+pub(crate) fn selector_path(file: &Path) -> String {
+    let path = file.to_string_lossy();
+    path.strip_prefix("./").unwrap_or(&path).to_string()
+}
+
+/// Format a `(file, test name)` pair as the `<file>/<name>` selector that
+/// `--filter` and the positional target accept.
+///
+/// The one spelling of the join, as `split_file_and_name` is the one spelling
+/// of the split: `list` prints these, completion offers them, and
+/// [`TestPattern::parse`] reads them back, so the three have to agree about
+/// what a selector looks like — including the `./` rule above, which an
+/// open-coded `format!("{file}/{name}")` quietly got wrong.
+pub(crate) fn selector(file: &Path, name: &str) -> String {
+    format!("{}/{name}", selector_path(file))
+}
+
 /// Match `text` against `pattern`.  `*` matches any sequence of characters.
 /// A pattern with no `*` is treated as a prefix (implicit trailing `*`).
 fn wildcard_match(pattern: &str, text: &str) -> bool {

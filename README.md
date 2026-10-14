@@ -426,6 +426,12 @@ With that in place, `attest examples/md5<TAB>` completes the file name and
 `attest examples/md5sum.test/<TAB>` offers `testHelp`, `testVersion` and
 `testHello`. `--filter` completes the same way.
 
+What comes back is always the selector form above — the same string `attest
+list` prints — so a completion can be accepted as a target or as a `--filter`
+interchangeably. A `./` you typed is dropped on the way, because behind one a
+`--filter` is all file path (see [Selecting tests](#selecting-tests)) and
+`./examples/md5sum.test/testHello` would then name a file rather than a test.
+
 ### Other options
 
 - `--timeout SECS` — kill a test after this much wall-clock time and report it
