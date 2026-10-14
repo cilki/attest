@@ -305,44 +305,52 @@ impl Selection {
     }
 }
 
+/// Complete a positional target or a `--filter` value: the discovered script
+/// files, plus the `<file>/<test>` selectors in them, that extend what has been
+/// typed so far.
+///
+/// One path for both shapes of argument. All that the file/test split decides
+/// is *where to look*: once the left half names an existing file, only that
+/// file can complete the argument, and otherwise every file the walk turns up
+/// can. From there both cases are the same prefix match against
+/// [`parser::selector`], which is also what `list` prints and what
+/// [`parser::TestPattern::parse`] reads back — so a completed selector names
+/// the test it was completed from by construction rather than by two
+/// open-coded `format!`s happening to agree.
+///
+/// They did not agree: a `./`-prefixed argument was completed by pasting the
+/// name onto the path as typed, and behind a `./` a `--filter` is *all* path,
+/// so accepting `./a/x.test/test_foo` asked for a file of that name and
+/// selected nothing. The same `./` kept the file-name half from matching
+/// anything at all, since the selectors it was compared against never carry
+/// the marker.
 fn complete_tests(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
     let current = current.to_string_lossy();
+    // What has been typed is compared against selectors, so it goes through
+    // the same `./` rule they do rather than a second spelling of it.
+    let typed = parser::selector_path(Path::new(&*current));
+
+    let files = match split_file_and_name(&current) {
+        Some((file, _)) => vec![PathBuf::from(file)],
+        None => discovery::discover_test_files(Path::new(".")).unwrap_or_default(),
+    };
+
     let mut candidates = Vec::new();
-
-    // The left half already names a file, so the rest is a test name in it.
-    if let Some((file, name_prefix)) = split_file_and_name(&current) {
-        if let Ok(test_file) = parser::parse_test_file(Path::new(file)) {
-            for name in &test_file.tests {
-                if name.starts_with(name_prefix) {
-                    candidates.push(CompletionCandidate::new(format!("{file}/{name}")));
-                }
-            }
+    for file in &files {
+        let path = parser::selector_path(file);
+        if path.starts_with(&typed) {
+            candidates.push(CompletionCandidate::new(&path));
         }
-        return candidates;
-    }
-
-    // No file/test split — complete with discovered files and all file/test patterns
-    let cwd = Path::new(".");
-    if let Ok(files) = discovery::discover_test_files(cwd) {
-        for file in &files {
-            let rel = file.strip_prefix(cwd).unwrap_or(file).display().to_string();
-            let rel = rel.strip_prefix("./").unwrap_or(&rel).to_string();
-
-            if rel.starts_with(&*current) {
-                candidates.push(CompletionCandidate::new(&rel));
-            }
-
-            if let Ok(test_file) = parser::parse_test_file(file) {
-                for name in &test_file.tests {
-                    let full = format!("{rel}/{name}");
-                    if full.starts_with(&*current) {
-                        candidates.push(CompletionCandidate::new(full));
-                    }
-                }
+        let Ok(test_file) = parser::parse_test_file(file) else {
+            continue;
+        };
+        for name in &test_file.tests {
+            let selector = parser::selector(file, name);
+            if selector.starts_with(&typed) {
+                candidates.push(CompletionCandidate::new(selector));
             }
         }
     }
-
     candidates
 }
 
@@ -555,6 +563,70 @@ mod tests {
         let pattern = parser::TestPattern::parse(&filter.unwrap());
         assert!(pattern.matches(Path::new("./examples/md5sum.test"), "testHello"));
         assert!(!pattern.matches(Path::new("./examples/md5sum.test"), "testHelp"));
+    }
+
+    /// The selectors `complete_tests` offers in `<file>/<test>` form.
+    fn completions(typed: &str) -> Vec<String> {
+        complete_tests(std::ffi::OsStr::new(typed))
+            .iter()
+            .map(|c| c.get_value().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// A completed selector has to select the test it was completed from —
+    /// under `--filter` as well as as a positional target.
+    ///
+    /// Behind a `./` a filter is *all* path (see `parser::TestPattern::parse`),
+    /// so a completion that pasted the name onto the path as typed handed back
+    /// `./examples/md5sum.test/testHello`: a file of that name, matching
+    /// nothing. The selector form carries no `./`, so neither may a completion
+    /// of it.
+    #[test]
+    fn a_completion_behind_a_dot_slash_still_names_its_test() {
+        // Completion of the `<file>/<name>` shape is decided by the
+        // filesystem, so this needs a file that really is one relative to the
+        // working directory — which cargo sets to the package root.
+        assert!(
+            Path::new("examples/md5sum.test").is_file(),
+            "expected to run from the package root"
+        );
+
+        let candidates = completions("./examples/md5sum.test/testHel");
+        assert_eq!(
+            candidates,
+            [
+                "examples/md5sum.test/testHelp",
+                "examples/md5sum.test/testHello"
+            ]
+        );
+        for candidate in &candidates {
+            let pattern = parser::TestPattern::parse(candidate);
+            let name = candidate.rsplit_once('/').unwrap().1;
+            assert!(
+                pattern.matches(Path::new("./examples/md5sum.test"), name),
+                "the completion `{candidate}` selects no test"
+            );
+        }
+
+        // The `./`-free spelling of the same prefix completes identically: the
+        // marker only ever said "this is a path", and the split already
+        // established that it is not all of one.
+        assert_eq!(completions("examples/md5sum.test/testHel"), candidates);
+    }
+
+    /// Only the file named by the left half is consulted once there is one, so
+    /// a selector cannot be completed out of some other file's tests (and the
+    /// cwd is not walked to find out).
+    #[test]
+    fn a_completion_comes_only_from_the_file_its_prefix_names() {
+        let candidates = completions("examples/md5sum.test/");
+        assert!(!candidates.is_empty());
+        assert!(
+            candidates
+                .iter()
+                .all(|c| c.starts_with("examples/md5sum.test/")),
+            "{candidates:?}"
+        );
     }
 
     #[test]

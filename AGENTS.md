@@ -15,7 +15,11 @@
   abort the run. Shell completion is dynamic (`clap_complete`'s `CompleteEnv`,
   so `COMPLETE=<shell> attest` prints the completion script):
   `complete_tests` discovers script files and parses them to complete
-  `<file>/<test>` pairs for the target and `--filter`.
+  `<file>/<test>` pairs for the target and `--filter`. The file/test split
+  decides only *where to look* — one named file, or everything the walk turns
+  up — and from there completion is a prefix match against
+  `parser::selector`, so a completed selector is the same string `list` prints
+  and `TestPattern::parse` reads back.
 - `src/discovery.rs` - Finds test files from a file path or directory
   (recursive). Scans all shell scripts (by extension or shebang) for test
   functions, not just `.test` files.
@@ -36,6 +40,9 @@
   synthesizes for a positional target: there the split is decided by the
   filesystem, so `./a/x.test/test_foo` is a file plus a name, and carrying the
   marker into the filter would turn the name back into a path component.
+  `selector` is the other direction — the single spelling of the join, used by
+  `list` and by completion — and drops the `./` for the same reason:
+  `TestPattern::parse` would otherwise read the whole selector as a path.
 - `src/runner.rs` - For each test: writes all extracted functions (test +
   helper) to a temp script, forks a child that execs `<shell> -c` (the shell
   `resolve_shell` picked for the file, or `--shebang`) with the original script
