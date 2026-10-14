@@ -264,8 +264,8 @@ struct Selection {
     /// `--filter`, or the name half the target carried.
     filter: Option<String>,
     /// The files that parsed, in discovery order. Each file is parsed exactly
-    /// once and kept alive here, so every test can borrow its path and
-    /// extracted functions rather than cloning the whole AST per test (and
+    /// once and kept alive here, so every test can borrow its path and the
+    /// script the runner sources rather than re-deriving either per test (and
     /// again per `--repeat`).
     files: Vec<parser::TestFile>,
 }

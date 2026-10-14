@@ -1,5 +1,4 @@
 use anyhow::{Result, anyhow};
-use brush_parser::ast::{FunctionDefinition, SourceLocation};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
@@ -763,65 +762,6 @@ fn resolve_shell(shell: &str) -> String {
     }
 }
 
-/// Build the script that the runner sources to define a test's functions.
-///
-/// Each function is emitted verbatim at the same line number it occupies in the
-/// original source, with the gaps between them blanked out. Because bash's
-/// `$LINENO` (used by our xtrace `PS4`) reports the line within the sourced
-/// file, keeping functions at their original offsets makes xtrace line numbers
-/// match the source exactly — so a failing command's trace points straight at
-/// its source line, with no reconstruction or line-mapping heuristics needed on
-/// the diagnostics side.
-///
-/// Only function definitions are emitted (top-level code is dropped), matching
-/// the previous `to_string`-based behavior, so sourcing the script never runs a
-/// test's top-level statements.
-///
-/// `source` is `None` when the original file could not be read. Then — as for
-/// any single function the parser gave no location for — the function falls
-/// back to the reformatted AST rendering: line alignment is lost, but the
-/// script still defines and runs the same functions.
-fn build_functions_source(functions: &[FunctionDefinition], source: Option<&str>) -> String {
-    let src_lines: Vec<&str> = source.unwrap_or_default().lines().collect();
-    let mut out = String::new();
-    // 1-based line number of the next line to be written to `out`.
-    let mut line = 1usize;
-
-    for func in functions {
-        let located = if src_lines.is_empty() {
-            None
-        } else {
-            func.location()
-        };
-        let Some(span) = located else {
-            for l in func.to_string().lines() {
-                out.push_str(l);
-                out.push('\n');
-                line += 1;
-            }
-            continue;
-        };
-
-        // Functions are yielded in source order, so this only pads forward.
-        while line < span.start.line {
-            out.push('\n');
-            line += 1;
-        }
-
-        // `end.line` is the line of the closing brace (inclusive here).
-        let last = span.end.line.min(src_lines.len());
-        for idx in span.start.line..=last {
-            if let Some(text) = src_lines.get(idx - 1) {
-                out.push_str(text);
-            }
-            out.push('\n');
-            line += 1;
-        }
-    }
-
-    out
-}
-
 /// Spawn a child process that will run the test. Returns a `PendingTest` that
 /// the caller must reap (or simply drop to kill+clean up). `context` must be
 /// unique per test (the caller derives it from the unique display name).
@@ -851,12 +791,11 @@ fn spawn_test(
         None => None,
     };
 
+    // The script is rendered once per file at parse time (see
+    // `parser::build_functions_source`), but it is written out per test: it
+    // lives in the test's own context dir, which nothing else can reach.
     let script_path = context.join("functions.sh");
-    // Read the original source so functions can be emitted verbatim at their
-    // original line numbers (see build_functions_source).
-    let source = std::fs::read_to_string(&spec.file.path).ok();
-    let script = build_functions_source(&spec.file.functions, source.as_deref());
-    std::fs::write(&script_path, &script)?;
+    std::fs::write(&script_path, &spec.file.script)?;
 
     if !config.override_cmds.is_empty() {
         let bin: &Path = &context.join("bin");
@@ -2396,46 +2335,6 @@ mod tests {
         assert_eq!(stat_ppid(stat), Some(7));
         assert_eq!(stat_state("garbage"), None);
         assert_eq!(stat_ppid("42 (sh) T"), None);
-    }
-
-    #[test]
-    fn functions_source_preserves_line_numbers() {
-        // A helper, a blank line, then a test: every function line must land on
-        // the same line number it has in the source, with the gaps blanked.
-        let source = "helper() {\n  echo setup\n}\n\ntest_foo() {\n  echo a\n  false\n}\n";
-        let tmp = TempDir::new().unwrap();
-        let tf = parse_script(tmp.path(), source);
-
-        let generated = build_functions_source(&tf.functions, Some(source));
-        let gen_lines: Vec<&str> = generated.lines().collect();
-        let src_lines: Vec<&str> = source.lines().collect();
-
-        // Function lines match the source exactly; the separator line is blanked.
-        for idx in [0, 1, 2, 4, 5, 6, 7] {
-            assert_eq!(gen_lines[idx], src_lines[idx], "line {idx} differs");
-        }
-        assert_eq!(gen_lines[3], "", "top-level/gap line 3 should be blank");
-    }
-
-    #[test]
-    fn functions_source_falls_back_when_the_source_is_unavailable() {
-        // Without the original text there are no line numbers to preserve, so
-        // every function is re-rendered from the AST. Line alignment is lost
-        // (and with it the diagnostic snippet), but the script must still be
-        // valid shell that defines and runs each function.
-        let source = "helper() {\n  echo 42\n}\n\ntest_foo() {\n  test \"$(helper)\" = 42\n}\n";
-        let tmp = TempDir::new().unwrap();
-        let tf = parse_script(tmp.path(), source);
-
-        let generated = build_functions_source(&tf.functions, None);
-        let script = tmp.path().join("fallback.sh");
-        fs::write(&script, &generated).unwrap();
-
-        let status = Command::new("/bin/sh")
-            .args(["-c", &format!(". {}\ntest_foo\n", sh_quote(&script))])
-            .status()
-            .unwrap();
-        assert!(status.success(), "generated script failed:\n{generated}");
     }
 
     #[test]

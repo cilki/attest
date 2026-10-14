@@ -3,7 +3,9 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use brush_parser::ast::{Command, CompoundCommand, CompoundList, FunctionDefinition, Program};
+use brush_parser::ast::{
+    Command, CompoundCommand, CompoundList, FunctionDefinition, Program, SourceLocation,
+};
 use brush_parser::{Parser, ParserOptions};
 use tracing::warn;
 
@@ -15,7 +17,15 @@ pub struct TestFile {
     /// Names of the test functions, in source order — one per name the shell
     /// would actually run (see [`parse_test_file`]).
     pub tests: Vec<String>,
-    pub functions: Vec<FunctionDefinition>,
+    /// The script the runner writes out and sources to define this file's
+    /// functions (see [`build_functions_source`]). It is the same text for
+    /// every test in the file, so it is rendered once here instead of per
+    /// test: rendering it walks each function's AST to find its source span,
+    /// which cost more than reading and writing the file it is built from —
+    /// and a file holding 25 tests paid it 25 times over, once more for every
+    /// `--repeat`. Keeping the text rather than the AST it came from is also
+    /// what lets the parse be thrown away: nothing downstream needs the nodes.
+    pub script: String,
 }
 
 /// A pattern for selecting tests, parsed from `[<file>/]<name-pattern>`.
@@ -136,8 +146,69 @@ pub fn parse_test_file(path: &Path) -> anyhow::Result<TestFile> {
     Ok(TestFile {
         path: path.to_path_buf(),
         tests,
-        functions,
+        // Built here, from the text this parse came from, so the script and
+        // the spans it is cut with can never be out of step: the file is read
+        // once and both come from that one read.
+        script: build_functions_source(&functions, &contents),
     })
+}
+
+/// Build the script that the runner sources to define a file's functions.
+///
+/// Each function is emitted verbatim at the same line number it occupies in the
+/// original source, with the gaps between them blanked out. Because bash's
+/// `$LINENO` (used by our xtrace `PS4`) reports the line within the sourced
+/// file, keeping functions at their original offsets makes xtrace line numbers
+/// match the source exactly — so a failing command's trace points straight at
+/// its source line, with no reconstruction or line-mapping heuristics needed on
+/// the diagnostics side.
+///
+/// Only function definitions are emitted (top-level code is dropped), so
+/// sourcing the script never runs a test file's top-level statements.
+///
+/// A function the parser gave no location for — and every function when
+/// `source` is empty — falls back to the reformatted AST rendering: line
+/// alignment is lost, but the script still defines and runs the same
+/// functions.
+pub(crate) fn build_functions_source(functions: &[FunctionDefinition], source: &str) -> String {
+    let src_lines: Vec<&str> = source.lines().collect();
+    let mut out = String::new();
+    // 1-based line number of the next line to be written to `out`.
+    let mut line = 1usize;
+
+    for func in functions {
+        let located = if src_lines.is_empty() {
+            None
+        } else {
+            func.location()
+        };
+        let Some(span) = located else {
+            for l in func.to_string().lines() {
+                out.push_str(l);
+                out.push('\n');
+                line += 1;
+            }
+            continue;
+        };
+
+        // Functions are yielded in source order, so this only pads forward.
+        while line < span.start.line {
+            out.push('\n');
+            line += 1;
+        }
+
+        // `end.line` is the line of the closing brace (inclusive here).
+        let last = span.end.line.min(src_lines.len());
+        for idx in span.start.line..=last {
+            if let Some(text) = src_lines.get(idx - 1) {
+                out.push_str(text);
+            }
+            out.push('\n');
+            line += 1;
+        }
+    }
+
+    out
 }
 
 fn extract_functions(program: &Program) -> Vec<FunctionDefinition> {
@@ -315,31 +386,67 @@ mod tests {
     }
 
     #[test]
+    fn functions_source_preserves_line_numbers() {
+        // A helper, a blank line, then a test: every function line must land on
+        // the same line number it has in the source, with the gaps blanked.
+        let source = "helper() {\n  echo setup\n}\n\ntest_foo() {\n  echo a\n  false\n}\n";
+        let tmp = TempDir::new().unwrap();
+        let path = write_script(tmp.path(), "lines.test", source);
+
+        let tf = parse_test_file(&path).unwrap();
+        let gen_lines: Vec<&str> = tf.script.lines().collect();
+        let src_lines: Vec<&str> = source.lines().collect();
+
+        // Function lines match the source exactly; the separator line is blanked.
+        for idx in [0, 1, 2, 4, 5, 6, 7] {
+            assert_eq!(gen_lines[idx], src_lines[idx], "line {idx} differs");
+        }
+        assert_eq!(gen_lines[3], "", "top-level/gap line 3 should be blank");
+    }
+
+    #[test]
+    fn functions_source_falls_back_when_the_source_is_unavailable() {
+        // Without the original text there are no line numbers to preserve, so
+        // every function is re-rendered from the AST. Line alignment is lost
+        // (and with it the diagnostic snippet), but the script must still be
+        // valid shell that defines and runs each function.
+        let source = "helper() {\n  echo 42\n}\n\ntest_foo() {\n  test \"$(helper)\" = 42\n}\n";
+        let functions = parse_functions(source).unwrap();
+
+        let generated = build_functions_source(&functions, "");
+        let tmp = TempDir::new().unwrap();
+        let script = write_script(tmp.path(), "fallback.sh", &generated);
+
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", &format!(". '{}'\ntest_foo\n", script.display())])
+            .status()
+            .unwrap();
+        assert!(status.success(), "generated script failed:\n{generated}");
+    }
+
+    #[test]
     fn parse_file_with_test_functions() {
         let tmp = TempDir::new().unwrap();
-        let path = write_script(
-            tmp.path(),
-            "example.test",
-            "test_hello() {\n  echo hello\n}\n\ntest_world() {\n  echo world\n}\n",
-        );
+        let source = "test_hello() {\n  echo hello\n}\n\ntest_world() {\n  echo world\n}\n";
+        let path = write_script(tmp.path(), "example.test", source);
 
         let result = parse_test_file(&path).unwrap();
         assert_eq!(result.tests, ["test_hello", "test_world"]);
-        assert_eq!(result.functions.len(), 2);
+        // Nothing but function definitions here, so the script the runner
+        // sources is the file itself, line for line.
+        assert_eq!(result.script, source);
     }
 
     #[test]
     fn parse_file_with_helpers_and_tests() {
         let tmp = TempDir::new().unwrap();
-        let path = write_script(
-            tmp.path(),
-            "example.test",
-            "setup() {\n  mkdir -p /tmp/test\n}\n\ntest_foo() {\n  setup\n  echo foo\n}\n",
-        );
+        let source = "setup() {\n  mkdir -p /tmp/test\n}\n\ntest_foo() {\n  setup\n  echo foo\n}\n";
+        let path = write_script(tmp.path(), "example.test", source);
 
         let result = parse_test_file(&path).unwrap();
         assert_eq!(result.tests, ["test_foo"]);
-        assert_eq!(result.functions.len(), 2);
+        // The helper is not a test but is still defined for the tests to call.
+        assert_eq!(result.script, source);
     }
 
     #[test]
@@ -349,21 +456,19 @@ mod tests {
 
         let result = parse_test_file(&path).unwrap();
         assert!(result.tests.is_empty());
-        assert!(result.functions.is_empty());
+        // Top-level code is dropped, so sourcing the script runs nothing.
+        assert!(result.script.is_empty());
     }
 
     #[test]
     fn parse_file_with_no_test_functions() {
         let tmp = TempDir::new().unwrap();
-        let path = write_script(
-            tmp.path(),
-            "helpers.sh",
-            "helper_one() {\n  echo one\n}\n\nhelper_two() {\n  echo two\n}\n",
-        );
+        let source = "helper_one() {\n  echo one\n}\n\nhelper_two() {\n  echo two\n}\n";
+        let path = write_script(tmp.path(), "helpers.sh", source);
 
         let result = parse_test_file(&path).unwrap();
         assert!(result.tests.is_empty());
-        assert_eq!(result.functions.len(), 2);
+        assert_eq!(result.script, source);
     }
 
     #[test]
@@ -419,17 +524,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // The same test name defined twice: the shell shadows the first, so
         // only the last definition can ever run. Exactly one test is emitted,
-        // but both definitions remain in `functions` so the sourced script is
+        // but both definitions stay in the sourced script, which is therefore
         // unchanged.
-        let path = write_script(
-            tmp.path(),
-            "dup.test",
-            "test_dup() {\n  echo first\n}\n\ntest_dup() {\n  echo second\n}\n",
-        );
+        let source = "test_dup() {\n  echo first\n}\n\ntest_dup() {\n  echo second\n}\n";
+        let path = write_script(tmp.path(), "dup.test", source);
 
         let result = parse_test_file(&path).unwrap();
         assert_eq!(result.tests, ["test_dup"]);
-        assert_eq!(result.functions.len(), 2);
+        assert_eq!(result.script, source);
     }
 
     #[test]
@@ -439,6 +541,6 @@ mod tests {
 
         let result = parse_test_file(&path).unwrap();
         assert!(result.tests.is_empty());
-        assert!(result.functions.is_empty());
+        assert!(result.script.is_empty());
     }
 }
