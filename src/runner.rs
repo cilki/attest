@@ -1173,38 +1173,49 @@ fn xorshift64(state: &mut u64) -> u64 {
     *state
 }
 
-/// One `--fuzz` tick for the test rooted at `test_pid`: either pause a random
-/// running descendant or resume a random stopped one, never both. `level` is
-/// the aggressiveness in (0,1) — the higher it is, the more often a tick pauses
+/// One `--fuzz` tick for the test rooted at `test_pid`: either pause a
+/// running descendant or resume a stopped one, never both. `level` is the
+/// aggressiveness in (0,1) — the higher it is, the more often a tick pauses
 /// rather than resumes.
+///
+/// The descendants are walked from a random offset and the first one in the
+/// state this tick wants is signalled. Whether a process is in that state is
+/// settled by [`signal_tree_member`] alone, through the same pinned descriptor
+/// it then signals through: a state read off `/proc/<pid>/stat` beforehand can
+/// only ever be advisory, since the process is free to run, stop or exit
+/// between that read and the signal. So shortlisting the eligible pids first —
+/// a `/proc` read per descendant per tick, for every running test — told us
+/// nothing the pinned check does not establish for itself, and wasted the tick
+/// outright whenever the one pid drawn from the shortlist had moved on in the
+/// meantime. Walking on to the next candidate instead means a tick acts
+/// whenever anything in the tree is still eligible by the time it is asked.
 fn fuzz_tick(test_pid: u32, level: f64, rng: &mut u64) {
     let resume = (xorshift64(rng) as f64) / (u64::MAX as f64) >= level;
-    let tree = collect_descendants(test_pid);
-    // A descendant whose state can't be read counts as running. The pick is
-    // only a preference: `signal_tree_member` re-checks the state of whatever
-    // it is about to signal, so a process that changed state (or vanished)
-    // meanwhile is skipped rather than signalled anyway.
-    let candidates: Vec<u32> = tree
-        .iter()
-        .copied()
-        .filter(|&pid| pid != test_pid && (process_state(pid) == Some('T')) == resume)
-        .collect();
-    if candidates.is_empty() {
-        return;
-    }
-    let chosen = candidates[(xorshift64(rng) as usize) % candidates.len()];
     let (signal, verb) = if resume {
         (libc::SIGCONT, "Resumed")
     } else {
         (libc::SIGSTOP, "Paused")
     };
-    if signal_tree_member(chosen, &tree, resume, signal) {
-        trace!(pid = chosen, "{verb} subprocess");
+    let tree = collect_descendants(test_pid);
+    // Everything but the test's own shell, which is `tree`'s first element.
+    // Stopping the process the runner is waiting on would suspend the test
+    // wholesale rather than reorder anything inside it.
+    let descendants = tree.get(1..).unwrap_or_default();
+    if descendants.is_empty() {
+        return;
+    }
+    let offset = (xorshift64(rng) as usize) % descendants.len();
+    for i in 0..descendants.len() {
+        let pid = descendants[(offset + i) % descendants.len()];
+        if signal_tree_member(pid, &tree, resume, signal) {
+            trace!(pid, "{verb} subprocess");
+            return;
+        }
     }
 }
 
 /// Send `signal` to `pid`, but only if it is still the member of `tree` the
-/// caller took it for and its stopped-ness still matches `want_stopped`.
+/// caller took it for and it is stopped exactly when `want_stopped` says.
 /// Returns whether the signal was delivered.
 ///
 /// `pid` came out of a `/proc` walk a few syscalls ago, and a pid is free to be
@@ -1218,6 +1229,8 @@ fn fuzz_tick(test_pid: u32, level: f64, rng: &mut u64) {
 /// Pinning the pid first rules it out: identity, state and signal all travel
 /// through one descriptor that the kernel never re-points at the pid's next
 /// occupant, and the parent check rejects a number that has already moved on.
+/// That makes this the only place the state is worth reading at all — see
+/// [`fuzz_tick`].
 fn signal_tree_member(pid: u32, tree: &[u32], want_stopped: bool, signal: libc::c_int) -> bool {
     let Some(target) = PinnedProcess::open(pid) else {
         return false;
@@ -1227,6 +1240,7 @@ fn signal_tree_member(pid: u32, tree: &[u32], want_stopped: bool, signal: libc::
     let Some(stat) = target.stat() else {
         return false; // already gone
     };
+    // A descendant whose state cannot be made out counts as running.
     if (stat_state(&stat) == Some('T')) != want_stopped {
         return false;
     }
@@ -1299,7 +1313,8 @@ impl Drop for PinnedProcess {
 }
 
 /// Collect the PID of `root` and all of its descendants by walking
-/// `/proc/<pid>/task/<pid>/children` recursively.
+/// `/proc/<pid>/task/<pid>/children` recursively. `root` is the first element,
+/// so the rest of the slice is exactly its descendants (see [`fuzz_tick`]).
 fn collect_descendants(root: u32) -> Vec<u32> {
     let mut result = vec![root];
     let mut queue = vec![root];
@@ -1313,12 +1328,6 @@ fn collect_descendants(root: u32) -> Vec<u32> {
         }
     }
     result
-}
-
-/// Read the single-character process state from `/proc/<pid>/stat`.
-/// Returns `None` if the file cannot be read (e.g. the process has already exited).
-fn process_state(pid: u32) -> Option<char> {
-    stat_state(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
 }
 
 /// The fields of a `/proc/<pid>/stat` line from `state` (field 3) on. The
@@ -1735,6 +1744,15 @@ mod tests {
             .unwrap();
         // The straggler must be dead shortly after the test completes.
         assert!(await_death(pid, 5), "background process survived the test");
+    }
+
+    /// Read the single-character process state from `/proc/<pid>/stat`.
+    /// `None` if the file cannot be read (e.g. the process has already
+    /// exited). Only the assertions below look at a process this way: the
+    /// runner itself reads state through a pinned descriptor, since the pid in
+    /// a path may have been reissued (see [`signal_tree_member`]).
+    fn process_state(pid: u32) -> Option<char> {
+        stat_state(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
     }
 
     /// Wait (up to `secs`) for `pid` to stop being a live process. A reparented
@@ -2297,24 +2315,38 @@ mod tests {
         }
     }
 
-    #[test]
-    fn fuzz_pauses_and_resumes_a_descendant() {
-        // The baseline the hardening below must not break: a live descendant of
-        // a test gets stopped by a pausing tick and resumed by a resuming one.
+    /// A shell with `n` `sleep 30` children, and their pids. Each one is a
+    /// direct child of the shell, so the `/proc` walk finds them all as
+    /// descendants of the test.
+    fn sleeper_tree(n: usize) -> (std::process::Child, Vec<u32>) {
+        use std::io::BufRead;
+
+        let spawn = "sleep 30 & echo $! >&2; ".repeat(n);
         let mut shell = Command::new("/bin/sh")
-            .args(["-c", "sleep 30 & echo $! >&2; wait"])
+            .args(["-c", &format!("{spawn}wait")])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        let mut out = String::new();
-        {
-            use std::io::BufRead;
-            let mut reader = std::io::BufReader::new(shell.stderr.take().unwrap());
-            reader.read_line(&mut out).unwrap();
-        }
-        let sleeper: u32 = out.trim().parse().unwrap();
-        assert!(await_state(sleeper, 'S', 5), "sleeper never started");
+        let mut reader = std::io::BufReader::new(shell.stderr.take().unwrap());
+        let pids: Vec<u32> = (0..n)
+            .map(|_| {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let pid: u32 = line.trim().parse().unwrap();
+                assert!(await_state(pid, 'S', 5), "sleeper {pid} never started");
+                pid
+            })
+            .collect();
+        (shell, pids)
+    }
+
+    #[test]
+    fn fuzz_pauses_and_resumes_a_descendant() {
+        // The baseline the hardening below must not break: a live descendant of
+        // a test gets stopped by a pausing tick and resumed by a resuming one.
+        let (mut shell, pids) = sleeper_tree(1);
+        let sleeper = pids[0];
 
         // level 1.0 always pauses, 0.0 always resumes.
         let mut rng = 1;
@@ -2326,6 +2358,35 @@ mod tests {
         let _ = shell.kill();
         let _ = shell.wait();
         unsafe { libc::kill(sleeper as libc::pid_t, libc::SIGKILL) };
+    }
+
+    #[test]
+    fn fuzz_looks_past_a_descendant_in_the_wrong_state() {
+        // A tick walks the descendants from a random offset and signals the
+        // first one in the state it wants, so a descendant that is already
+        // stopped must not absorb a pausing tick: whichever offset came up,
+        // something that was running has to end up paused.
+        let (mut shell, pids) = sleeper_tree(2);
+        let (already_stopped, running) = (pids[0], pids[1]);
+        unsafe { libc::kill(already_stopped as libc::pid_t, libc::SIGSTOP) };
+        assert!(await_state(already_stopped, 'T', 5), "could not stop it");
+
+        let mut rng = 1;
+        fuzz_tick(shell.id(), 1.0, &mut rng); // level 1.0 always pauses
+        let paused = await_state(running, 'T', 5);
+
+        // Torn down before the verdict: a `sleep` left stopped by a failing
+        // assertion would never exit on its own.
+        for pid in pids {
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
+        let _ = shell.kill();
+        let _ = shell.wait();
+
+        assert!(
+            paused,
+            "the tick gave up on the descendant that was already stopped"
+        );
     }
 
     #[test]
