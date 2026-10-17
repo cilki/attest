@@ -22,17 +22,26 @@
   and `TestPattern::parse` reads back.
 - `src/discovery.rs` - Finds test files from a file path or directory
   (recursive). Scans all shell scripts (by extension or shebang) for test
-  functions, not just `.test` files.
+  functions, not just `.test` files. Owns every rule about shebangs and
+  shells, so the "is this a shell script" and "which shell does it want"
+  answers cannot disagree: `shebang_shell` reads the interpreter out of a
+  shebang line (`#!/usr/bin/env bash` included) and `script_shell` turns a
+  script's *text* into the shell to exec it with — the shebang's shell if it
+  is installed, `/bin/sh` if it is not, `bash` when there is no recognized
+  shebang. It takes the text and not the path because by then the file has
+  been read whole and parsed anyway; the runner used to reopen and re-read it
+  for the first line on every spawn, once more for every `--repeat`.
 - `src/parser.rs` - Parses shell scripts with `brush_parser::Parser`, walks the
   AST to extract all `FunctionDefinition` nodes. Test functions start with
-  `test`. A `TestFile` keeps the names of its tests and the script the runner
-  sources (`build_functions_source`), not the nodes: the script is the same
-  text for every test in the file, and rendering it walks each function's AST
+  `test`. A `TestFile` keeps the names of its tests, the script the runner
+  sources (`build_functions_source`) and the shell that sources it
+  (`discovery::script_shell`), not the nodes: all of those are the same for
+  every test in the file, and rendering the script walks each function's AST
   for its source span — which cost more than reading and writing the file it
   is built from, and a file holding 25 tests paid it 25 times over, once more
-  for every `--repeat`. Rendering at parse time also means the script and the
-  spans it is cut with come from one read of the file, so the two cannot
-  disagree. Also holds `TestPattern`, the `[<file>/]<name>` selector behind
+  for every `--repeat`. Deriving them at parse time also means the script, the
+  spans it is cut with and the shell all come from one read of the file, so
+  they cannot disagree. Also holds `TestPattern`, the `[<file>/]<name>` selector behind
   `--filter` and the positional target: the file half is a `Path::ends_with`
   suffix (whole components, no wildcards), the name half a `*` glob that
   degrades to a prefix match when it contains no `*`, and either half may be
@@ -52,7 +61,7 @@
   `TestPattern::parse` would otherwise read the whole selector as a path.
 - `src/runner.rs` - For each test: writes all extracted functions (test +
   helper) to a temp script, forks a child that execs `<shell> -c` (the shell
-  `resolve_shell` picked for the file, or `--shebang`) with the original script
+  the file's own parse settled on, or `--shebang`) with the original script
   path as `argv[0]` so `$0` still works, redirects stdout to `stdout.log` and
   stderr to `xtrace.log`, enables `set -e`, sources the script, and only then
   turns on `set -x` before invoking the test function by name — so the xtrace

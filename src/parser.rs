@@ -26,6 +26,15 @@ pub struct TestFile {
     /// `--repeat`. Keeping the text rather than the AST it came from is also
     /// what lets the parse be thrown away: nothing downstream needs the nodes.
     pub script: String,
+    /// The shell the runner execs to source [`TestFile::script`] and call one
+    /// of [`TestFile::tests`], unless `--shebang` overrides it (see
+    /// [`crate::discovery::script_shell`]).
+    ///
+    /// Kept here for the same reason the script is: it depends only on the
+    /// file, and deriving it needs the file's first line — which the runner
+    /// used to reopen and re-read on every spawn, and so once more for every
+    /// `--repeat`. The text this parse read is already the first line.
+    pub shell: String,
 }
 
 /// A pattern for selecting tests, parsed from `[<file>/]<name-pattern>`.
@@ -179,10 +188,12 @@ pub fn parse_test_file(path: &Path) -> anyhow::Result<TestFile> {
     Ok(TestFile {
         path: path.to_path_buf(),
         tests,
-        // Built here, from the text this parse came from, so the script and
-        // the spans it is cut with can never be out of step: the file is read
-        // once and both come from that one read.
+        // Both built here, from the text this parse came from, so the script,
+        // the spans it is cut with and the shell that sources it can never be
+        // out of step: the file is read once and all three come from that one
+        // read.
         script: build_functions_source(&functions, &contents),
+        shell: crate::discovery::script_shell(&contents),
     })
 }
 

@@ -451,7 +451,7 @@ fn main() -> anyhow::Result<()> {
             // Otherwise tests would silently fall back to /bin/sh and report
             // results for a shell the user never asked for.
             if let Some(ref shell) = cli.shebang
-                && !runner::shell_exists(shell)
+                && !discovery::shell_exists(shell)
             {
                 anyhow::bail!("--shebang: shell not found: {shell}");
             }

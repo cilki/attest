@@ -119,17 +119,49 @@ fn shebang_shell(line: &str) -> Option<&str> {
     matches!(basename, "sh" | "bash" | "zsh" | "dash" | "ash" | "ksh").then_some(interpreter)
 }
 
-/// The shell to run a script file under: the one its shebang names, falling
-/// back to `bash` when there is no shebang or it names something else.
-pub(crate) fn get_script_shell(path: &Path) -> String {
-    let Some(line) = read_first_line(path) else {
-        return "bash".to_string();
-    };
-    shebang_shell(&line).unwrap_or("bash").to_string()
-}
-
 pub(crate) fn is_shell_interpreter(shebang: &str) -> bool {
     shebang_shell(shebang).is_some()
+}
+
+/// Whether `shell` names something we can exec: an existing path when it
+/// contains a `/`, or a command resolvable on `PATH` otherwise.
+pub(crate) fn shell_exists(shell: &str) -> bool {
+    if shell.contains('/') {
+        Path::new(shell).exists()
+    } else {
+        which::which(shell).is_ok()
+    }
+}
+
+/// Resolve a shell name or path to an executable, falling back to `/bin/sh`
+/// when the requested shell is not found.
+pub(crate) fn resolve_shell(shell: &str) -> String {
+    if shell_exists(shell) {
+        shell.to_string()
+    } else {
+        "/bin/sh".to_string()
+    }
+}
+
+/// The shell to run the script `source` under: the one its shebang names if
+/// that shell is installed, `/bin/sh` when it is not, and `bash` when the file
+/// carries no shebang this recognizes.
+///
+/// Derived from the script's *text*, not from its path. By the time the answer
+/// is needed the file has already been read whole and parsed
+/// ([`crate::parser::parse_test_file`]), so taking the path would mean
+/// reopening and re-reading it — which the runner used to do once per spawned
+/// test, and so once more for every `--repeat`. Reading the shebang from the
+/// same text the sourced script is cut from also keeps the two in step: a file
+/// edited mid-run could otherwise have its new shell paired with its old
+/// functions.
+pub(crate) fn script_shell(source: &str) -> String {
+    let named = source
+        .lines()
+        .next()
+        .and_then(shebang_shell)
+        .unwrap_or("bash");
+    resolve_shell(named)
 }
 
 #[cfg(test)]
@@ -320,28 +352,44 @@ mod tests {
     }
 
     #[test]
-    fn script_shell_from_shebang() {
-        let tmp = TempDir::new().unwrap();
+    fn shebang_names_its_interpreter() {
+        // The shell a shebang asks for, exactly as written — the `env` form
+        // names the shell rather than `env` itself.
+        assert_eq!(shebang_shell("#!/bin/bash"), Some("/bin/bash"));
+        assert_eq!(shebang_shell("#!/usr/bin/env bash"), Some("bash"));
+        assert_eq!(shebang_shell("#!/bin/sh"), Some("/bin/sh"));
+        // Not a shell, and not a shebang at all.
+        assert_eq!(shebang_shell("#!/usr/bin/python3"), None);
+        assert_eq!(shebang_shell("echo hi"), None);
+    }
 
-        let bash_file = tmp.path().join("bash.sh");
-        fs::write(&bash_file, "#!/bin/bash\necho hi\n").unwrap();
-        assert_eq!(get_script_shell(&bash_file), "/bin/bash");
+    #[test]
+    fn script_shell_resolves_the_shell_its_shebang_names() {
+        // The shebang decides, and the shell it names is used as written.
+        assert_eq!(script_shell("#!/bin/sh\necho hi\n"), "/bin/sh");
+        // A recognized shell that is not installed falls back to /bin/sh,
+        // rather than failing the exec of every test in the file.
+        assert_eq!(script_shell("#!/no/such/bash\necho hi\n"), "/bin/sh");
+        // No shebang, or one naming something that is not a shell: bash.
+        for source in ["echo hi\n", "#!/usr/bin/python3\nprint('hi')\n", ""] {
+            assert_eq!(script_shell(source), resolve_shell("bash"), "{source:?}");
+        }
+    }
 
-        let env_bash = tmp.path().join("env_bash.sh");
-        fs::write(&env_bash, "#!/usr/bin/env bash\necho hi\n").unwrap();
-        assert_eq!(get_script_shell(&env_bash), "bash");
+    #[test]
+    fn shell_exists_detects_real_and_missing_shells() {
+        // Absolute path that exists vs. one that doesn't.
+        assert!(shell_exists("/bin/sh"));
+        assert!(!shell_exists("/no/such/shell"));
+        // Bare name resolved via PATH.
+        assert!(shell_exists("sh"));
+        assert!(!shell_exists("definitely-not-a-real-shell-xyz"));
+    }
 
-        let sh_file = tmp.path().join("sh.sh");
-        fs::write(&sh_file, "#!/bin/sh\necho hi\n").unwrap();
-        assert_eq!(get_script_shell(&sh_file), "/bin/sh");
-
-        let no_shebang = tmp.path().join("noshebang.sh");
-        fs::write(&no_shebang, "echo hi\n").unwrap();
-        assert_eq!(get_script_shell(&no_shebang), "bash");
-
-        let python_file = tmp.path().join("python.py");
-        fs::write(&python_file, "#!/usr/bin/python3\nprint('hi')\n").unwrap();
-        assert_eq!(get_script_shell(&python_file), "bash");
+    #[test]
+    fn resolve_shell_falls_back_when_missing() {
+        assert_eq!(resolve_shell("/bin/sh"), "/bin/sh");
+        assert_eq!(resolve_shell("/no/such/shell"), "/bin/sh");
     }
 
     #[test]

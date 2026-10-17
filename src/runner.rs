@@ -434,6 +434,10 @@ struct RunEnv {
     overlay_mode: Option<overlay::Mode>,
     /// How each mount under `/` is re-established inside per-test roots.
     submounts: Vec<overlay::Submount>,
+    /// `--shebang`, resolved once for the run: the shell every test runs under
+    /// instead of the one its own file's shebang names
+    /// ([`crate::parser::TestFile::shell`]).
+    shell_override: Option<String>,
 }
 
 /// One test to run: the name it is reported under, the shell function to
@@ -513,6 +517,10 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
         invocation_dir,
         overlay_mode,
         submounts,
+        shell_override: config
+            .shebang
+            .as_deref()
+            .map(crate::discovery::resolve_shell),
     };
 
     // Contexts always live in the temp dir; `--save-context` copies each test's
@@ -747,26 +755,6 @@ fn context_dir_name(display_name: &str, taken: &mut std::collections::HashSet<St
     }
 }
 
-/// Whether `shell` names something we can exec: an existing path when it
-/// contains a `/`, or a command resolvable on `PATH` otherwise.
-pub(crate) fn shell_exists(shell: &str) -> bool {
-    if shell.contains('/') {
-        std::path::Path::new(shell).exists()
-    } else {
-        which::which(shell).is_ok()
-    }
-}
-
-/// Resolve a shell name or path to an executable, falling back to `/bin/sh`
-/// when the requested shell is not found.
-fn resolve_shell(shell: &str) -> String {
-    if shell_exists(shell) {
-        shell.to_string()
-    } else {
-        "/bin/sh".to_string()
-    }
-}
-
 /// Spawn a child process that will run the test. Returns a `PendingTest` that
 /// the caller must reap (or simply drop to kill+clean up). `context` must be
 /// unique per test (the caller derives it from the unique display name).
@@ -830,11 +818,9 @@ fn spawn_test(
         .path
         .canonicalize()
         .unwrap_or_else(|_| spec.file.path.clone());
-    let shell = if let Some(s) = config.shebang.as_deref() {
-        resolve_shell(s)
-    } else {
-        resolve_shell(&crate::discovery::get_script_shell(&source_path_owned))
-    };
+    // Settled once per file at parse time, so a spawn neither re-reads the
+    // script's shebang nor looks the shell up on PATH again.
+    let shell = env.shell_override.as_deref().unwrap_or(&spec.file.shell);
 
     #[cfg(feature = "cgroup")]
     let cgroup = if config.no_cgroups {
@@ -853,7 +839,7 @@ fn spawn_test(
     // <shell> -c <script> <source_path>: passing source_path as argv[0]
     // makes $0 inside the test functions refer to the original script.
     let source_str = source_path_owned.to_str().unwrap_or("bash").to_string();
-    let mut cmd = Command::new(&shell);
+    let mut cmd = Command::new(shell);
     cmd.args(["-c", &runner_content, &source_str]);
 
     // Detach into a fresh session/process group so timeouts and cleanup can
@@ -1340,6 +1326,7 @@ mod tests {
             invocation_dir: invocation_dir.to_path_buf(),
             overlay_mode: None,
             submounts: Vec::new(),
+            shell_override: None,
         }
     }
 
@@ -1620,20 +1607,81 @@ mod tests {
         );
     }
 
-    #[test]
-    fn shell_exists_detects_real_and_missing_shells() {
-        // Absolute path that exists vs. one that doesn't.
-        assert!(shell_exists("/bin/sh"));
-        assert!(!shell_exists("/no/such/shell"));
-        // Bare name resolved via PATH.
-        assert!(shell_exists("sh"));
-        assert!(!shell_exists("definitely-not-a-real-shell-xyz"));
+    /// A stand-in shell under `dir`, named so that discovery recognizes it,
+    /// which records that it was the one exec'd and then exits successfully.
+    /// Returns `(the shell, its marker file)`.
+    fn shell_shim(dir: &Path) -> (PathBuf, PathBuf) {
+        fs::create_dir_all(dir).unwrap();
+        let (shell, marker) = (dir.join("bash"), dir.join("ran"));
+        fs::write(&shell, format!("#!/bin/sh\n: > {}\n", sh_quote(&marker))).unwrap();
+        fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (shell, marker)
     }
 
+    /// A script defining `test_x` and asking to be run under `shell`.
+    fn script_with_shebang(shell: &Path) -> String {
+        format!("#!{}\ntest_x() {{\n  :\n}}\n", shell.display())
+    }
+
+    /// A spawn execs the shell its file was *parsed* with, rather than reading
+    /// the file's shebang again when the test starts.
+    ///
+    /// The shebang used to be re-read off disk on every spawn while the script
+    /// being sourced came from the parse, so the two could disagree: a file
+    /// edited mid-run had its new shell paired with its old functions, and
+    /// under `--repeat` that window reopened for every pass over the same
+    /// `TestFile`.
     #[test]
-    fn resolve_shell_falls_back_when_missing() {
-        assert_eq!(resolve_shell("/bin/sh"), "/bin/sh");
-        assert_eq!(resolve_shell("/no/such/shell"), "/bin/sh");
+    fn a_spawn_execs_the_shell_its_file_was_parsed_with() {
+        let tmp = TempDir::new().unwrap();
+        let (parsed, parsed_ran) = shell_shim(&tmp.path().join("parsed"));
+        let (edited, edited_ran) = shell_shim(&tmp.path().join("edited"));
+
+        let tf = parse_script(tmp.path(), &script_with_shebang(&parsed));
+        assert_eq!(Path::new(&tf.shell), parsed);
+
+        // The file changes its mind about the shell after the parse.
+        fs::write(tf.path.as_path(), script_with_shebang(&edited)).unwrap();
+
+        let ctx = private_temp_dir().unwrap();
+        let mut pending = spawn_test(
+            &spec(&tf, "test_x", "test_x"),
+            ctx.path().to_path_buf(),
+            &RunConfig::default(),
+            &no_overlay_env(tmp.path()),
+        )
+        .unwrap();
+        assert!(reap_blocking(&mut pending).success());
+
+        assert!(parsed_ran.exists(), "the parsed shell did not run the test");
+        assert!(!edited_ran.exists(), "the spawn re-read the file's shebang");
+    }
+
+    /// `--shebang` still wins over whatever the file asked for.
+    #[test]
+    fn the_shell_override_beats_the_files_own_shebang() {
+        let tmp = TempDir::new().unwrap();
+        let (own, own_ran) = shell_shim(&tmp.path().join("own"));
+        let (forced, forced_ran) = shell_shim(&tmp.path().join("forced"));
+
+        let tf = parse_script(tmp.path(), &script_with_shebang(&own));
+        let env = RunEnv {
+            shell_override: Some(forced.to_string_lossy().into_owned()),
+            ..no_overlay_env(tmp.path())
+        };
+
+        let ctx = private_temp_dir().unwrap();
+        let mut pending = spawn_test(
+            &spec(&tf, "test_x", "test_x"),
+            ctx.path().to_path_buf(),
+            &RunConfig::default(),
+            &env,
+        )
+        .unwrap();
+        assert!(reap_blocking(&mut pending).success());
+
+        assert!(forced_ran.exists(), "--shebang was not honoured");
+        assert!(!own_ran.exists(), "the file's own shebang won");
     }
 
     #[test]
@@ -1817,6 +1865,7 @@ mod tests {
             invocation_dir: invocation_dir.to_path_buf(),
             overlay_mode: Some(mode),
             submounts,
+            shell_override: None,
         })
     }
 
