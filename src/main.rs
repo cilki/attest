@@ -534,10 +534,16 @@ fn main() -> anyhow::Result<()> {
     } else {
         tracing_subscriber::EnvFilter::from_default_env()
     };
-    // The log goes to stderr, so it is styled by the same rule the rest of
-    // what attest writes there is: `attest -d . 2> debug.log` should leave a
-    // log that reads as text.
+    // Logs go to stderr, like every other message attest prints itself.
+    // `tracing_subscriber` writes to stdout by default, which is where the
+    // machine-readable output lives: a `-d` (or `RUST_LOG=…`) run of
+    // `attest . --json | jq` fed its consumer log lines ahead of the JSONL,
+    // and `attest list . | xargs attest` picked one up as a test target.
+    // Being stderr, it is styled by the same rule the rest of what attest
+    // writes there is: `attest -d . 2> debug.log` should leave a log that
+    // reads as text.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(env_filter)
         .with_ansi(output::err_palette().is_colored())
         .init();
