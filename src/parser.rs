@@ -25,6 +25,10 @@ pub struct TestFile {
     /// and a file holding 25 tests paid it 25 times over, once more for every
     /// `--repeat`. Keeping the text rather than the AST it came from is also
     /// what lets the parse be thrown away: nothing downstream needs the nodes.
+    ///
+    /// Empty when [`TestFile::tests`] is: the script exists to be sourced by a
+    /// run of one of this file's tests, so a file with no test in it has
+    /// nothing to source it (see [`parse_test_file`]).
     pub script: String,
     /// The shell the runner execs to source [`TestFile::script`] and call one
     /// of [`TestFile::tests`], unless `--shebang` overrides it (see
@@ -155,9 +159,92 @@ pub(crate) fn parse_functions(source: &str) -> anyhow::Result<Vec<FunctionDefini
     Ok(extract_functions(&program))
 }
 
+/// What a function's name has to start with for it to be a test. One
+/// spelling, shared by the scan that decides whether a file is worth parsing
+/// and by the walk over what the parse found.
+const TEST_PREFIX: &str = "test";
+
+/// Is `b` a byte a function name can be spelled with?
+///
+/// Everything that is not a blank and not one of the shell's own
+/// metacharacters: a shell takes almost anything else as a function name
+/// (`test-dash`, `test.dot`, `tëst` — and brush parses all three), so the set
+/// is defined by what it excludes rather than by what it allows.
+fn is_name_byte(b: u8) -> bool {
+    !b.is_ascii_whitespace()
+        && !matches!(
+            b,
+            b'(' | b')'
+                | b'{'
+                | b'}'
+                | b'|'
+                | b'&'
+                | b';'
+                | b'<'
+                | b'>'
+                | b'#'
+                | b'\''
+                | b'"'
+                | b'`'
+                | b'$'
+                | b'\\'
+        )
+}
+
+/// Could `source` define a function whose name starts with `test`?
+///
+/// A full parse is the only thing that *answers* that, but it costs roughly a
+/// microsecond per line of script, and a directory walk parses every shell
+/// script it turns up — the vast majority of which, in a repository of any
+/// size, are ordinary scripts that define no test at all. So the text is
+/// scanned first for the one shape a definition can have: the literal `test`
+/// at the head of a word, the rest of a name, then (across any blanks or
+/// newlines) the `(` of `test_foo()` or the `{` of `function test_foo {`.
+///
+/// It only ever has to agree with the parser about what *cannot* be there:
+/// a false positive costs the parse that would have happened anyway, while a
+/// false negative loses a test. Hence the deliberate crudeness — the name
+/// bytes are "not a blank, not a metacharacter", the word head is "not
+/// preceded by a name byte", and anything may sit between the name and its
+/// brace. A name the shell only spells `test…` after quote removal
+/// (`te'st'_foo`) is not a false negative: brush keeps the quotes in the
+/// name, so such a function is not a test today either.
+fn may_define_test(source: &str) -> bool {
+    let b = source.as_bytes();
+    for (i, _) in source.match_indices(TEST_PREFIX) {
+        // The tail of a longer word, as in `latest_release() {`.
+        if i > 0 && is_name_byte(b[i - 1]) {
+            continue;
+        }
+        let mut j = i + TEST_PREFIX.len();
+        while j < b.len() && is_name_byte(b[j]) {
+            j += 1;
+        }
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if matches!(b.get(j), Some(b'(' | b'{')) {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn parse_test_file(path: &Path) -> anyhow::Result<TestFile> {
     let contents =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+
+    // Nothing in this file can be selected, so there is nothing a parse of it
+    // could tell a run: the tests are the names it does not hold, and the
+    // script is only ever sourced to call one of them.
+    if !may_define_test(&contents) {
+        return Ok(TestFile {
+            path: path.to_path_buf(),
+            tests: Vec::new(),
+            script: String::new(),
+            shell: crate::discovery::script_shell(&contents),
+        });
+    }
 
     let functions = parse_functions(&contents)
         .map_err(|e| anyhow::anyhow!("parse error in {}: {e}", path.display()))?;
@@ -171,7 +258,7 @@ pub fn parse_test_file(path: &Path) -> anyhow::Result<TestFile> {
     let mut tests = Vec::new();
     let mut seen = HashSet::new();
     for f in &functions {
-        if !f.fname.value.starts_with("test") {
+        if !f.fname.value.starts_with(TEST_PREFIX) {
             continue;
         }
         if !seen.insert(f.fname.value.as_str()) {
@@ -512,7 +599,90 @@ mod tests {
 
         let result = parse_test_file(&path).unwrap();
         assert!(result.tests.is_empty());
-        assert_eq!(result.script, source);
+        // Nothing in the file can be selected, so nothing will ever source its
+        // functions: the script is not built (and the file is not even parsed).
+        assert!(result.script.is_empty());
+    }
+
+    /// Every spelling of a function definition the parser recognizes has to
+    /// survive the scan that decides whether the parser is worth running: a
+    /// false negative there is a test that silently stops existing.
+    #[test]
+    fn the_scan_keeps_every_test_the_parser_would_find() {
+        let spellings = [
+            ("test_plain() {\n  true\n}\n", "test_plain"),
+            ("test_spaced ( ) {\n  true\n}\n", "test_spaced"),
+            ("function test_keyword {\n  true\n}\n", "test_keyword"),
+            ("function test_both() {\n  true\n}\n", "test_both"),
+            // The brace on the line after the name.
+            ("function test_nextline\n{\n  true\n}\n", "test_nextline"),
+            // A subshell body instead of a brace group.
+            ("test_subshell() (\n  true\n)\n", "test_subshell"),
+            // Shells take far more than `[A-Za-z0-9_]` in a function name.
+            ("test-dash() {\n  true\n}\n", "test-dash"),
+            ("test.dot() {\n  true\n}\n", "test.dot"),
+            // Indented, and after another command on the same line.
+            ("  test_indented() {\n  true\n}\n", "test_indented"),
+            ("true; test_after() {\n  true\n}\n", "test_after"),
+            // Nested inside a compound command.
+            (
+                "if true; then\n  test_nested() {\n    true\n  }\nfi\n",
+                "test_nested",
+            ),
+        ];
+
+        let tmp = TempDir::new().unwrap();
+        for (source, name) in spellings {
+            assert!(may_define_test(source), "scan rejected {source:?}");
+            let path = write_script(tmp.path(), "spelling.test", source);
+            let parsed = parse_test_file(&path).unwrap();
+            assert_eq!(parsed.tests, [name], "parse of {source:?}");
+        }
+    }
+
+    /// The point of the scan: an ordinary script pays for a read, not for a
+    /// shell parse. `test` as a command, and names that merely end in it,
+    /// define nothing a run could select.
+    #[test]
+    fn the_scan_skips_what_cannot_define_a_test() {
+        for source in [
+            "",
+            "#!/bin/sh\necho hello\n",
+            "if test -f /etc/passwd; then echo yes; fi\n",
+            "x=$(test -d /tmp && echo yes)\n",
+            "latest_release() {\n  true\n}\n",
+            "my_test() {\n  true\n}\n",
+            "contest=1\n",
+            "# the tests live in t/\n",
+            // Quoting that only spells `test…` after the shell removes it is
+            // not a test today either: brush keeps the quotes in the name, so
+            // the scan and the parser agree about it.
+            "te'st'_quoted() {\n  true\n}\n",
+        ] {
+            assert!(!may_define_test(source), "scan accepted {source:?}");
+            // And the parser agrees: skipping the parse loses nothing, which
+            // is the only thing the scan is allowed to be right about.
+            let functions = parse_functions(source).expect(source);
+            assert!(
+                !functions
+                    .iter()
+                    .any(|f| f.fname.value.starts_with(TEST_PREFIX)),
+                "parser found a test in {source:?}"
+            );
+        }
+    }
+
+    /// The scan is allowed to be wrong in the direction that only costs a
+    /// parse: `test` followed by something brace-shaped is handed over, and
+    /// the parser has the final say about whether it defines anything.
+    #[test]
+    fn a_false_positive_only_costs_the_parse() {
+        let source = "test_like_this_but_not_a_definition=(a b)\n";
+        assert!(may_define_test(source));
+
+        let tmp = TempDir::new().unwrap();
+        let path = write_script(tmp.path(), "array.sh", source);
+        assert!(parse_test_file(&path).unwrap().tests.is_empty());
     }
 
     #[test]

@@ -497,9 +497,14 @@ mod tests {
     use std::collections::HashSet;
 
     const GOOD: &str = "#!/bin/sh\ntestGood() {\n\ttrue\n}\n";
-    // Unterminated double quote: valid for no shell, and the kind of thing a
-    // tree can contain without it having anything to do with the tests.
-    const BROKEN: &str = "#!/bin/bash\nfoo() {\n\techo \"unterminated\n}\n";
+    // Unterminated double quote: valid for no shell. Spelled inside a test
+    // function, so the file is one the parser is asked about at all (a script
+    // that spells no test function is never parsed — see
+    // `parser::may_define_test` and the test below).
+    const BROKEN: &str = "#!/bin/bash\ntest_broken() {\n\techo \"unterminated\n}\n";
+    // The same syntax error in the kind of script a tree can contain without
+    // it having anything to do with the tests.
+    const BROKEN_WITHOUT_TESTS: &str = "#!/bin/bash\nfoo() {\n\techo \"unterminated\n}\n";
 
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
@@ -531,6 +536,23 @@ mod tests {
             panic!("a file the user named must not be skipped silently");
         };
         assert!(err.to_string().starts_with("parse error in "), "{err}");
+    }
+
+    /// A script that spells no test function at all is never handed to the
+    /// parser, so its syntax is nobody's business — not even when the user
+    /// named it. Whatever it holds, it holds no test: the answer the run gives
+    /// is "no test functions found", which is both true and what was asked.
+    #[test]
+    fn a_script_that_can_hold_no_test_is_not_parsed_at_all() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let broken = script(tmp.path(), "broken.sh", BROKEN_WITHOUT_TESTS);
+
+        for named in [true, false] {
+            let parsed = parse_discovered(vec![broken.clone()], named)
+                .expect("a script with no test in it must not fail a run");
+            assert_eq!(parsed.len(), 1);
+            assert!(parsed[0].tests.is_empty());
+        }
     }
 
     /// A `./`-prefixed target keeps selecting the test it names.

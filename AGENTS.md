@@ -8,11 +8,15 @@
   the file half matches as a path suffix and a positional target only splits
   where its left half is an existing file, so a base-name-only listing is both
   ambiguous between same-named files and unusable as a target.
-  `parse_discovered` parses every discovered file: a parse error in a file the
+  `parse_discovered` parses every discovered file that could hold a test
+  (`parser::may_define_test` settles that from the text, without a parse): a
+  parse error in a file the
   user named directly is
   fatal, while one in a file the directory walk turned up is reported on stderr
   and the file skipped, so an unparseable script elsewhere in the tree cannot
-  abort the run. Shell completion is dynamic (`clap_complete`'s `CompleteEnv`,
+  abort the run. A file that spells no test function is never parsed at all,
+  so it is never reported either — named or walked, it holds no test and that
+  is the answer the run gives. Shell completion is dynamic (`clap_complete`'s `CompleteEnv`,
   so `COMPLETE=<shell> attest` prints the completion script):
   `complete_tests` discovers script files and parses them to complete
   `<file>/<test>` pairs for the target and `--filter`. The file/test split
@@ -31,6 +35,10 @@
   shebang. It takes the text and not the path because by then the file has
   been read whole and parsed anyway; the runner used to reopen and re-read it
   for the first line on every spawn, once more for every `--repeat`.
+  `resolve_shell` remembers what each shell name resolved to: every file the
+  walk turns up asks the same question about the same handful of shells, and
+  a bare name costs a `which` — a stat per `PATH` entry, which on a tree of
+  scripts holding no tests was most of what the walk spent.
 - `src/parser.rs` - Parses shell scripts with `brush_parser::Parser`, walks the
   AST to extract all `FunctionDefinition` nodes. Test functions start with
   `test`. A `TestFile` keeps the names of its tests, the script the runner
@@ -41,7 +49,14 @@
   is built from, and a file holding 25 tests paid it 25 times over, once more
   for every `--repeat`. Deriving them at parse time also means the script, the
   spans it is cut with and the shell all come from one read of the file, so
-  they cannot disagree. Also holds `TestPattern`, the `[<file>/]<name>` selector behind
+  they cannot disagree. A file is only parsed at all once `may_define_test`
+  has found the shape of a `test…` definition in its text: the shell parse
+  costs about a microsecond per line, the walk hands it every script in the
+  tree, and almost none of them define a test. A file that fails that scan
+  gets an empty `tests` and an empty `script` — nothing can source a script
+  none of whose tests can be selected. The scan may only ever err towards the
+  parse: a false positive costs what would have been paid anyway, while a
+  false negative loses a test. Also holds `TestPattern`, the `[<file>/]<name>` selector behind
   `--filter` and the positional target: the file half is a `Path::ends_with`
   suffix (whole components, no wildcards), the name half a `*` glob that
   degrades to a prefix match when it contains no `*`, and either half may be

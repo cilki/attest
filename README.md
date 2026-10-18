@@ -315,11 +315,18 @@ that isn't a regular file is skipped too: a named pipe sitting in the tree would
 block the walk waiting for a writer. Pointed at a single file — or a symlink to
 one — it scans that whatever it happens to be called.
 
+Scanning is cheap for the scripts in the tree that aren't tests: a file is only
+parsed as shell once its text actually spells a `test…` function definition, so
+a repository full of build and install scripts costs a read apiece rather than
+a parse apiece.
+
 Not every script in a tree is shell `attest` can parse — zsh-only syntax, a
 generated or templated file, or just a script with a syntax error in it. Those
 are reported on stderr and skipped, so one unrelated file can't take down a run
 it has no tests in. Point `attest` straight at such a file, though, and the
-parse error is fatal: you asked for that file specifically.
+parse error is fatal: you asked for that file specifically — unless it spells
+no test function at all, in which case it is never parsed, and the answer is
+that it holds no tests.
 
 Each test runs under the shell its file's shebang asks for, falling back to
 `/bin/sh` when that shell isn't installed and to `bash` for files without a
