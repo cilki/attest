@@ -659,7 +659,10 @@ there isn't always the same thing:
   instead of failing on them; `--add-decorators` — write a block above each
   test that has none (see [Generating and updating
   decorators](#generating-and-updating-decorators))
-- `-d`, `--debug` — enable debug logging
+- `-d`, `--debug` — enable debug logging. It goes to stderr, along with every
+  other line attest prints about itself: stdout carries only the output meant
+  to be read by a program (`attest list`'s selectors, `--json`'s JSONL), so
+  `attest . --json -d | jq` still sees nothing but JSON
 
 ### Stopping a run early
 
@@ -873,6 +876,18 @@ working directory under `cwd/` (so a scratch file written to `$PWD` shows up at
 `results/<test>/cwd/x`), and every file it created or modified elsewhere, laid
 out by absolute path (a write to `/tmp/x` shows up at
 `results/<test>/tmp/x`).
+
+A copy that could not be made is reported on stderr — one `warning:` line per
+test, naming what it was and why:
+
+```
+❯ attest . --save-context ./results
+warning: failed to save the working directory for testHello: No space left on device (os error 28)
+```
+
+The run is unaffected and still passes on its own merits; you are told so that
+an empty `results/testHello/` is something you read about rather than something
+you discover an hour later.
 
 Saved files keep their permissions, minus the set-user-ID, set-group-ID and
 sticky bits: those files are whatever the test chose to write, and the copy is

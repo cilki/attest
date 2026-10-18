@@ -51,7 +51,10 @@
   `a/x.test` — which as a pattern is the name `x.test` under the directory `a`
   and selects nothing. A target gets neither: a bare name is not a path, and
   completing to one would hand back an argument that fails with "path does not
-  exist".
+  exist". The `tracing` subscriber `-d` turns up writes to **stderr**, not to
+  `tracing_subscriber`'s default stdout: stdout is where the machine-readable
+  output goes (`list`'s selectors, `--json`'s JSONL), so a log line there
+  landed in the middle of a stream something else was parsing.
 - `src/discovery.rs` - Finds test files from a file path or directory
   (recursive). Scans all shell scripts (by extension or shebang) for test
   functions, not just `.test` files. Owns every rule about shebangs and
@@ -555,7 +558,14 @@ left alone with a warning).
   `/tmp/x` appears at `DIR/<test>/tmp/x`) plus the test's working directory at
   `DIR/<test>/cwd/` (it is live-bound, not part of any overlay),
   `stdout.log`/`xtrace.log` to `DIR/<test>/`, and any `--strace` logs at
-  `DIR/<test>/strace/CMD.log` for debugging
+  `DIR/<test>/strace/CMD.log` for debugging. `save_test_context` *returns* the
+  copies it could not make instead of logging them, and the run loop prints
+  them as `warning:` lines with the status bar suspended: the files are what
+  the user asked for, the run passes either way, and the copy is as slow as
+  the delta is big — so the reporting belongs to the loop that owns the bar,
+  not to the copy. A log that is no longer a regular file is not one of them
+  (that reads as missing, by design); a destination that cannot be written is
+  one, since the copy is what the user asked for
 - `--repeat N` — run each test N times (default: 1); combine with `--fuzz` to
   shake out flaky tests
 - `--fuzz [VALUE]` — randomly pause and resume each test's descendant processes
