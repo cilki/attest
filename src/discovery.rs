@@ -135,12 +135,44 @@ pub(crate) fn shell_exists(shell: &str) -> bool {
 
 /// Resolve a shell name or path to an executable, falling back to `/bin/sh`
 /// when the requested shell is not found.
+///
+/// Answered once per distinct shell name and remembered. Every file the walk
+/// turns up asks this question, almost always about the same handful of
+/// shells, and answering it is not free: a bare name goes to
+/// [`which::which`], which stats the name in every entry of `PATH` — around
+/// 20µs a file here, and the dominant cost of walking a tree of scripts that
+/// hold no tests. Caching it also keeps one run's answer consistent, the way
+/// settling a file's shell at parse time keeps one file's answer consistent:
+/// a shell appearing on `PATH` mid-run cannot make two files that name the
+/// same shell disagree about it.
 pub(crate) fn resolve_shell(shell: &str) -> String {
-    if shell_exists(shell) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static RESOLVED: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    let cache = RESOLVED.get_or_init(Mutex::default);
+
+    // A poisoned lock would mean a panic while resolving, which leaves the map
+    // itself intact: take it back rather than turning that into a second panic.
+    let hit = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(shell)
+        .cloned();
+    if let Some(resolved) = hit {
+        return resolved;
+    }
+
+    let resolved = if shell_exists(shell) {
         shell.to_string()
     } else {
         "/bin/sh".to_string()
-    }
+    };
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(shell.to_string(), resolved.clone());
+    resolved
 }
 
 /// The shell to run the script `source` under: the one its shebang names if
