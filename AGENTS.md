@@ -34,7 +34,10 @@
   `a/x.test` — which as a pattern is the name `x.test` under the directory `a`
   and selects nothing. A target gets neither: a bare name is not a path, and
   completing to one would hand back an argument that fails with "path does not
-  exist".
+  exist". The `tracing` subscriber `-d` turns up writes to **stderr**, not to
+  `tracing_subscriber`'s default stdout: stdout is where the machine-readable
+  output goes (`list`'s selectors, `--json`'s JSONL), so a log line there
+  landed in the middle of a stream something else was parsing.
 - `src/discovery.rs` - Finds test files from a file path or directory
   (recursive). Scans all shell scripts (by extension or shebang) for test
   functions, not just `.test` files. Owns every rule about shebangs and
@@ -132,9 +135,15 @@
   caller to uid 0 so the test sees itself as root in its namespace). A private
   UTS namespace keeps hostname changes inside the test.
   `probe_support` rehearses the full setup (same options, same `pivot_root`)
-  once per run in a throwaway child; if no mode works, the runner warns once
-  and runs without isolation, while a per-test setup failure after a successful
-  probe fails the run loudly rather than silently running unisolated. All
+  once per run in a throwaway child; if no mode works, the runner prints one
+  `warning:` line to stderr (through `errln!`, with the status bar suspended —
+  not `warn!`, which nothing shows without `-d`) and runs without isolation,
+  while a per-test setup failure after a successful probe fails the run loudly
+  rather than silently running unisolated. The warning is part of the report
+  for the same reason a skipped unparseable file is: it changes what the run
+  did — here, which of a test's writes survive it — so it cannot depend on a
+  log level. `--no-overlay` takes the `debug!` arm instead, the fallback there
+  having been asked for. All
   mounts happen in the forked child's private mount namespace via `pre_exec`,
   so they are torn down automatically on exit and never pollute the host.
   The test's own context dir is bind-mounted back in **live** (the logs are
@@ -293,7 +302,14 @@ off, so a test asserting on a pipeline must set it itself (see
   `/tmp/x` appears at `DIR/<test>/tmp/x`) plus the test's working directory at
   `DIR/<test>/cwd/` (it is live-bound, not part of any overlay),
   `stdout.log`/`xtrace.log` to `DIR/<test>/`, and any `--strace` logs at
-  `DIR/<test>/strace/CMD.log` for debugging
+  `DIR/<test>/strace/CMD.log` for debugging. `save_test_context` *returns* the
+  copies it could not make instead of logging them, and the run loop prints
+  them as `warning:` lines with the status bar suspended: the files are what
+  the user asked for, the run passes either way, and the copy is as slow as
+  the delta is big — so the reporting belongs to the loop that owns the bar,
+  not to the copy. A log that is no longer a regular file is not one of them
+  (that reads as missing, by design); a destination that cannot be written is
+  one, since the copy is what the user asked for
 - `--no-overlay` — disable overlayfs isolation; run each test directly in the
   working directory (same as the automatic fallback when overlays are unavailable)
 - `--repeat N` — run each test N times (default: 1); combine with `--fuzz` to
