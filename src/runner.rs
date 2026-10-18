@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 use crate::decorator;
 use crate::output;
@@ -701,7 +701,14 @@ pub fn run_all_tests<'a>(
             }
             let result = build_result(pending, exit_status, config, &env);
             if let Some(ref save_dir) = config.save_context {
-                save_test_context(&result, save_dir, &env.submounts);
+                let failures = save_test_context(&result, save_dir, &env.submounts);
+                if !failures.is_empty() {
+                    status.suspend(|| {
+                        for failure in &failures {
+                            errln!("warning: {failure}");
+                        }
+                    });
+                }
             }
             completed.push(result);
         }
@@ -1252,23 +1259,40 @@ fn saved_dirs(
 /// write made here stays inside `save_dir` by construction: names reproduced
 /// from the delta are never followed as symlinks when something else has to be
 /// written at (or under) them.
-fn save_test_context(result: &TestResult, save_dir: &Path, submounts: &[overlay::Submount]) {
+///
+/// Returns what could not be saved, as messages for the caller to report.
+/// `--save-context` is a request for files, so a copy that fails leaves the
+/// user reading an empty directory for a debugging session they have already
+/// spent: it has to be said out loud rather than logged at a level that is off
+/// unless `-d` was passed. The reporting is the caller's because the run's
+/// status line is the caller's to suspend, and because a copy is as slow as the
+/// delta is big — the bar should not be held down for the length of one.
+#[must_use = "a context the user asked for and did not get has to be reported"]
+fn save_test_context(
+    result: &TestResult,
+    save_dir: &Path,
+    submounts: &[overlay::Submount],
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    // The name is the test's own, so it is escaped wherever it goes into a
+    // message: raw, the control bytes a shell accepts in a function name are
+    // terminal commands (see `output::escape_label`).
+    let name = output::escape_label(&result.name);
     // Named after the context dir rather than the test: that name is already a
     // single safe component (see context_dir_name), so a test whose function
     // name contains `/` cannot steer the copy outside save_dir.
     let Some(dst) = result.context.file_name().map(|n| save_dir.join(n)) else {
-        warn!(
-            "failed to save context for {}: unnamed context dir",
-            result.name
-        );
-        return;
+        failures.push(format!(
+            "failed to save context for {name}: unnamed context dir"
+        ));
+        return failures;
     };
     // Created up front rather than as a side effect of the first copy: a test
     // that wrote nothing has no delta to copy at all, and the logs below
     // still have to land somewhere.
     if let Err(e) = std::fs::create_dir_all(&dst) {
-        warn!("failed to save context for {}: {e}", result.name);
-        return;
+        failures.push(format!("failed to save context for {name}: {e}"));
+        return failures;
     }
 
     for (what, src, rel) in saved_dirs(result, submounts) {
@@ -1283,7 +1307,7 @@ fn save_test_context(result: &TestResult, save_dir: &Path, submounts: &[overlay:
         let copied = overlay::create_dir_nofollow(&dst, &rel)
             .and_then(|into| overlay::copy_dir_recursive(&src, &into));
         if let Err(e) = copied {
-            warn!("failed to save {what} for {}: {e}", result.name);
+            failures.push(format!("failed to save {what} for {name}: {e}"));
         }
     }
 
@@ -1294,15 +1318,23 @@ fn save_test_context(result: &TestResult, save_dir: &Path, submounts: &[overlay:
         // destination may already hold a symlink reproduced from the delta (a
         // test that created `/stdout.log` as one), and writing the log through
         // that would land on whatever host path it names.
+        // A log that is no longer a regular file reads as missing, which is
+        // the test's own doing and already documented: nothing to report.
         let Ok(mut from) = overlay::open_nofollow(&result.context.join(log)) else {
             continue;
         };
         let to = dst.join(log);
         let _ = overlay::unlink_if_symlink(&to);
-        if let Ok(mut out) = std::fs::File::create(&to) {
-            let _ = std::io::copy(&mut from, &mut out);
+        // Failing at this end is different: the log exists and the user asked
+        // for a copy of it, so not getting one is news.
+        let copied = std::fs::File::create(&to)
+            .and_then(|mut out| std::io::copy(&mut from, &mut out))
+            .map(|_| ());
+        if let Err(e) = copied {
+            failures.push(format!("failed to save {log} for {name}: {e}"));
         }
     }
+    failures
 }
 
 /// The clean per-test working directory inside a context dir.
@@ -2648,7 +2680,7 @@ mod tests {
         let result = result_in(ctx, "test_traced");
 
         let save = TempDir::new().unwrap();
-        save_test_context(&result, save.path(), &[]);
+        assert!(save_test_context(&result, save.path(), &[]).is_empty());
 
         let saved = save.path().join("test_traced");
         assert_eq!(
@@ -2656,6 +2688,54 @@ mod tests {
             "execve(\"/bin/ls\")\n"
         );
         assert!(saved.join("xtrace.log").exists());
+    }
+
+    #[test]
+    fn save_context_reports_what_it_could_not_save() {
+        // --save-context is a request for files, and the run goes on to pass
+        // whether or not they arrived. A copy that fails therefore has to come
+        // back to the caller to be printed: reported only through `tracing`,
+        // it was invisible unless the user happened to pass `-d`, so a
+        // debugging session spent on a run was followed by an empty directory
+        // and nothing saying why.
+        let contexts = TempDir::new().unwrap();
+        let ctx = contexts.path().join("test_blocked");
+        fs::create_dir_all(cwd_dir(&ctx)).unwrap();
+        fs::write(cwd_dir(&ctx).join("artifact"), "cwd artifact").unwrap();
+        fs::write(ctx.join("xtrace.log"), "+1: true\n").unwrap();
+        let result = result_in(ctx, "test_blocked");
+
+        // A plain file where this test's directory has to go: nothing can be
+        // created under it, so every copy into it fails.
+        let save = TempDir::new().unwrap();
+        fs::write(save.path().join("test_blocked"), "in the way").unwrap();
+
+        let failures = save_test_context(&result, save.path(), &[]);
+        assert!(
+            failures.iter().any(|m| m.contains("test_blocked")),
+            "a failed save said nothing about it: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn save_context_failure_escapes_the_test_name_it_names() {
+        // The message carries a name the tree chose, and it is printed into
+        // the report next to the test's own verdict — so it goes through
+        // escape_label like every other label (see `output::escape_label`).
+        let contexts = TempDir::new().unwrap();
+        let ctx = contexts.path().join("test_liar");
+        fs::create_dir_all(&ctx).unwrap();
+        let result = result_in(ctx, "test_liar\u{1b}[2K");
+
+        let save = TempDir::new().unwrap();
+        fs::write(save.path().join("test_liar"), "in the way").unwrap();
+
+        let failures = save_test_context(&result, save.path(), &[]);
+        assert!(!failures.is_empty());
+        for message in &failures {
+            assert!(!message.contains('\u{1b}'), "{message}");
+            assert!(message.contains("test_liar\\x1b[2K"), "{message}");
+        }
     }
 
     #[test]
@@ -2686,7 +2766,9 @@ mod tests {
         let result = result_in(ctx, "test_leak");
 
         let save = TempDir::new().unwrap();
-        save_test_context(&result, save.path(), &[]);
+        // A log that is a link reads as missing, not as a failure to save: the
+        // substitution is the test's own and nothing was asked of the host.
+        assert!(save_test_context(&result, save.path(), &[]).is_empty());
 
         // Nothing read through a link: no copy of the secret anywhere, under
         // any of the names it was linked from.
@@ -2732,7 +2814,7 @@ mod tests {
             dump_xtrace_log(&result.name, result.context.as_path());
             crate::diagnostics::print_failure_snippet(&result);
             output::print_test_result_json(&result);
-            save_test_context(&result, &save_dir, &[]);
+            let _ = save_test_context(&result, &save_dir, &[]);
             let _ = tx.send(());
         });
         assert_eq!(
@@ -2865,7 +2947,7 @@ mod tests {
         }];
 
         let save = TempDir::new().unwrap();
-        save_test_context(&result, save.path(), &submounts);
+        assert!(save_test_context(&result, save.path(), &submounts).is_empty());
 
         // Nothing escaped the save dir.
         assert_eq!(fs::read_to_string(&victim_file).unwrap(), "original");
