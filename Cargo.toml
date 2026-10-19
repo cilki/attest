@@ -6,12 +6,6 @@ license = "Unlicense"
 name = "attest"
 version = "0.6.0"
 
-[features]
-default = ["cgroup"]
-
-# Track test resource usage with cgroups
-cgroup = []
-
 [dependencies]
 anyhow = "1.0.100"
 libc = "0.2"

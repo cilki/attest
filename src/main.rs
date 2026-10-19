@@ -1,4 +1,3 @@
-#[cfg(feature = "cgroup")]
 mod cgroup;
 mod diagnostics;
 mod discovery;
@@ -127,7 +126,6 @@ struct Cli {
     no_overlay: bool,
 
     /// Disable cgroup resource tracking
-    #[cfg(feature = "cgroup")]
     #[arg(long)]
     no_cgroups: bool,
 
@@ -520,7 +518,6 @@ fn main() -> anyhow::Result<()> {
                 fuzz: cli.fuzz,
                 shebang: cli.shebang,
                 no_overlay: cli.no_overlay,
-                #[cfg(feature = "cgroup")]
                 no_cgroups: cli.no_cgroups,
             };
 

@@ -203,7 +203,7 @@ fn needs_escape(byte: u8) -> bool {
 /// resource, off by default, is what "overrides the mapping of C1 control
 /// characters (code 128-159) to treat them as printable" — and the VTE-based
 /// terminals do the same. So escaping only `ESC` leaves the whole of
-/// [`write_log_err`]'s job undone: `\u{9b}2K` erases a line just as `\x1b[2K`
+/// [`replay_log_err`]'s job undone: `\u{9b}2K` erases a line just as `\x1b[2K`
 /// does.
 ///
 /// `0xc2` can never be a continuation byte (those are `0x80..=0xbf`), so the
@@ -502,7 +502,6 @@ fn strace_logs(context: &Path) -> BTreeMap<String, LogField> {
 
 /// Whichever resource numbers the cgroup actually reported, or `null` when no
 /// stats were collected for the test at all.
-#[cfg(feature = "cgroup")]
 fn resource_stats_json(stats: Option<&crate::cgroup::ResourceStats>) -> Value {
     let Some(r) = stats else {
         return Value::Null;
@@ -538,11 +537,6 @@ impl serde::Serialize for TestResultJson<'_> {
             Outcome::Fail => "fail",
             Outcome::Timeout => "timeout",
         };
-        #[cfg(feature = "cgroup")]
-        let resources = resource_stats_json(result.resources.as_ref());
-        #[cfg(not(feature = "cgroup"))]
-        let resources = Value::Null;
-
         let mut map = serializer.serialize_map(None)?;
         map.serialize_entry("name", &result.name)?;
         map.serialize_entry("file", &result.source_path.display().to_string())?;
@@ -551,7 +545,7 @@ impl serde::Serialize for TestResultJson<'_> {
         map.serialize_entry("stdout", &LogField(result.context.join("stdout.log")))?;
         map.serialize_entry("xtrace", &LogField(result.context.join("xtrace.log")))?;
         map.serialize_entry("strace", &strace_logs(&result.context))?;
-        map.serialize_entry("resources", &resources)?;
+        map.serialize_entry("resources", &resource_stats_json(result.resources.as_ref()))?;
         map.end()
     }
 }
@@ -587,13 +581,11 @@ fn result_line(result: &TestResult) -> String {
 
 pub fn print_test_result(result: &TestResult) {
     outln!("{}", result_line(result));
-    #[cfg(feature = "cgroup")]
     if let Some(ref r) = result.resources {
         print_resource_stats(r);
     }
 }
 
-#[cfg(feature = "cgroup")]
 fn print_resource_stats(r: &crate::cgroup::ResourceStats) {
     let mut parts: Vec<String> = Vec::new();
 
@@ -628,7 +620,6 @@ fn print_resource_stats(r: &crate::cgroup::ResourceStats) {
     }
 }
 
-#[cfg(feature = "cgroup")]
 fn format_bytes(b: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = 1024 * KIB;
@@ -774,7 +765,6 @@ mod tests {
             duration: Duration::from_millis(1500),
             context: context.to_path_buf(),
             source_path: PathBuf::from("/repo/a b.test"),
-            #[cfg(feature = "cgroup")]
             resources: None,
         }
     }
@@ -962,20 +952,28 @@ mod tests {
         assert_eq!(parsed["stdout"], json!(""));
     }
 
-    #[cfg(feature = "cgroup")]
     #[test]
     fn json_resources_omit_what_the_cgroup_did_not_report() {
-        // An unavailable controller must not be reported as a real zero.
-        let stats = crate::cgroup::ResourceStats {
+        // An unavailable controller must not be reported as a real zero, so
+        // the keys it would have filled are absent from the object rather
+        // than present and zero. Asserted through the emitted line, which is
+        // the only thing a consumer ever sees.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut result = result_in(tmp.path(), "test_stats");
+        result.resources = Some(crate::cgroup::ResourceStats {
             cpu_user_usec: Some(120),
             memory_peak: Some(4096),
             ..Default::default()
-        };
+        });
         assert_eq!(
-            resource_stats_json(Some(&stats)),
+            test_result_json(&result)["resources"],
             json!({ "cpu_user_usec": 120, "memory_peak": 4096 })
         );
-        assert_eq!(resource_stats_json(None), Value::Null);
+
+        // No cgroup at all is `null`, not an empty object: a consumer can tell
+        // "nothing was measured" from "measured and reported nothing".
+        result.resources = None;
+        assert_eq!(test_result_json(&result)["resources"], Value::Null);
     }
 
     fn display_with(total: usize, results: Vec<bool>) -> StatusDisplay {

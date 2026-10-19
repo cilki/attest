@@ -242,7 +242,6 @@ pub struct TestResult {
     pub duration: Duration,
     pub context: PathBuf,
     pub source_path: PathBuf,
-    #[cfg(feature = "cgroup")]
     pub resources: Option<crate::cgroup::ResourceStats>,
 }
 
@@ -261,7 +260,6 @@ struct PendingTest {
     /// `None` after the path has been transferred to `TestResult`.
     context: Option<PathBuf>,
     source_path: PathBuf,
-    #[cfg(feature = "cgroup")]
     cgroup: Option<crate::cgroup::TestCgroup>,
 }
 
@@ -278,7 +276,6 @@ impl PendingTest {
     /// never be misdirected, still runs. (`Child::kill` is no help as a guard:
     /// it quietly succeeds on an already-waited-for child.)
     fn kill_tree(&mut self) {
-        #[cfg(feature = "cgroup")]
         if let Some(ref cg) = self.cgroup {
             cg.kill_all();
         }
@@ -421,7 +418,6 @@ pub struct RunConfig {
     pub shebang: Option<String>,
     /// Disable overlayfs isolation; run each test directly in the working directory.
     pub no_overlay: bool,
-    #[cfg(feature = "cgroup")]
     pub no_cgroups: bool,
 }
 
@@ -660,14 +656,11 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
         let running: Vec<(&str, Duration)> = pending_list
             .iter()
             .map(|p| {
-                #[cfg(feature = "cgroup")]
                 let duration = p
                     .cgroup
                     .as_ref()
                     .and_then(|cg| cg.read_cpu_time())
                     .unwrap_or_else(|| p.start.elapsed());
-                #[cfg(not(feature = "cgroup"))]
-                let duration = p.start.elapsed();
                 (p.name.as_str(), duration)
             })
             .collect();
@@ -820,7 +813,6 @@ fn spawn_test(
     // script's shebang nor looks the shell up on PATH again.
     let shell = env.shell_override.as_deref().unwrap_or(&spec.file.shell);
 
-    #[cfg(feature = "cgroup")]
     let cgroup = if config.no_cgroups {
         None
     } else {
@@ -865,7 +857,6 @@ fn spawn_test(
     // live threads (status-bar ticker), so the hook must not allocate:
     // add_self_to is async-signal-safe and the path CString is built here.
     // TODO don't include test setup in cgroup
-    #[cfg(feature = "cgroup")]
     if let Some(ref cg) = cgroup
         && let Some(procs) = cg.procs_cstring()
     {
@@ -904,7 +895,6 @@ fn spawn_test(
         start,
         context: Some(context),
         source_path: source_path_owned,
-        #[cfg(feature = "cgroup")]
         cgroup,
     })
 }
@@ -922,7 +912,6 @@ fn build_result(mut pending: PendingTest, status: ExitStatus) -> TestResult {
     };
 
     // Read stats before dropping cgroup (which removes the directory).
-    #[cfg(feature = "cgroup")]
     let resources = pending.cgroup.as_ref().map(|cg| cg.read_stats());
 
     TestResult {
@@ -931,7 +920,6 @@ fn build_result(mut pending: PendingTest, status: ExitStatus) -> TestResult {
         duration,
         context: pending.context.take().unwrap(),
         source_path: pending.source_path.clone(),
-        #[cfg(feature = "cgroup")]
         resources,
     }
     // pending drops here: reaped=true skips kill/wait, tmp_dir=None skips
@@ -1420,7 +1408,6 @@ mod tests {
             duration: Duration::from_millis(1),
             context,
             source_path: PathBuf::from("t.sh"),
-            #[cfg(feature = "cgroup")]
             resources: None,
         }
     }

@@ -305,8 +305,7 @@ off, so a test asserting on a pipeline must set it itself (see
   shebang (e.g. `/bin/bash`, `/usr/bin/zsh`)
 - `--json` — print results as JSONL (one JSON object per test) instead of the
   colored terminal output
-- `--no-cgroups` — disable cgroup resource tracking (only present when built with
-  the `cgroup` feature)
+- `--no-cgroups` — disable cgroup resource tracking
 - `-d`, `--debug` — enable debug logging
 
 ## Building and running
