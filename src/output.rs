@@ -342,9 +342,13 @@ impl StatusDisplay {
 
     /// Update the status line with the result strip plus the currently running
     /// tests and their elapsed times.
-    pub fn update(&self, running: &[(&str, Duration)], completed: usize) {
+    ///
+    /// How many tests have finished is [`StatusDisplay::record`]'s to say, not
+    /// the caller's: the bar's position was set from the caller's own count of
+    /// results as well, which is the same number by construction and one more
+    /// thing to keep that way.
+    pub fn update(&self, running: &[(&str, Duration)]) {
         if let Some(ref bar) = self.bar {
-            bar.set_position(completed as u64);
             let running_msg: String = running
                 .iter()
                 .map(|(name, elapsed)| {

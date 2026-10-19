@@ -112,6 +112,18 @@ impl Drop for ChildWaiter {
 }
 
 /// The test whose xtrace.log is currently being tailed to stderr.
+///
+/// Live xtrace streaming (`-vv`) gives this to one test at a time, so
+/// concurrent traces never interleave; the run loop holds `Option<Tailed>`,
+/// `None` meaning nobody has it. A test that finishes without ever having
+/// held it gets its whole log dumped instead (see [`finish_xtrace`]).
+///
+/// Whether the run streams at all is `config.verbose >= 2`, read from there
+/// by the two sites that hand the tail out and take it back. Recording it a
+/// second time as well — a `Some` streamer wrapped around this one `Option` —
+/// made every site unwrap two layers to reach the question it was asking, and
+/// left the run loop holding a copy of a flag it is given, next to the
+/// `config.verbose < 2` the failure report reads straight off `config`.
 struct Tailed {
     /// Name of the test holding the xtrace output lock.
     name: String,
@@ -120,46 +132,24 @@ struct Tailed {
     offset: u64,
 }
 
-/// Live xtrace streaming: at most one test at a time has its xtrace.log tailed
-/// to stderr, so concurrent traces never interleave.
-struct XtraceStreamer {
-    /// `None` while no test holds the xtrace output lock.
-    tailed: Option<Tailed>,
-}
-
-impl XtraceStreamer {
-    fn new() -> Self {
-        Self { tailed: None }
-    }
-
-    fn is_idle(&self) -> bool {
-        self.tailed.is_none()
-    }
-
-    /// Start tailing a test's xtrace.log if no other test holds the lock.
-    fn try_acquire(&mut self, pending: &PendingTest) {
-        if self.tailed.is_some() {
-            return;
-        }
+impl Tailed {
+    /// Start tailing `pending`'s xtrace.log. `None` when it cannot be opened
+    /// yet: the test's own shell creates the file as it starts up, so a
+    /// freshly spawned test may not have one for the first tick or two.
+    fn open(pending: &PendingTest) -> Option<Self> {
         let xtrace_path = pending.context.as_ref().unwrap().join("xtrace.log");
-        if let Ok(file) = overlay::open_nofollow(&xtrace_path) {
-            errln!(
-                "{DIM}--- xtrace: {} ---{RESET}",
-                output::escape_label(&pending.name)
-            );
-            self.tailed = Some(Tailed {
-                name: pending.name.clone(),
-                file,
-                offset: 0,
-            });
-        }
+        let file = overlay::open_nofollow(&xtrace_path).ok()?;
+        xtrace_header(&pending.name);
+        Some(Self {
+            name: pending.name.clone(),
+            file,
+            offset: 0,
+        })
     }
 
     /// Check whether the tailed xtrace.log has grown since the last flush.
     fn has_new(&self) -> bool {
-        self.tailed
-            .as_ref()
-            .is_some_and(|t| t.file.metadata().is_ok_and(|m| m.len() > t.offset))
+        self.file.metadata().is_ok_and(|m| m.len() > self.offset)
     }
 
     /// Print any bytes appended to the tailed xtrace.log since the last flush.
@@ -168,30 +158,39 @@ impl XtraceStreamer {
     /// in the file is all of it. Until then a trailing [`output::C1_LEAD`] is
     /// left unconsumed and re-read next time (see [`output::replay_log_err`]).
     fn flush_new(&mut self, last: bool) {
-        let Some(t) = self.tailed.as_mut() else {
-            return;
-        };
-        if t.file.seek(SeekFrom::Start(t.offset)).is_err() {
+        if self.file.seek(SeekFrom::Start(self.offset)).is_err() {
             return;
         }
-        t.offset += output::replay_log_err(&mut t.file, last);
-    }
-
-    /// Settle a finished test's trace output: flush and release the lock if it
-    /// was the one being tailed, otherwise dump its whole log (it finished
-    /// before the parent could open the file).
-    fn finish(&mut self, pending: &PendingTest) {
-        if self.tailed.as_ref().is_some_and(|t| t.name == pending.name) {
-            self.flush_new(true);
-            self.tailed = None;
-        } else {
-            dump_xtrace_log(&pending.name, pending.context.as_ref().unwrap());
-        }
+        self.offset += output::replay_log_err(&mut self.file, last);
     }
 }
 
-/// Print a test's full xtrace.log, dimmed, under a `--- xtrace: <name> ---`
-/// header. Silent if the log is missing or empty.
+/// Settle a finished test's trace output under `-vv`: flush and release the
+/// tail if this was the test holding it, otherwise dump its whole log (it
+/// never got the tail, because another test held it or because it finished
+/// before the parent could open the file).
+fn finish_xtrace(tailed: &mut Option<Tailed>, pending: &PendingTest) {
+    match tailed {
+        Some(t) if t.name == pending.name => {
+            t.flush_new(true);
+            *tailed = None;
+        }
+        _ => dump_xtrace_log(&pending.name, pending.context.as_ref().unwrap()),
+    }
+}
+
+/// The `--- xtrace: <name> ---` header a trace is announced by, whether it is
+/// being tailed live or dumped whole.
+///
+/// The name is the test's own, so it goes out escaped: a shell takes almost
+/// anything as a function name, and raw those bytes are terminal commands (see
+/// [`output::escape_label`]).
+fn xtrace_header(name: &str) {
+    errln!("{DIM}--- xtrace: {} ---{RESET}", output::escape_label(name));
+}
+
+/// Print a test's full xtrace.log, dimmed, under an [`xtrace_header`]. Silent
+/// if the log is missing or empty.
 ///
 /// The log is whatever the test and the programs it ran wrote to stderr, so it
 /// goes out through [`output::replay_log_err`] rather than being replayed
@@ -210,7 +209,7 @@ fn dump_xtrace_log(name: &str, context: &Path) {
     if !log.metadata().is_ok_and(|m| m.len() > 0) {
         return;
     }
-    errln!("{DIM}--- xtrace: {} ---{RESET}", output::escape_label(name));
+    xtrace_header(name);
     output::replay_log_err(&mut log, true);
 }
 
@@ -475,11 +474,10 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0xdeadbeef_cafebabe);
-    let mut xtrace = if config.verbose >= 2 {
-        Some(XtraceStreamer::new())
-    } else {
-        None
-    };
+    // Whichever test currently has its xtrace streamed to the terminal, under
+    // `-vv`. Nothing else records that `-vv` was asked for: every site below
+    // reads `config.verbose` for itself, the way the failure report does.
+    let mut tailed: Option<Tailed> = None;
     // Shared by every failure report in the run: a file is read and parsed the
     // first time one of its tests fails, not once per failing test.
     let mut sources = crate::diagnostics::SourceCache::default();
@@ -563,10 +561,10 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
         }
 
         // Stream xtrace output from the current holder.
-        if let Some(ref mut xt) = xtrace
-            && xt.has_new()
+        if let Some(t) = tailed.as_mut()
+            && t.has_new()
         {
-            status.suspend(|| xt.flush_new(false));
+            status.suspend(|| t.flush_new(false));
         }
 
         // Kill any tests that have exceeded the wall-clock timeout.
@@ -601,8 +599,8 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
                 }
                 Err(e) => return Err(anyhow!("reaping test child failed: {e}")),
             };
-            if let Some(ref mut xt) = xtrace {
-                status.suspend(|| xt.finish(&pending_list[i]));
+            if config.verbose >= 2 {
+                status.suspend(|| finish_xtrace(&mut tailed, &pending_list[i]));
             }
             let pending = pending_list.remove(i);
             if bail_flag {
@@ -650,12 +648,12 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
             break;
         }
 
-        // If xtrace lock is free, acquire the next pending test.
-        if let Some(ref mut xt) = xtrace
-            && xt.is_idle()
+        // If the xtrace tail is free, hand it to the next pending test.
+        if config.verbose >= 2
+            && tailed.is_none()
             && let Some(p) = pending_list.first()
         {
-            status.suspend(|| xt.try_acquire(p));
+            status.suspend(|| tailed = Tailed::open(p));
         }
 
         // Update status line with currently running tests.
@@ -673,7 +671,7 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
                 (p.name.as_str(), duration)
             })
             .collect();
-        status.update(&running, results.len());
+        status.update(&running);
 
         waiter.wait(POLL_INTERVAL);
     }
@@ -2128,30 +2126,28 @@ mod tests {
         let log = tmp.path().join("xtrace.log");
         fs::write(&log, b"+1: payload\xc2").unwrap();
 
-        let mut streamer = XtraceStreamer::new();
-        streamer.tailed = Some(Tailed {
+        let mut tailed = Tailed {
             name: "test_split".to_string(),
             file: overlay::open_nofollow(&log).unwrap(),
             offset: 0,
-        });
+        };
 
-        streamer.flush_new(false);
-        let consumed = streamer.tailed.as_ref().unwrap().offset;
+        tailed.flush_new(false);
         assert_eq!(
-            consumed, 11,
+            tailed.offset, 11,
             "the trailing \\xc2 was printed before its second byte arrived"
         );
 
         // The second half lands: the pair is now sanitized together.
         fs::write(&log, b"+1: payload\xc2\x9b2K").unwrap();
-        streamer.flush_new(false);
-        assert_eq!(streamer.tailed.as_ref().unwrap().offset, 15);
+        tailed.flush_new(false);
+        assert_eq!(tailed.offset, 15);
 
         // Once the test is done there is no more to wait for, so a log that
         // really does end in a lone `\xc2` is not held back forever.
         fs::write(&log, b"+1: payload\xc2\x9b2K\xc2").unwrap();
-        streamer.flush_new(true);
-        assert_eq!(streamer.tailed.as_ref().unwrap().offset, 16);
+        tailed.flush_new(true);
+        assert_eq!(tailed.offset, 16);
     }
 
     #[test]
