@@ -228,10 +228,14 @@ fn split_path_arg(arg: &str) -> (PathBuf, Option<String>) {
 fn parse_discovered(
     files: Vec<PathBuf>,
     explicit_file: bool,
+    cores: Cores,
 ) -> anyhow::Result<Vec<parser::TestFile>> {
     let mut parsed = Vec::with_capacity(files.len());
-    for file in files {
-        match parser::parse_test_file(&file) {
+    // Reported here, on this thread and in discovery order, however the parse
+    // was spread: which file was skipped is part of what the run covers, so
+    // the warnings have to read the same way from one run to the next.
+    for result in parse_each(&files, cores) {
+        match result {
             Ok(test_file) => parsed.push(test_file),
             Err(e) if explicit_file => return Err(e),
             // Printed directly rather than logged: dropping a file changes
@@ -248,6 +252,96 @@ fn parse_discovered(
         }
     }
     Ok(parsed)
+}
+
+/// How much of the machine a parse may use.
+///
+/// Not a question of taste. Parsing a tree is embarrassingly parallel, but
+/// the threads that would do it are not free once they are done: creating one
+/// leaves the process multi-threaded for good — glibc keeps the worker's
+/// stack mapped for reuse and stops taking its single-threaded paths — and
+/// the `fork(2)` behind every spawned test is measurably dearer afterwards.
+/// Measured on a tree of 100 small files holding 500 tests, the spawns alone
+/// went from ~390ms to ~450ms, which is ten times the 7ms the parallel parse
+/// had saved there.
+///
+/// So the choice is made by what follows the parse, not by how big the parse
+/// is: [`Cores::All`] where nothing is going to be forked per test,
+/// [`Cores::One`] where a run is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Cores {
+    /// Take the machine. `list` and shell completion print what they found and
+    /// exit, so the parse is the whole of their latency and nothing afterwards
+    /// pays for the threads.
+    All,
+    /// Stay on this thread: a run follows, and it `fork`s once per test.
+    One,
+}
+
+/// Parse every file in `files`, one result per file and in the same order.
+///
+/// Where the time goes once a tree holds scripts of any size:
+/// `brush_parser` costs a few microseconds a line, the walk hands it every
+/// script that could hold a test, and on 60 scripts of 450 lines the parse
+/// was 95% of what `attest list` spent — all of it on one core. A file's
+/// parse neither needs nor affects any other file's, so with [`Cores::All`]
+/// they go out to as many workers as the machine has. The one thing two
+/// parses share, the `PATH` lookup behind [`discovery::script_shell`], is
+/// already answered once per shell name under a lock.
+///
+/// Order is restored afterwards rather than preserved by the scheduling:
+/// files are claimed one at a time as workers come free, since a tree's
+/// scripts differ in length by orders of magnitude and a fixed split would
+/// leave whoever drew the big ones parsing alone.
+fn parse_each(files: &[PathBuf], cores: Cores) -> Vec<anyhow::Result<parser::TestFile>> {
+    let workers = match cores {
+        Cores::One => 1,
+        Cores::All => std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(files.len()),
+    };
+    if workers <= 1 {
+        return files.iter().map(|f| parser::parse_test_file(f)).collect();
+    }
+
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut parsed: Vec<(usize, anyhow::Result<parser::TestFile>)> =
+        Vec::with_capacity(files.len());
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (1..workers)
+            .map(|_| scope.spawn(|| parse_claimed(files, &next)))
+            .collect();
+        // This thread is one of the workers: spawning `workers` of them and
+        // then only waiting would leave a core to the scheduler's discretion.
+        parsed.extend(parse_claimed(files, &next));
+        for handle in handles {
+            match handle.join() {
+                Ok(done) => parsed.extend(done),
+                // A worker panicking is this parse panicking: there is no
+                // partial set of files to go on with, and swallowing it would
+                // turn a bug into a run that silently covers less.
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+    });
+    parsed.sort_by_key(|&(i, _)| i);
+    parsed.into_iter().map(|(_, result)| result).collect()
+}
+
+/// Parse files out of `files` until they run out, each tagged with its index
+/// so the caller can put the answers back in discovery order.
+fn parse_claimed(
+    files: &[PathBuf],
+    next: &std::sync::atomic::AtomicUsize,
+) -> Vec<(usize, anyhow::Result<parser::TestFile>)> {
+    let mut done = Vec::new();
+    loop {
+        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let Some(file) = files.get(i) else {
+            return done;
+        };
+        done.push((i, parser::parse_test_file(file)));
+    }
 }
 
 /// What a positional target plus an optional `--filter` select.
@@ -272,9 +366,17 @@ impl Selection {
     /// Resolve `target` and `filter`: split the target, discover and parse what
     /// its path half names, and take the name half as the filter unless
     /// `--filter` gave one explicitly.
-    fn resolve(target: &str, filter: Option<String>) -> anyhow::Result<Self> {
+    ///
+    /// `cores` only says how fast to get there, never what is found: the
+    /// selection a run resolves and the one `list` prints have to be the same
+    /// one (see [`Cores`] for why they ask for different amounts of machine).
+    fn resolve(target: &str, filter: Option<String>, cores: Cores) -> anyhow::Result<Self> {
         let (path, inline_filter) = split_path_arg(target);
-        let files = parse_discovered(discovery::discover_test_files(&path)?, path.is_file())?;
+        let files = parse_discovered(
+            discovery::discover_test_files(&path)?,
+            path.is_file(),
+            cores,
+        )?;
         Ok(Self {
             path,
             filter: filter.or(inline_filter),
@@ -363,9 +465,14 @@ fn complete_tests(current: &std::ffi::OsStr, arg: Completing) -> Vec<CompletionC
     // on it (`parser::wildcard_match`).
     let name_only = arg == Completing::Filter && !typed.contains('/');
 
+    // Spread over the machine, because nothing here forks afterwards: a tab is
+    // a keystroke, and parsing the tree is the whole of what the wait is (see
+    // `parse_each`).
+    let parsed = parse_each(&files, Cores::All);
+
     let mut candidates = Vec::new();
     let mut offered_names = std::collections::HashSet::new();
-    for file in &files {
+    for (file, test_file) in files.iter().zip(parsed) {
         let path = parser::selector_path(file);
         if path.starts_with(&typed) {
             candidates.push(CompletionCandidate::new(match arg {
@@ -377,7 +484,7 @@ fn complete_tests(current: &std::ffi::OsStr, arg: Completing) -> Vec<CompletionC
                 Completing::Filter => format!("{path}/"),
             }));
         }
-        let Ok(test_file) = parser::parse_test_file(file) else {
+        let Ok(test_file) = test_file else {
             continue;
         };
         for name in &test_file.tests {
@@ -435,7 +542,7 @@ fn main() -> anyhow::Result<()> {
             output::write_out(include_str!("../SKILL.md").as_bytes());
         }
         Some(Commands::List { path, filter }) => {
-            let selection = Selection::resolve(&path, filter)?;
+            let selection = Selection::resolve(&path, filter, Cores::All)?;
             let tests: Vec<(&Path, &str)> = selection
                 .tests()
                 .into_iter()
@@ -449,7 +556,7 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             });
 
-            let selection = Selection::resolve(&path_arg, cli.filter)?;
+            let selection = Selection::resolve(&path_arg, cli.filter, Cores::One)?;
             let selected = selection.tests();
             if selected.is_empty() {
                 return Err(selection.nothing_selected());
@@ -566,7 +673,7 @@ mod tests {
         let broken = script(tmp.path(), "broken.sh", BROKEN);
         let good = script(tmp.path(), "good.test", GOOD);
 
-        let parsed = parse_discovered(vec![broken, good.clone()], false)
+        let parsed = parse_discovered(vec![broken, good.clone()], false, Cores::One)
             .expect("one bad script must not abort a directory run");
 
         // Only the file that parsed is kept, and it knows where it came from.
@@ -580,10 +687,54 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let broken = script(tmp.path(), "broken.sh", BROKEN);
 
-        let Err(err) = parse_discovered(vec![broken], true) else {
+        let Err(err) = parse_discovered(vec![broken], true, Cores::One) else {
             panic!("a file the user named must not be skipped silently");
         };
         assert!(err.to_string().starts_with("parse error in "), "{err}");
+    }
+
+    /// Spreading the parse over the cores may change how long it takes and
+    /// nothing else: every file still gets exactly one answer, in the order
+    /// the walk turned it up, however the workers happened to pick them off.
+    ///
+    /// Asserted over a mix a tree really contains — files that parse, files
+    /// that parse and hold nothing, files that do not parse — and over enough
+    /// of them that the claims interleave, since with one file per worker the
+    /// scheduling could never put an answer out of place.
+    #[test]
+    fn a_parse_spread_over_the_cores_answers_exactly_as_one_thread_would() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bodies = [GOOD, BROKEN, BROKEN_WITHOUT_TESTS];
+        let files: Vec<PathBuf> = (0..60)
+            .map(|i| script(tmp.path(), &format!("f{i:02}.sh"), bodies[i % bodies.len()]))
+            .collect();
+
+        let spread = parse_each(&files, Cores::All);
+        let one = parse_each(&files, Cores::One);
+        assert_eq!(spread.len(), files.len());
+        assert_eq!(one.len(), files.len());
+
+        for ((file, spread), one) in files.iter().zip(&spread).zip(&one) {
+            match (spread, one) {
+                (Ok(spread), Ok(one)) => {
+                    // The answer is the one for *this* file, not merely some
+                    // file's: a lost index would otherwise pass unnoticed as
+                    // long as the multiset of answers came out right.
+                    assert_eq!(&spread.path, file);
+                    assert_eq!(&one.path, file);
+                    assert_eq!(spread.tests, one.tests);
+                    assert_eq!(spread.script, one.script);
+                    assert_eq!(spread.shell, one.shell);
+                }
+                (Err(spread), Err(one)) => assert_eq!(spread.to_string(), one.to_string()),
+                (spread, one) => panic!(
+                    "{} parsed on {} threads but not on {}",
+                    file.display(),
+                    if spread.is_ok() { "many" } else { "one" },
+                    if one.is_ok() { "one" } else { "many" },
+                ),
+            }
+        }
     }
 
     /// A script that spells no test function at all is never handed to the
@@ -596,7 +747,7 @@ mod tests {
         let broken = script(tmp.path(), "broken.sh", BROKEN_WITHOUT_TESTS);
 
         for named in [true, false] {
-            let parsed = parse_discovered(vec![broken.clone()], named)
+            let parsed = parse_discovered(vec![broken.clone()], named, Cores::One)
                 .expect("a script with no test in it must not fail a run");
             assert_eq!(parsed.len(), 1);
             assert!(parsed[0].tests.is_empty());

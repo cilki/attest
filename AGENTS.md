@@ -16,7 +16,17 @@
   and the file skipped, so an unparseable script elsewhere in the tree cannot
   abort the run. A file that spells no test function is never parsed at all,
   so it is never reported either — named or walked, it holds no test and that
-  is the answer the run gives. Shell completion is dynamic (`clap_complete`'s `CompleteEnv`,
+  is the answer the run gives. How much of the machine that parse gets is
+  `parse_each`'s `Cores` argument, and it is decided by what *follows* the
+  parse rather than by how big it is: a file's parse is independent of every
+  other file's, but creating a thread leaves the process multi-threaded for
+  good and the `fork(2)` behind every spawned test is measurably dearer
+  afterwards. So `list` and completion take every core (they print and exit,
+  and the parse is the whole of their latency — 2.3x on a tree of 60
+  450-line scripts) while a run keeps the parse on one thread, where the
+  thousand-odd forks of a real suite would cost more than it saved.
+  Whichever way it is spread, each file gets exactly one answer and the
+  warnings come out on the main thread in discovery order. Shell completion is dynamic (`clap_complete`'s `CompleteEnv`,
   so `COMPLETE=<shell> attest` prints the completion script):
   `complete_tests` discovers script files and parses them to complete
   `<file>/<test>` pairs for the target and `--filter`. The file/test split
