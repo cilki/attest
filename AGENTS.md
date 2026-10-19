@@ -23,7 +23,18 @@
   decides only *where to look* — one named file, or everything the walk turns
   up — and from there completion is a prefix match against
   `parser::selector`, so a completed selector is the same string `list` prints
-  and `TestPattern::parse` reads back.
+  and `TestPattern::parse` reads back. A whole selector means the same to both
+  arguments, but nothing shorter does, so `Completing` says which one is being
+  completed: a target is a *path* on its left (`split_path_arg` only splits
+  where that half is an existing file), while `--filter` is a `TestPattern`,
+  where an argument with no `/` is all name and a file needs the trailing `/`
+  to be the file half. So the filter also completes bare test names (the form
+  `--filter` exists for, which no selector can extend since every one of them
+  starts with a file path) and completes a file to `a/x.test/` rather than
+  `a/x.test` — which as a pattern is the name `x.test` under the directory `a`
+  and selects nothing. A target gets neither: a bare name is not a path, and
+  completing to one would hand back an argument that fails with "path does not
+  exist".
 - `src/discovery.rs` - Finds test files from a file path or directory
   (recursive). Scans all shell scripts (by extension or shebang) for test
   functions, not just `.test` files. Owns every rule about shebangs and

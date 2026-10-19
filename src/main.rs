@@ -52,7 +52,7 @@ struct Cli {
     command: Option<Commands>,
 
     /// Test target: a file, directory, or `<file>/<test>` pattern
-    #[arg(add = ArgValueCompleter::new(complete_tests))]
+    #[arg(add = ArgValueCompleter::new(complete_target))]
     path: Option<String>,
 
     /// Maximum number of tests to run in parallel
@@ -61,7 +61,7 @@ struct Cli {
 
     /// Filter tests by pattern: `[<file>/]<name>` where `<name>` supports `*` wildcards and
     /// plain names match as prefixes (e.g. `foo.sh/test_net*`)
-    #[arg(long, add = ArgValueCompleter::new(complete_tests))]
+    #[arg(long, add = ArgValueCompleter::new(complete_filter))]
     filter: Option<String>,
 
     /// Copy each test's logs, filesystem delta and working directory into DIR
@@ -141,12 +141,12 @@ enum Commands {
     /// List test functions without running them
     List {
         /// Test target: a file, directory, or `<file>/<test>` pattern
-        #[arg(add = ArgValueCompleter::new(complete_tests))]
+        #[arg(add = ArgValueCompleter::new(complete_target))]
         path: String,
 
         /// Filter tests by pattern: `[<file>/]<name>` where `<name>` supports `*` wildcards and
         /// plain names match as prefixes (e.g. `foo.sh/test_net*`)
-        #[arg(long, add = ArgValueCompleter::new(complete_tests))]
+        #[arg(long, add = ArgValueCompleter::new(complete_filter))]
         filter: Option<String>,
     },
     /// Print AI agent skill for writing .test files
@@ -305,6 +305,22 @@ impl Selection {
     }
 }
 
+/// Which argument is being completed.
+///
+/// Both accept a whole `<file>/<test>` selector, and for that much they
+/// complete identically. Anything short of one they read differently, so it
+/// cannot be offered to both: a positional target is a *path* on its left
+/// (`split_path_arg` only splits where that half is an existing file), while
+/// `--filter` is a [`parser::TestPattern`], where an argument with no `/` in it
+/// is all *name* and a file needs the trailing `/` to be the file half.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Completing {
+    /// The positional target of a run or of `list`.
+    Target,
+    /// A `--filter` value.
+    Filter,
+}
+
 /// Complete a positional target or a `--filter` value: the discovered script
 /// files, plus the `<file>/<test>` selectors in them, that extend what has been
 /// typed so far.
@@ -324,7 +340,16 @@ impl Selection {
 /// selected nothing. The same `./` kept the file-name half from matching
 /// anything at all, since the selectors it was compared against never carry
 /// the marker.
-fn complete_tests(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+///
+/// What a completed *selector* means is the same for both, but what anything
+/// shorter means is not (see [`Completing`]), and offering a target's
+/// candidates for a filter handed back filters that select nothing:
+/// `--filter testHel<TAB>` — the bare-name form that is the whole point of
+/// `--filter` — offered nothing at all, because every candidate began with a
+/// file path, and `--filter examples/md5<TAB>` completed to
+/// `examples/md5sum.test`, which as a pattern is the *name* `md5sum.test` in
+/// the directory `examples` and matches no test in the tree.
+fn complete_tests(current: &std::ffi::OsStr, arg: Completing) -> Vec<CompletionCandidate> {
     let current = current.to_string_lossy();
     // What has been typed is compared against selectors, so it goes through
     // the same `./` rule they do rather than a second spelling of it.
@@ -335,11 +360,24 @@ fn complete_tests(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
         None => discovery::discover_test_files(Path::new(".")).unwrap_or_default(),
     };
 
+    // A filter with no `/` left in it is all name, so a name is what is being
+    // typed — and the prefix match below is the one `--filter` itself performs
+    // on it (`parser::wildcard_match`).
+    let name_only = arg == Completing::Filter && !typed.contains('/');
+
     let mut candidates = Vec::new();
+    let mut offered_names = std::collections::HashSet::new();
     for file in &files {
         let path = parser::selector_path(file);
         if path.starts_with(&typed) {
-            candidates.push(CompletionCandidate::new(&path));
+            candidates.push(CompletionCandidate::new(match arg {
+                Completing::Target => path.clone(),
+                // The path alone is a name pattern to `--filter`; the trailing
+                // `/` is what makes it the file half, and it also stops the
+                // shell putting a space after a completion a test name still
+                // has to be typed onto.
+                Completing::Filter => format!("{path}/"),
+            }));
         }
         let Ok(test_file) = parser::parse_test_file(file) else {
             continue;
@@ -349,9 +387,22 @@ fn complete_tests(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
             if selector.starts_with(&typed) {
                 candidates.push(CompletionCandidate::new(selector));
             }
+            // A name can be defined in more than one file, and as a filter it
+            // stands for every one of them, so it is offered once.
+            if name_only && name.starts_with(&typed) && offered_names.insert(name.clone()) {
+                candidates.push(CompletionCandidate::new(name));
+            }
         }
     }
     candidates
+}
+
+fn complete_target(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    complete_tests(current, Completing::Target)
+}
+
+fn complete_filter(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    complete_tests(current, Completing::Filter)
 }
 
 /// Finish the way an ordinary Unix filter does once its reader has gone away.
@@ -587,12 +638,88 @@ mod tests {
         assert!(!pattern.matches(Path::new("./examples/md5sum.test"), "testHelp"));
     }
 
-    /// The selectors `complete_tests` offers in `<file>/<test>` form.
+    /// What completion offers for a positional target.
     fn completions(typed: &str) -> Vec<String> {
-        complete_tests(std::ffi::OsStr::new(typed))
+        candidates_for(typed, Completing::Target)
+    }
+
+    /// What completion offers for a `--filter` value.
+    fn filter_completions(typed: &str) -> Vec<String> {
+        candidates_for(typed, Completing::Filter)
+    }
+
+    fn candidates_for(typed: &str, arg: Completing) -> Vec<String> {
+        complete_tests(std::ffi::OsStr::new(typed), arg)
             .iter()
             .map(|c| c.get_value().to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// Every test in the tree, as completion sees them: the same walk and
+    /// parse, so a candidate can be checked against what it would select.
+    fn discovered_tests() -> Vec<(PathBuf, String)> {
+        discovery::discover_test_files(Path::new("."))
+            .unwrap()
+            .into_iter()
+            .filter_map(|f| parser::parse_test_file(&f).ok())
+            .flat_map(|tf| {
+                tf.tests
+                    .iter()
+                    .map(|n| (tf.path.clone(), n.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Whatever is offered for `--filter` has to be a filter that selects
+    /// something: `--filter` is a `TestPattern`, not a path, so the candidates
+    /// a positional target gets are wrong there in both directions — a bare
+    /// name prefix (the form `--filter` exists for) matched no selector and so
+    /// was offered nothing, and a file path without the trailing `/` reads as
+    /// the *name* pattern of its last component and matches no test at all.
+    #[test]
+    fn every_filter_completion_selects_a_test() {
+        let tests = discovered_tests();
+        assert!(!tests.is_empty(), "expected to run from the package root");
+
+        for typed in [
+            "",
+            "test",
+            "testHel",
+            "examples/md5",
+            "examples/md5sum.test/",
+            "examples/md5sum.test/testHel",
+        ] {
+            let candidates = filter_completions(typed);
+            assert!(!candidates.is_empty(), "nothing offered for `{typed}`");
+            for candidate in candidates {
+                let pattern = parser::TestPattern::parse(&candidate);
+                assert!(
+                    tests.iter().any(|(file, name)| pattern.matches(file, name)),
+                    "`{typed}` offered `{candidate}`, which selects no test",
+                );
+            }
+        }
+    }
+
+    /// A `/`-less `--filter` is all name, so that is what completing one
+    /// offers — `list`'s selector form cannot extend it, since every selector
+    /// starts with a file path.
+    #[test]
+    fn a_bare_filter_prefix_completes_test_names() {
+        let candidates = filter_completions("testHel");
+        assert_eq!(candidates, ["testHelp", "testHello"]);
+    }
+
+    /// A target keeps naming a path: a bare test name is not one, and offering
+    /// it would complete to an argument that fails with "path does not exist".
+    #[test]
+    fn a_target_is_never_completed_to_a_bare_test_name() {
+        assert!(completions("testHel").is_empty());
+        assert!(
+            completions("examples/md5").contains(&"examples/md5sum.test".to_string()),
+            "a target still completes to the file path itself"
+        );
     }
 
     /// A completed selector has to select the test it was completed from —
