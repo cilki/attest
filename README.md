@@ -336,6 +336,13 @@ By default you get a progress bar while the run is in flight, a summary at the
 end, and a report for each failure. Add `-v` if you also want a PASS/FAIL line
 per test.
 
+The report is colored on a terminal and plain anywhere else, so
+`attest . > results.txt`, `attest . | grep '^FAIL'` and a CI log get the words
+without escape sequences wrapped around them. `NO_COLOR` turns the color off
+even on a terminal and `CLICOLOR_FORCE` turns it on even down a pipe (for a CI
+runner that renders ANSI itself). Each stream is decided on its own, so
+`attest . > results.txt` still colors the xtrace it leaves on your terminal.
+
 Control characters in a test or file name are escaped (`\x1b`, `\x0d`, and the
 C1 forms such as `\x9b`, which a terminal in UTF-8 mode obeys just the same)
 wherever that name appears in the report. A shell takes almost anything as a

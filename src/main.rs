@@ -534,7 +534,13 @@ fn main() -> anyhow::Result<()> {
     } else {
         tracing_subscriber::EnvFilter::from_default_env()
     };
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    // The log goes to stderr, so it is styled by the same rule the rest of
+    // what attest writes there is: `attest -d . 2> debug.log` should leave a
+    // log that reads as text.
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_ansi(output::err_palette().is_colored())
+        .init();
 
     let mut any_failed = false;
     match cli.command {

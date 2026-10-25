@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 
 use crate::output;
-use crate::output::{DIM, RESET, errln};
+use crate::output::errln;
 use crate::overlay;
 
 /// Set by the SIGINT/SIGTERM handler. Tests run in their own sessions (see the
@@ -186,7 +186,8 @@ fn finish_xtrace(tailed: &mut Option<Tailed>, pending: &PendingTest) {
 /// anything as a function name, and raw those bytes are terminal commands (see
 /// [`output::escape_label`]).
 fn xtrace_header(name: &str) {
-    errln!("{DIM}--- xtrace: {} ---{RESET}", output::escape_label(name));
+    let output::Palette { dim, reset, .. } = output::err_palette();
+    errln!("{dim}--- xtrace: {} ---{reset}", output::escape_label(name));
 }
 
 /// Print a test's full xtrace.log, dimmed, under an [`xtrace_header`]. Silent

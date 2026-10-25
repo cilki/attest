@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use brush_parser::ast::SourceLocation;
 
-use crate::output::{GREEN, RED, RESET, outln};
+use crate::output::{Palette, out_palette, outln};
 use crate::runner::{Outcome, TestResult};
 
 /// Information extracted from an xtrace log about the failing command.
@@ -127,6 +127,7 @@ pub fn print_failure_snippet(result: &TestResult, sources: &mut SourceCache) {
             line_idx,
             func_start_line,
             func_end_line,
+            out_palette().is_colored(),
         )
     );
 
@@ -273,6 +274,7 @@ fn render_snippet(
     line_idx: usize,
     func_start_line: usize,
     func_end_line: usize,
+    colored: bool,
 ) -> String {
     use annotate_snippets::{AnnotationKind, Level, Renderer, Snippet};
 
@@ -312,7 +314,12 @@ fn render_snippet(
             ),
     )];
 
-    Renderer::styled().render(report).to_string()
+    let renderer = if colored {
+        Renderer::styled()
+    } else {
+        Renderer::plain()
+    };
+    renderer.render(report).to_string()
 }
 
 /// Comparison operators we know how to render a diff for. `==` is how `[[`
@@ -466,6 +473,9 @@ fn escape_for_display(value: &str) -> String {
 
 /// Render a comparison between bracket expression operands.
 fn render_bracket_diff(expr: &BracketExpr) {
+    let Palette {
+        green, red, reset, ..
+    } = out_palette();
     let left = escape_for_display(&expr.left);
     let right = escape_for_display(&expr.right);
 
@@ -487,14 +497,14 @@ fn render_bracket_diff(expr: &BracketExpr) {
                     right_hl.push_str(val);
                 }
                 ChangeTag::Delete => {
-                    left_hl.push_str(RED);
+                    left_hl.push_str(red);
                     left_hl.push_str(val);
-                    left_hl.push_str(RESET);
+                    left_hl.push_str(reset);
                 }
                 ChangeTag::Insert => {
-                    right_hl.push_str(GREEN);
+                    right_hl.push_str(green);
                     right_hl.push_str(val);
-                    right_hl.push_str(RESET);
+                    right_hl.push_str(reset);
                 }
             }
         }
@@ -725,7 +735,7 @@ mod tests {
             "  false",
             "}",
         ];
-        let rendered = render_snippet("command failed", Path::new("t.sh"), &lines, 2, 0, 3);
+        let rendered = render_snippet("command failed", Path::new("t.sh"), &lines, 2, 0, 3, true);
 
         assert!(
             !rendered.contains('\u{9b}'),

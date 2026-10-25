@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -9,10 +10,121 @@ use serde_json::Value;
 
 use crate::runner::{Outcome, TestResult};
 
-pub(crate) const GREEN: &str = "\x1b[32m";
-pub(crate) const RED: &str = "\x1b[31m";
-pub(crate) const DIM: &str = "\x1b[2m";
-pub(crate) const RESET: &str = "\x1b[0m";
+/// The escape sequences a report is styled with — or, when it is not going to
+/// a terminal, nothing at all.
+///
+/// Colour belongs to the stream and not to the run: on a terminal the four
+/// bytes in front of `FAIL` make it red, while in `attest . > results.txt`, in
+/// a CI log or on the far side of a `grep` the same bytes are noise wrapped
+/// around the word, and a `grep -c '^FAIL'` over them finds nothing. So every
+/// styled write takes its sequences from the palette of the stream it is bound
+/// for ([`out_palette`] or [`err_palette`]) instead of spelling them inline,
+/// and [`Palette::PLAIN`] empties all of them at once: the same `format!`
+/// then writes the same report with no styling in it at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Palette {
+    pub(crate) green: &'static str,
+    pub(crate) red: &'static str,
+    pub(crate) dim: &'static str,
+    /// Bold green, for the progress bar's own heading.
+    pub(crate) heading: &'static str,
+    pub(crate) reset: &'static str,
+}
+
+impl Palette {
+    pub(crate) const ANSI: Self = Self {
+        green: "\x1b[32m",
+        red: "\x1b[31m",
+        dim: "\x1b[2m",
+        heading: "\x1b[1;32m",
+        reset: "\x1b[0m",
+    };
+
+    pub(crate) const PLAIN: Self = Self {
+        green: "",
+        red: "",
+        dim: "",
+        heading: "",
+        reset: "",
+    };
+
+    /// Whether this palette writes any sequence at all. Asked by the renderers
+    /// that take a verdict rather than the sequences themselves — the snippet
+    /// renderer, which styles its own output.
+    pub(crate) fn is_colored(self) -> bool {
+        self != Self::PLAIN
+    }
+}
+
+/// What the environment has to say about colour.
+#[derive(Clone, Copy)]
+struct ColorEnv {
+    no_color: bool,
+    clicolor_force: bool,
+    clicolor: Option<bool>,
+    term_supports_color: bool,
+}
+
+impl ColorEnv {
+    fn from_env() -> Self {
+        Self {
+            no_color: anstyle_query::no_color(),
+            clicolor_force: anstyle_query::clicolor_force(),
+            clicolor: anstyle_query::clicolor(),
+            term_supports_color: anstyle_query::term_supports_color(),
+        }
+    }
+}
+
+/// Whether a stream gets [`Palette::ANSI`]: `NO_COLOR` turns styling off
+/// whatever else says, `CLICOLOR_FORCE` turns it on even down a pipe, and
+/// otherwise it follows the stream itself — a terminal whose `TERM` is one
+/// that understands colour, with `CLICOLOR` not set to `0`.
+///
+/// That is `anstream`'s precedence, which is also clap's: the usage errors
+/// `attest --nonsense` prints already answer to these variables, so a run's
+/// own output had better answer to them the same way.
+fn colors_wanted(is_tty: bool, env: ColorEnv) -> bool {
+    if env.no_color {
+        return false;
+    }
+    if env.clicolor_force {
+        return true;
+    }
+    is_tty && env.clicolor.unwrap_or(true) && env.term_supports_color
+}
+
+fn palette_for(is_tty: bool) -> Palette {
+    if colors_wanted(is_tty, ColorEnv::from_env()) {
+        Palette::ANSI
+    } else {
+        Palette::PLAIN
+    }
+}
+
+/// Decided once per stream: the answer cannot change during a run, and
+/// `isatty` plus four environment lookups per printed line would be paid on
+/// the critical path of every result.
+static OUT_PALETTE: LazyLock<Palette> =
+    LazyLock::new(|| palette_for(std::io::stdout().is_terminal()));
+static ERR_PALETTE: LazyLock<Palette> =
+    LazyLock::new(|| palette_for(std::io::stderr().is_terminal()));
+
+/// Palette for what goes to stdout: the result lines, the summary and the
+/// failure snippets.
+pub(crate) fn out_palette() -> Palette {
+    *OUT_PALETTE
+}
+
+/// Palette for what goes to stderr: the progress bar, and the xtrace replay
+/// that follows a failure.
+///
+/// Separate from [`out_palette`] because the two halves of a failure report
+/// are separately redirectable: `attest . > results.txt` leaves the xtrace on
+/// a terminal that can still colour it.
+pub(crate) fn err_palette() -> Palette {
+    *ERR_PALETTE
+}
 
 /// Set once the reader on the other end of one of our streams has gone away, as
 /// `attest | head -1` or quitting out of `attest | less` does.
@@ -98,15 +210,21 @@ pub fn write_err(buf: &[u8]) {
 /// The full bytes are still reported verbatim where nothing interprets them:
 /// `--json` and `--save-context`.
 pub fn replay_log_err(log: &mut impl Read, last: bool) -> u64 {
-    stream_log(&BROKEN_PIPE, &mut std::io::stderr().lock(), log, last)
+    stream_log(
+        &BROKEN_PIPE,
+        &mut std::io::stderr().lock(),
+        log,
+        last,
+        err_palette(),
+    )
 }
 
 /// How much of a log is held in memory at a time while it is replayed.
 const LOG_CHUNK: usize = 64 * 1024;
 
 /// Replay `log` to `stream` a [`LOG_CHUNK`] at a time, wrapping whatever it
-/// prints in [`DIM`]. Returns the number of bytes consumed: all of them, bar a
-/// trailing [`C1_LEAD`] when `last` is false.
+/// prints in `palette`'s dimming. Returns the number of bytes consumed: all of
+/// them, bar a trailing [`C1_LEAD`] when `last` is false.
 ///
 /// Bounded rather than read whole because a log is as big as the test that
 /// wrote it chose to make it: `xtrace.log` carries everything the test and the
@@ -121,12 +239,13 @@ fn stream_log(
     stream: &mut impl Write,
     log: &mut impl Read,
     last: bool,
+    palette: Palette,
 ) -> u64 {
     /// Open the dimmed region, once, and only if there is anything to put in
     /// it: a flush that finds nothing new must print nothing at all.
-    fn open_dim(closed: &AtomicBool, stream: &mut impl Write, opened: &mut bool) {
-        if !std::mem::replace(opened, true) {
-            write_stream(closed, stream, DIM.as_bytes());
+    fn open_dim(closed: &AtomicBool, stream: &mut impl Write, opened: &mut bool, dim: &str) {
+        if !std::mem::replace(opened, true) && !dim.is_empty() {
+            write_stream(closed, stream, dim.as_bytes());
         }
     }
 
@@ -163,20 +282,20 @@ fn stream_log(
         if end == 0 {
             continue;
         }
-        open_dim(closed, stream, &mut opened);
+        open_dim(closed, stream, &mut opened, palette.dim);
         write_stream(closed, stream, &sanitize_log(&buf[..end]));
     }
     if carry {
         if last {
             // Nothing follows it after all, so it was never half of anything.
-            open_dim(closed, stream, &mut opened);
+            open_dim(closed, stream, &mut opened, palette.dim);
             write_stream(closed, stream, &sanitize_log(&[C1_LEAD]));
         } else {
             consumed -= 1; // left for the call that has the byte after it
         }
     }
-    if opened {
-        write_stream(closed, stream, RESET.as_bytes());
+    if opened && !palette.reset.is_empty() {
+        write_stream(closed, stream, palette.reset.as_bytes());
     }
     consumed
 }
@@ -279,16 +398,24 @@ pub struct StatusDisplay {
     /// Pass/fail of each completed test, in completion order, used to draw the
     /// green/red block strip in the live status line.
     results: Vec<bool>,
+    /// The bar is drawn on stderr, so it is styled like everything else there
+    /// — including when `NO_COLOR` empties the palette on a terminal that
+    /// would otherwise take the colour.
+    palette: Palette,
 }
 
 impl StatusDisplay {
     pub fn new(total: usize, json: bool) -> Self {
         let visible = !json && !indicatif::ProgressDrawTarget::stderr().is_hidden();
+        let palette = err_palette();
         let bar = visible.then(|| {
             let bar = ProgressBar::new(total as u64);
             bar.set_style(
                 ProgressStyle::default_bar()
-                    .template("\x1b[1;32mTesting\x1b[0m {pos}/{len} {msg}")
+                    .template(&format!(
+                        "{}Testing{} {{pos}}/{{len}} {{msg}}",
+                        palette.heading, palette.reset
+                    ))
                     .unwrap(),
             );
             bar.enable_steady_tick(Duration::from_millis(250));
@@ -298,6 +425,7 @@ impl StatusDisplay {
             bar,
             total,
             results: Vec::new(),
+            palette,
         }
     }
 
@@ -333,9 +461,13 @@ impl StatusDisplay {
                 continue;
             }
             let any_failed = self.results[lo..lo + done].iter().any(|&passed| !passed);
-            s.push_str(if any_failed { RED } else { GREEN });
+            s.push_str(if any_failed {
+                self.palette.red
+            } else {
+                self.palette.green
+            });
             s.push('█');
-            s.push_str(RESET);
+            s.push_str(self.palette.reset);
         }
         s
     }
@@ -568,19 +700,20 @@ pub fn print_test_result_json(result: &TestResult) {
 }
 
 /// The one-line `PASS`/`FAIL`/`TIME` report for a finished test.
-fn result_line(result: &TestResult) -> String {
+fn result_line(result: &TestResult, palette: Palette) -> String {
     let (label, color) = match result.outcome {
-        Outcome::Pass => ("PASS", GREEN),
-        Outcome::Fail => ("FAIL", RED),
-        Outcome::Timeout => ("TIME", RED),
+        Outcome::Pass => ("PASS", palette.green),
+        Outcome::Fail => ("FAIL", palette.red),
+        Outcome::Timeout => ("TIME", palette.red),
     };
+    let reset = palette.reset;
     let duration = format_duration(result.duration);
     let name = escape_label(&result.name);
-    format!("{color}{label}{RESET}  {:<40} ({duration})", &*name)
+    format!("{color}{label}{reset}  {:<40} ({duration})", &*name)
 }
 
 pub fn print_test_result(result: &TestResult) {
-    outln!("{}", result_line(result));
+    outln!("{}", result_line(result, out_palette()));
     if let Some(ref r) = result.resources {
         print_resource_stats(r);
     }
@@ -638,16 +771,19 @@ fn format_bytes(b: u64) -> String {
 pub fn print_summary(results: &[TestResult], wall_duration: Duration) {
     let passed = results.iter().filter(|r| r.outcome.passed()).count();
     let failed = results.len() - passed;
+    let Palette {
+        green, red, reset, ..
+    } = out_palette();
 
     outln!();
     if failed > 0 {
         outln!(
-            "Results: {GREEN}{passed} passed{RESET}, {RED}{failed} failed{RESET}, {} total",
+            "Results: {green}{passed} passed{reset}, {red}{failed} failed{reset}, {} total",
             results.len()
         );
     } else {
         outln!(
-            "Results: {GREEN}{passed} passed{RESET}, {} total",
+            "Results: {green}{passed} passed{reset}, {} total",
             results.len()
         );
     }
@@ -738,6 +874,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The sequences a styled report carries, for the tests that assert on one
+    /// (a palette is a run-time choice, so the colored one is named here
+    /// rather than read off the streams the test harness happens to have).
+    const GREEN: &str = Palette::ANSI.green;
+    const RED: &str = Palette::ANSI.red;
+    const DIM: &str = Palette::ANSI.dim;
+    const RESET: &str = Palette::ANSI.reset;
+
     /// The JSONL line `--json` prints for `result`.
     fn json_line(result: &TestResult) -> Vec<u8> {
         let mut out: Vec<u8> = Vec::new();
@@ -784,12 +928,48 @@ mod tests {
         result.outcome = Outcome::Fail;
 
         assert_eq!(
-            result_line(&result),
+            result_line(&result, Palette::ANSI),
             format!(
                 "{RED}FAIL{RESET}  \
                  test_lie\\x1b[1G\\x1b[K\\x1b[32mPASS\\x1b[0m\\x1b[2Ctest_lie (1.50s)"
             )
         );
+
+        // Unstyled, the same line is the same report with no escape byte of
+        // attest's own in it: a `FAIL` redirected into a file or a log is
+        // still a `FAIL` that `grep '^FAIL'` finds.
+        let plain = result_line(&result, Palette::PLAIN);
+        assert!(!plain.contains('\x1b'), "{plain}");
+        assert!(plain.starts_with("FAIL  test_lie\\x1b["), "{plain}");
+        assert!(plain.ends_with("(1.50s)"), "{plain}");
+    }
+
+    #[test]
+    fn a_stream_is_styled_only_when_it_is_a_terminal_that_wants_it() {
+        let env = |no_color, clicolor_force, clicolor, term_supports_color| ColorEnv {
+            no_color,
+            clicolor_force,
+            clicolor,
+            term_supports_color,
+        };
+        let plain_env = env(false, false, None, true);
+
+        // The default both ways round: a terminal is styled, a redirect or a
+        // pipe is not.
+        assert!(colors_wanted(true, plain_env));
+        assert!(!colors_wanted(false, plain_env));
+
+        // `NO_COLOR` wins over everything, including a forced one.
+        assert!(!colors_wanted(true, env(true, false, None, true)));
+        assert!(!colors_wanted(true, env(true, true, None, true)));
+
+        // `CLICOLOR_FORCE` is how a pipe that does understand colour (a CI
+        // log, `attest . | less -R`) asks for it anyway.
+        assert!(colors_wanted(false, env(false, true, None, true)));
+
+        // A terminal that says it cannot show colour gets none.
+        assert!(!colors_wanted(true, env(false, false, None, false)));
+        assert!(!colors_wanted(true, env(false, false, Some(false), true)));
     }
 
     #[test]
@@ -981,6 +1161,7 @@ mod tests {
             bar: None,
             total,
             results,
+            palette: Palette::ANSI,
         }
     }
 
@@ -1131,9 +1312,20 @@ mod tests {
     /// Replay `log` into a buffer, the way [`replay_log_err`] replays it into
     /// stderr. Returns what was written and how much of `log` was consumed.
     fn replayed(log: &[u8], last: bool) -> (Vec<u8>, u64) {
+        replayed_with(log, last, Palette::ANSI)
+    }
+
+    /// The same, under a palette of the caller's choosing.
+    fn replayed_with(log: &[u8], last: bool, palette: Palette) -> (Vec<u8>, u64) {
         let closed = AtomicBool::new(false);
         let mut sink: Vec<u8> = Vec::new();
-        let consumed = stream_log(&closed, &mut sink, &mut std::io::Cursor::new(log), last);
+        let consumed = stream_log(
+            &closed,
+            &mut sink,
+            &mut std::io::Cursor::new(log),
+            last,
+            palette,
+        );
         (sink, consumed)
     }
 
@@ -1152,6 +1344,16 @@ mod tests {
         let (out, consumed) = replayed_text(b"+1: false\n", true);
         assert_eq!(out, format!("{DIM}+1: false\n{RESET}"));
         assert_eq!(consumed, 10);
+    }
+
+    #[test]
+    fn an_unstyled_replay_is_the_log_and_nothing_else() {
+        // Off a terminal there is no region to dim, so the replay is the
+        // sanitized log on its own — the escaping still happens, only the
+        // styling around it goes away.
+        let (out, consumed) = replayed_with(b"+1: \x1b[2Kfalse\n", true, Palette::PLAIN);
+        assert_eq!(String::from_utf8(out).unwrap(), "+1: \\x1b[2Kfalse\n");
+        assert_eq!(consumed, 14);
     }
 
     #[test]
@@ -1218,7 +1420,10 @@ mod tests {
         let closed = AtomicBool::new(true);
         let mut sink: Vec<u8> = Vec::new();
         let mut log = std::io::Cursor::new(vec![b'x'; LOG_CHUNK * 4]);
-        assert_eq!(stream_log(&closed, &mut sink, &mut log, true), 0);
+        assert_eq!(
+            stream_log(&closed, &mut sink, &mut log, true, Palette::ANSI),
+            0
+        );
         assert!(sink.is_empty());
         assert_eq!(log.position(), 0);
     }

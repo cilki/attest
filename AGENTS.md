@@ -193,6 +193,21 @@
   terminal obeys (`U+009B` is `CSI`). Escaping happens before the annotation
   span is measured, since it moves the offsets the span is built from.
 - `src/output.rs` - ANSI-colored terminal output for PASS/FAIL and summary, plus
+  the `Palette` that decides whether those sequences are written at all. A
+  styled write takes them from the palette of the stream it is bound for
+  (`out_palette`/`err_palette`, decided once per stream) rather than spelling
+  them inline, so `Palette::PLAIN` empties the whole report at once: off a
+  terminal the same `format!` writes the same words with nothing around them,
+  which is what `attest . > results.txt`, a CI log and `grep '^FAIL'` want.
+  `colors_wanted` is the rule — `NO_COLOR` off, then `CLICOLOR_FORCE` on, then
+  the stream's own `isatty` with `TERM`/`CLICOLOR` — and it is `anstream`'s
+  precedence on purpose, since clap's own usage errors already answer to those
+  variables. The two streams are asked separately because the halves of a
+  failure report are separately redirectable: the `FAIL` line and the snippet
+  go to stdout, the xtrace replay to stderr. The snippet renderer takes the
+  verdict rather than the sequences (`Renderer::styled`/`plain` is
+  annotate-snippets' own switch), and
+  `--json` carries no styling either way. Also holds
   the `--json` JSONL encoder (`print_test_result_json`): one object per test with
   `name`, `file`, `status` (`pass`/`fail`/`timeout`), `duration_ms`, `stdout`,
   `xtrace`, `strace` and `resources`. The schema is documented in the README, so
