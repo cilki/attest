@@ -749,15 +749,16 @@ statement containing it rather than at the command itself. A timed-out test
 gets the same snippet under `test timed out`, pointing at whatever it was
 running when the clock ran out.
 
-When the failing command is a comparison — `[` or `[[` with `=`, `==`, `!=`,
-`-eq`, `-ne`, `-lt`, `-le`, `-gt` or `-ge` — both operands are recovered from
-the trace and printed as `left` and `right`, so you don't have to pick them out
-of the quoting yourself. For `=`, `==` and `!=` a character-level `diff` of the
-two follows, which is what finds the stray space or the changed digit: the
-characters that differ are colored (red on the first line, green on the
-second), so in the plain text above the `diff` lines look just like the `left`
-and `right` ones. Newlines and tabs in an operand are printed as `\n` and `\t`
-to keep all four lines aligned.
+When the failing command is a comparison — `[`, `test` or `[[` with `=`, `==`,
+`!=`, `-eq`, `-ne`, `-lt`, `-le`, `-gt` or `-ge` — both operands are recovered
+from the trace and printed as `left` and `right`, so you don't have to pick them
+out of the quoting yourself. `[ "$a" = "$b" ]` and `test "$a" = "$b"` are the
+same builtin spelled two ways and report identically. For `=`, `==` and `!=` a
+character-level `diff` of the two follows, which is what finds the stray space
+or the changed digit: the characters that differ are colored (red on the first
+line, green on the second), so in the plain text above the `diff` lines look
+just like the `left` and `right` ones. Newlines and tabs in an operand are
+printed as `\n` and `\t` to keep all four lines aligned.
 
 ### Where a test's own output goes
 

@@ -332,17 +332,22 @@ fn is_comparison_op(op: &str) -> bool {
     )
 }
 
-/// Parse a `[` or `[[` test command from xtrace output.
+/// Parse a `[`, `test` or `[[` comparison from xtrace output.
 ///
-/// Xtrace renders `[ "A" = "B" ]` as `'[' A = B ']'` and `[[ "A" = "B" ]]` as
-/// `[[ A = B ]]`. The two forms need different handling: `[` is an ordinary
-/// command, so each operand is a separately quoted word, whereas `[[` is shell
-/// syntax and its operands are echoed back verbatim with no quoting at all.
+/// Xtrace renders `[ "A" = "B" ]` as `'[' A = B ']'`, `test "A" = "B"` as
+/// `test A = B` and `[[ "A" = "B" ]]` as `[[ A = B ]]`. `[` and `test` are the
+/// same builtin spelled two ways — the only difference in the trace is the
+/// `'['`/`']'` arguments bracketing the operands — so both are read the same
+/// way: each operand is a separately quoted word. `[[` needs different
+/// handling, being shell syntax rather than a command: its operands are echoed
+/// back verbatim with no quoting at all.
 fn parse_bracket_expr(command: &str) -> Option<BracketExpr> {
-    if let Some(inner) = command
+    let bracketed = command
         .strip_prefix("'[' ")
-        .and_then(|s| s.strip_suffix(" ']'"))
-    {
+        .and_then(|s| s.strip_suffix(" ']'"));
+    // A `test` with no argument at all cannot be a comparison, so requiring the
+    // space costs nothing and keeps the operand list non-empty.
+    if let Some(inner) = bracketed.or_else(|| command.strip_prefix("test ")) {
         let words = split_quoted_words(inner)?;
         let [left, op, right] = <[String; 3]>::try_from(words).ok()?;
         if !is_comparison_op(&op) {
@@ -612,6 +617,48 @@ mod tests {
     #[test]
     fn parse_bracket_rejects_unterminated_quote() {
         assert!(parse_bracket_expr("'[' 'unterminated = x ']'").is_none());
+    }
+
+    #[test]
+    fn parse_test_builtin_equality() {
+        // `test "A" = "B"` is the same builtin as `[ "A" = "B" ]` and quotes
+        // its operands the same way, so it gets the same operands back.
+        let expr = parse_bracket_expr("test ABC = DEF").expect("test builtin should parse");
+        assert_eq!(expr.left, "ABC");
+        assert_eq!(expr.op, "=");
+        assert_eq!(expr.right, "DEF");
+    }
+
+    #[test]
+    fn parse_test_builtin_numeric() {
+        let expr = parse_bracket_expr("test 1 -eq 2").unwrap();
+        assert_eq!(expr.left, "1");
+        assert_eq!(expr.op, "-eq");
+        assert_eq!(expr.right, "2");
+    }
+
+    #[test]
+    fn parse_test_builtin_operands_with_spaces() {
+        let expr = parse_bracket_expr("test 'hello world' = 'hello worlx'").unwrap();
+        assert_eq!(expr.left, "hello world");
+        assert_eq!(expr.op, "=");
+        assert_eq!(expr.right, "hello worlx");
+    }
+
+    #[test]
+    fn parse_test_builtin_unary_declines() {
+        // A unary test has no two operands to compare.
+        assert!(parse_bracket_expr("test -f /tmp/x").is_none());
+        assert!(parse_bracket_expr("test ''").is_none());
+    }
+
+    #[test]
+    fn parse_test_builtin_needs_the_whole_word() {
+        // A command whose name merely starts with `test` is not the builtin:
+        // the test functions themselves are named that way, and the first
+        // trace line of every run is the runner calling one of them.
+        assert!(parse_bracket_expr("testEquality").is_none());
+        assert!(parse_bracket_expr("tester a = b").is_none());
     }
 
     #[test]

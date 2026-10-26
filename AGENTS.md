@@ -183,8 +183,12 @@
   executed command (skipping `++` subshell traces, so a failure inside
   `$(...)` is attributed to the statement around it), maps it back to the
   original source file, and renders an annotate-snippets error snippet.
-  Also shows `left`/`right` operands for a failed `[`/`[[` comparison and,
-  for `=`/`==`/`!=`, an inline character-level diff of them. The report the
+  Also shows `left`/`right` operands for a failed `[`/`test`/`[[` comparison
+  and, for `=`/`==`/`!=`, an inline character-level diff of them. `[` and
+  `test` are one builtin under two names, and xtrace renders them the same way
+  but for the `'['`/`']'` arguments, so `parse_bracket_expr` reads both through
+  the same quoted-word split — a `test` spelling must not be the one that gets
+  no operands back. The report the
   whole of this adds up to is documented in the README, so keep both in step
   when changing it.
   The log is scanned a line at a time, keeping at most `MAX_LINE` bytes of any
