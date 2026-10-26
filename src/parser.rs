@@ -17,20 +17,21 @@ pub struct TestFile {
     /// Names of the test functions, in source order — one per name the shell
     /// would actually run (see [`parse_test_file`]).
     pub tests: Vec<String>,
-    /// The script the runner writes out and sources to define this file's
-    /// functions (see [`build_functions_source`]). It is the same text for
-    /// every test in the file, so it is rendered once here instead of per
-    /// test: rendering it walks each function's AST to find its source span,
-    /// which cost more than reading and writing the file it is built from —
-    /// and a file holding 25 tests paid it 25 times over, once more for every
-    /// `--repeat`. Keeping the text rather than the AST it came from is also
-    /// what lets the parse be thrown away: nothing downstream needs the nodes.
+    /// The shell source that defines this file's functions, which the runner
+    /// carries into the script it runs a test with (see
+    /// [`build_functions_source`]). It is the same text for every test in the
+    /// file, so it is rendered once here instead of per test: rendering it
+    /// walks each function's AST to find its source span, which cost more than
+    /// reading the file it is built from — and a file holding 25 tests paid it
+    /// 25 times over, once more for every `--repeat`. Keeping the text rather
+    /// than the AST it came from is also what lets the parse be thrown away:
+    /// nothing downstream needs the nodes.
     ///
-    /// Empty when [`TestFile::tests`] is: the script exists to be sourced by a
+    /// Empty when [`TestFile::tests`] is: the definitions exist to be run by a
     /// run of one of this file's tests, so a file with no test in it has
-    /// nothing to source it (see [`parse_test_file`]).
+    /// nothing to run them (see [`parse_test_file`]).
     pub script: String,
-    /// The shell the runner execs to source [`TestFile::script`] and call one
+    /// The shell the runner execs to define [`TestFile::script`] and call one
     /// of [`TestFile::tests`], unless `--shebang` overrides it (see
     /// [`crate::discovery::script_shell`]).
     ///
@@ -236,7 +237,7 @@ pub fn parse_test_file(path: &Path) -> anyhow::Result<TestFile> {
 
     // Nothing in this file can be selected, so there is nothing a parse of it
     // could tell a run: the tests are the names it does not hold, and the
-    // script is only ever sourced to call one of them.
+    // definitions are only ever run to call one of them.
     if !may_define_test(&contents) {
         return Ok(TestFile {
             path: path.to_path_buf(),
@@ -250,11 +251,11 @@ pub fn parse_test_file(path: &Path) -> anyhow::Result<TestFile> {
         .map_err(|e| anyhow::anyhow!("parse error in {}: {e}", path.display()))?;
 
     // A shell function defined more than once in the same file is shadowed:
-    // when the runner sources the file and calls the name, only the last
+    // when the runner defines them all and calls the name, only the last
     // definition runs. Emit a single test per name (matching what the shell
     // actually executes) rather than one phantom test per definition — every
     // one of which would run the same, last body. `functions` still carries
-    // all definitions so the sourced script is unchanged.
+    // all definitions so the rendered script is unchanged.
     let mut tests = Vec::new();
     let mut seen = HashSet::new();
     for f in &functions {
@@ -276,7 +277,7 @@ pub fn parse_test_file(path: &Path) -> anyhow::Result<TestFile> {
         path: path.to_path_buf(),
         tests,
         // Both built here, from the text this parse came from, so the script,
-        // the spans it is cut with and the shell that sources it can never be
+        // the spans it is cut with and the shell that runs it can never be
         // out of step: the file is read once and all three come from that one
         // read.
         script: build_functions_source(&functions, &contents),
@@ -284,18 +285,19 @@ pub fn parse_test_file(path: &Path) -> anyhow::Result<TestFile> {
     })
 }
 
-/// Build the script that the runner sources to define a file's functions.
+/// Build the definitions the runner puts at the head of a test's script.
 ///
 /// Each function is emitted verbatim at the same line number it occupies in the
-/// original source, with the gaps between them blanked out. Because bash's
-/// `$LINENO` (used by our xtrace `PS4`) reports the line within the sourced
-/// file, keeping functions at their original offsets makes xtrace line numbers
-/// match the source exactly — so a failing command's trace points straight at
-/// its source line, with no reconstruction or line-mapping heuristics needed on
-/// the diagnostics side.
+/// original source, with the gaps between them blanked out. Because the shell's
+/// `$LINENO` (used by our xtrace `PS4`) reports the line within the script it
+/// is running, and the runner puts these definitions at the head of that
+/// script, keeping functions at their original offsets makes xtrace line
+/// numbers match the source exactly — so a failing command's trace points
+/// straight at its source line, with no reconstruction or line-mapping
+/// heuristics needed on the diagnostics side.
 ///
 /// Only function definitions are emitted (top-level code is dropped), so
-/// sourcing the script never runs a test file's top-level statements.
+/// running the script never runs a test file's top-level statements.
 ///
 /// A function the parser gave no location for — and every function when
 /// `source` is empty — falls back to the reformatted AST rendering: line

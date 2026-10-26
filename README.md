@@ -72,8 +72,9 @@ discarded. Nested containers and sandboxes are the usual places this happens.
 Those three facts are about the inside of a test function. There is one more
 worth knowing about the file around them: attest never executes your test file.
 It parses it, extracts the *function definitions* — tests and helpers alike —
-and sources only those into a fresh shell, which then calls one test function.
-Everything at the file's top level is dropped, which has two consequences:
+and gives only those to a fresh shell as the script it runs, which then calls
+one test function. Everything at the file's top level is dropped, which has two
+consequences:
 
 - **Code outside a function never runs.** A variable assigned at the top of the
   file is unset inside the tests, and a top-level `trap` or `set` has no
@@ -93,8 +94,13 @@ Everything at the file's top level is dropped, which has two consequences:
   }
   ```
 
-Dropping the top level is also what makes inline tests work: sourcing a script
-that happens to be a program doesn't run the program.
+Dropping the top level is also what makes inline tests work: taking the
+functions out of a script that happens to be a program doesn't run the program.
+
+Nothing is sourced to arrange any of this. The definitions are the head of the
+script the shell is handed, so running a test asks the shell for nothing beyond
+defining a function and calling it — a shell that implements neither `.` nor
+`source` nor `eval` runs its tests just the same.
 
 ### Inline tests
 

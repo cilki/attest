@@ -683,8 +683,8 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
 /// readable and writable by its owner alone.
 ///
 /// A context dir is the whole record of what a test did: `stdout.log` and
-/// `xtrace.log`, the test's working directory, the generated `functions.sh`,
-/// any `--override` binaries, and the overlay upper layers — which is every
+/// `xtrace.log`, the test's working directory, any `--override` binaries,
+/// and the overlay upper layers — which is every
 /// file the test wrote anywhere in its ephemeral root. The runner enables
 /// `set -x`, so `xtrace.log` holds each command with its arguments already
 /// expanded: a test that passes a token, a password or a key to anything has
@@ -714,8 +714,8 @@ fn private_temp_dir() -> std::io::Result<tempfile::TempDir> {
 /// anything there, `/` and `..` included (`test_x/../../../etc() { … }` parses
 /// and runs fine under sh and bash). Joining such a name onto the run's temp
 /// dir escapes it, and the escape is not contained by test isolation: the
-/// parent process creates the context dir, writes the generated script and
-/// logs into it, and `remove_dir_all`s it on drop, all outside any overlay and
+/// parent process creates the context dir, opens the test's logs in it, and
+/// `remove_dir_all`s it on drop, all outside any overlay and
 /// with the invoking user's privileges. `--save-context` would likewise copy
 /// the test's files outside the directory that was asked for.
 ///
@@ -776,11 +776,15 @@ fn spawn_test(
         None => None,
     };
 
-    // The script is rendered once per file at parse time (see
-    // `parser::build_functions_source`), but it is written out per test: it
-    // lives in the test's own context dir, which nothing else can reach.
-    let script_path = context.join("functions.sh");
-    std::fs::write(&script_path, &spec.file.script)?;
+    // The test's output goes to log files in its context dir, opened here and
+    // handed to the child as its stdout and stderr instead of being redirected
+    // by the script it runs. The script carries the file's own function
+    // definitions, so a shell that will not parse them never reaches its first
+    // line — and that complaint is exactly what the failure report has to
+    // replay, so it belongs in `xtrace.log` with everything else the test
+    // wrote to stderr.
+    let stdout_log = std::fs::File::create(context.join("stdout.log"))?;
+    let xtrace_log = std::fs::File::create(context.join("xtrace.log"))?;
 
     if !config.override_cmds.is_empty() {
         let bin: &Path = &context.join("bin");
@@ -820,9 +824,11 @@ fn spawn_test(
         crate::cgroup::TestCgroup::try_create(display_name)
     };
 
+    // The functions are rendered once per file at parse time (see
+    // `parser::build_functions_source`); the script around them is per test.
     let runner_content = build_runner_script(
         spec.name,
-        &script_path,
+        &spec.file.script,
         &context,
         &config.bin_dirs,
         &config.strace,
@@ -831,7 +837,9 @@ fn spawn_test(
     // makes $0 inside the test functions refer to the original script.
     let source_str = source_path_owned.to_str().unwrap_or("bash").to_string();
     let mut cmd = Command::new(shell);
-    cmd.args(["-c", &runner_content, &source_str]);
+    cmd.args(["-c", &runner_content, &source_str])
+        .stdout(stdout_log)
+        .stderr(xtrace_log);
 
     // Detach into a fresh session/process group so timeouts and cleanup can
     // kill the whole test tree with one kill(-pgid).
@@ -878,14 +886,23 @@ fn spawn_test(
 
     let start = Instant::now();
     let child = cmd.spawn().map_err(|e| {
-        if isolated {
-            anyhow!(
-                "spawn failed for {display_name}: {e} \
-                 (isolation was active for this test; --no-overlay disables it)"
+        // The script rides in the argument vector, and Linux caps how long a
+        // single argument may be — 32 pages classically, a slice of the stack
+        // limit on newer kernels, so half a megabyte of shell either way. Only
+        // a file with more function definitions in it than that can hit this,
+        // and `E2BIG` on its own names neither the argument nor its size.
+        let note = if e.raw_os_error() == Some(libc::E2BIG) {
+            format!(
+                " (the script carrying this file's function definitions is {} bytes, \
+                 more than one argument can hold)",
+                runner_content.len()
             )
+        } else if isolated {
+            " (isolation was active for this test; --no-overlay disables it)".to_string()
         } else {
-            anyhow!("spawn failed for {display_name}: {e}")
-        }
+            String::new()
+        };
+        anyhow!("spawn failed for {display_name}: {e}{note}")
     })?;
 
     Ok(PendingTest {
@@ -1057,19 +1074,40 @@ fn sh_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
 }
 
-/// Build the shell script content that sources the function definitions and
-/// runs the named test. Used with `<shell> -c <content> <source_path>` so
-/// that `$0` inside test functions refers to the original script.
+/// Build the shell script content that defines the test's functions and runs
+/// the named one. Used with `<shell> -c <content> <source_path>` so that `$0`
+/// inside test functions refers to the original script.
+///
+/// The definitions are carried in the script itself rather than sourced out of
+/// a file beside it. `.` is the one command here that a shell need not have —
+/// it is a POSIX special builtin, but attest runs whatever shell a file's
+/// shebang names, and a small or purpose-built one may well implement neither
+/// it nor `source` nor `eval` (issue #93). Inlining asks the shell for nothing
+/// beyond defining a function and calling it, which is the whole of what a
+/// test is.
+///
+/// Nothing is emitted in front of the definitions, and that is load-bearing:
+/// they are rendered at the line numbers they have in the test file
+/// (`parser::build_functions_source` pads for it) and `$LINENO` inside a
+/// function is a line of the script the shell is running, so every `PS4` trace
+/// line indexes the original source directly — which is how `diagnostics`
+/// points at the command that failed. A prelude above them would shift all of
+/// it by its own length.
 fn build_runner_script(
     test_name: &str,
-    functions_path: &Path,
+    functions: &str,
     working_dir: &Path,
     bin_dirs: &[PathBuf],
     strace: &[String],
 ) -> String {
     use std::fmt::Write;
 
-    let mut s = String::new();
+    let mut s = String::from(functions);
+    // `build_functions_source` ends every function on a line of its own, but a
+    // file holding none at all renders as the empty string.
+    if !s.is_empty() && !s.ends_with('\n') {
+        s.push('\n');
+    }
 
     // PATH entries prepended low-to-high precedence, each layering on top of the
     // previous, so the last one wins:
@@ -1085,17 +1123,17 @@ fn build_runner_script(
         let _ = writeln!(s, "export PATH={}:\"$PATH\"", sh_quote(dir));
     }
 
-    // Redirect both stdout and stderr to log files, then enable xtrace.
-    let stdout = working_dir.join("stdout.log");
-    let xtrace = working_dir.join("xtrace.log");
-    let _ = writeln!(s, "exec 1>{} 2>{}", sh_quote(&stdout), sh_quote(&xtrace));
+    // Nothing redirects the logs here: the child is handed them as its stdout
+    // and stderr before it is exec'd (see `spawn_test`), so a shell that
+    // rejects the definitions above still complains into `xtrace.log` rather
+    // than over attest's own output.
     s.push_str("set -e\n");
 
     // Every test starts in its own clean, empty working directory.
     let _ = writeln!(s, "cd {}", sh_quote(&cwd_dir(working_dir)));
 
-    // Source function definitions, then enable xtrace and invoke the test function.
-    let _ = writeln!(s, ". {}", sh_quote(functions_path));
+    // Only now turn on xtrace, so the log starts at the test itself rather
+    // than at the definitions and the setup above.
     s.push_str("PS4='+$LINENO: '\n");
     s.push_str("set -x\n");
     s.push_str(test_name);
@@ -1641,7 +1679,7 @@ mod tests {
     /// the file's shebang again when the test starts.
     ///
     /// The shebang used to be re-read off disk on every spawn while the script
-    /// being sourced came from the parse, so the two could disagree: a file
+    /// being run came from the parse, so the two could disagree: a file
     /// edited mid-run had its new shell paired with its old functions, and
     /// under `--repeat` that window reopened for every pass over the same
     /// `TestFile`.
@@ -1696,6 +1734,136 @@ mod tests {
 
         assert!(forced_ran.exists(), "--shebang was not honoured");
         assert!(!own_ran.exists(), "the file's own shebang won");
+    }
+
+    /// A stand-in for the shell issue #93 is about: one with no `.`, no
+    /// `source` and no `eval`.
+    ///
+    /// It is bash with those three builtins taken away — `BASH_ENV` is sourced
+    /// before a non-interactive bash runs its `-c` script, and `enable -n`
+    /// takes a builtin away for the rest of the shell's life — so the shell
+    /// really does lack them, rather than a script only claiming it does.
+    fn no_dot_shell(dir: &Path) -> PathBuf {
+        let env = dir.join("no_dot.sh");
+        fs::write(&env, "enable -n . source eval\n").unwrap();
+        let shell = dir.join("bash");
+        fs::write(
+            &shell,
+            format!(
+                "#!/bin/sh\nBASH_ENV={} exec {} \"$@\"\n",
+                sh_quote(&env),
+                sh_quote(&which::which("bash").unwrap())
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        shell
+    }
+
+    /// A shell that implements neither `.` nor `source` nor `eval` still runs
+    /// its tests: the function definitions are carried in the script the
+    /// runner hands the shell, so running a test asks it for nothing beyond
+    /// defining a function and calling it (issue #93).
+    #[test]
+    fn a_shell_without_a_dot_command_still_runs_its_tests() {
+        let tmp = TempDir::new().unwrap();
+        let env = RunEnv {
+            shell_override: Some(no_dot_shell(tmp.path()).to_string_lossy().into_owned()),
+            ..no_overlay_env(tmp.path())
+        };
+
+        let r = run_script(
+            tmp.path(),
+            "helper() {\n  echo 42\n}\ntest_x() {\n  [ \"$(helper)\" = 42 ]\n}\n",
+            "test_x",
+            &RunConfig::default(),
+            &env,
+        );
+        assert!(
+            r.outcome.passed(),
+            "a shell without `.` could not run the test: {}",
+            fs::read_to_string(r.context.join("xtrace.log")).unwrap_or_default()
+        );
+
+        // And that shell really has no `.`, so the pass above is the runner
+        // asking for no sourcing rather than `enable -n` quietly doing nothing.
+        let sourcing = run_script(
+            tmp.path(),
+            "test_dot() {\n  . /dev/null\n}\n",
+            "test_dot",
+            &RunConfig::default(),
+            &env,
+        );
+        assert!(
+            !sourcing.outcome.passed(),
+            "the stand-in shell still has a `.` command"
+        );
+    }
+
+    /// Whatever the shell itself has to say lands in `xtrace.log`, where the
+    /// failure report replays it from.
+    ///
+    /// The script the shell is given carries the test file's own function
+    /// definitions, so a shell that will not parse them never reaches the
+    /// first line of it. Nothing in the script can redirect the complaint that
+    /// follows; the child is handed the logs as its stdout and stderr before
+    /// it is exec'd, so it goes to the log either way instead of landing in
+    /// the middle of attest's own output.
+    #[test]
+    fn the_shells_own_complaint_goes_to_the_xtrace_log() {
+        let tmp = TempDir::new().unwrap();
+        // A "shell" that rejects the script out of hand, the way a real one
+        // would reject syntax it does not know.
+        let shell = tmp.path().join("bash");
+        fs::write(&shell, "#!/bin/sh\necho 'bad syntax' >&2\nexit 2\n").unwrap();
+        fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let env = RunEnv {
+            shell_override: Some(shell.to_string_lossy().into_owned()),
+            ..no_overlay_env(tmp.path())
+        };
+
+        let r = run_script(
+            tmp.path(),
+            "test_x() {\n  :\n}\n",
+            "test_x",
+            &RunConfig::default(),
+            &env,
+        );
+        assert!(!r.outcome.passed(), "the shell exited 2");
+        assert_eq!(
+            fs::read_to_string(r.context.join("xtrace.log")).unwrap(),
+            "bad syntax\n"
+        );
+    }
+
+    /// Nothing may be emitted above the function definitions, and nothing the
+    /// runner adds below them may be a command a shell can lack.
+    ///
+    /// The definitions are rendered at the line numbers they have in the test
+    /// file and `$LINENO` counts from the first line of the script the shell is
+    /// running, so a single line in front of them shifts every trace line a
+    /// failure is mapped back to the source with.
+    #[test]
+    fn the_runner_script_starts_at_the_definitions() {
+        let functions = "helper() {\n  :\n}\n\ntest_x() {\n  false\n}\n";
+        let script = build_runner_script(
+            "test_x",
+            functions,
+            Path::new("/ctx"),
+            &[PathBuf::from("/bins")],
+            &["strace_me".to_string()],
+        );
+
+        let Some(prelude) = script.strip_prefix(functions) else {
+            panic!("the runner script does not start at the definitions:\n{script}");
+        };
+        for line in prelude.lines() {
+            let word = line.split(|c: char| c.is_whitespace()).next().unwrap_or("");
+            assert!(
+                !matches!(word, "." | "source" | "eval"),
+                "the runner script needs `{word}`: {line}"
+            );
+        }
     }
 
     #[test]
@@ -2469,8 +2637,9 @@ mod tests {
 
     #[test]
     fn xtrace_line_number_matches_source() {
-        // The failing command sits on source line 7 (1-based). With
-        // line-preserving functions.sh, the xtrace PS4 must report `+7:`.
+        // The failing command sits on source line 7 (1-based). With the
+        // definitions at the head of the runner script, at the line numbers
+        // they have in the file, the xtrace PS4 must report `+7:`.
         let source = "helper() {\n  echo setup\n}\n\ntest_foo() {\n  echo a\n  false\n}\n";
         let r = run_inline(source, "test_foo");
         assert!(!r.outcome.passed());

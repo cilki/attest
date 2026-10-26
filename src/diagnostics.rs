@@ -8,8 +8,9 @@ use crate::runner::{Outcome, TestResult};
 
 /// Information extracted from an xtrace log about the failing command.
 struct FailureInfo {
-    /// 1-based line number where the failure occurred. `functions.sh` preserves
-    /// the source's line numbers, so this is also the line in the source file.
+    /// 1-based line number where the failure occurred. The runner script
+    /// preserves the source's line numbers, so this is also the line in the
+    /// source file.
     lineno: usize,
     /// The command text as shown in xtrace (e.g. `'[' ABC = DEF ']'`).
     command: String,
@@ -90,9 +91,9 @@ pub fn print_failure_snippet(result: &TestResult, sources: &mut SourceCache) {
         return;
     };
 
-    // The runner emits `functions.sh` so that each function keeps its original
-    // source line numbers, so the xtrace line number (bash's `$LINENO`) indexes
-    // the original source directly — no text matching required.
+    // The runner script carries each function at its original source line
+    // number, so the xtrace line number (the shell's `$LINENO`) indexes the
+    // original source directly — no text matching required.
     let Some(source) = sources.get(&result.source_path) else {
         return;
     };

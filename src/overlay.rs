@@ -401,8 +401,9 @@ pub struct RootOverlay {
     /// Submount overlays and live binds, shallowest-first.
     steps: Vec<MountStep>,
     /// `(source, target)` bind keeping attest's own context dir live inside the
-    /// new root, so `functions.sh` and log capture work even though the context
-    /// falls under an overlaid mount (it usually lives under `/tmp`).
+    /// new root, so the test's working directory and the files attest reads
+    /// back out of a context survive, even though the context falls under an
+    /// overlaid mount (it usually lives under `/tmp`).
     context: (CString, CString),
     /// `put_old` directory for pivot_root (under `merged`).
     put_old: CString,
@@ -527,8 +528,9 @@ unsafe fn setup_root(p: &RootOverlay) -> std::io::Result<()> {
                 }
             }
         }
-        // Keep attest's own context dir live (functions.sh + log capture); the
-        // run is broken without it, so failure is fatal.
+        // Keep attest's own context dir live (the test's cwd lives there, and
+        // so does everything attest reads back out of a context); the run is
+        // broken without it, so failure is fatal.
         let (ctx_src, ctx_dst) = &p.context;
         libc::mkdir(ctx_dst.as_ptr(), 0o755);
         if libc::mount(

@@ -62,11 +62,11 @@
   scripts holding no tests was most of what the walk spent.
 - `src/parser.rs` - Parses shell scripts with `brush_parser::Parser`, walks the
   AST to extract all `FunctionDefinition` nodes. Test functions start with
-  `test`. A `TestFile` keeps the names of its tests, the script the runner
-  sources (`build_functions_source`) and the shell that sources it
-  (`discovery::script_shell`), not the nodes: all of those are the same for
-  every test in the file, and rendering the script walks each function's AST
-  for its source span — which cost more than reading and writing the file it
+  `test`. A `TestFile` keeps the names of its tests, the definitions the runner
+  puts at the head of the script it runs (`build_functions_source`) and the
+  shell that runs it (`discovery::script_shell`), not the nodes: all of those
+  are the same for every test in the file, and rendering the script walks each
+  function's AST for its source span — which cost more than reading the file it
   is built from, and a file holding 25 tests paid it 25 times over, once more
   for every `--repeat`. Deriving them at parse time also means the script, the
   spans it is cut with and the shell all come from one read of the file, so
@@ -95,13 +95,25 @@
   `selector` is the other direction — the single spelling of the join, used by
   `list` and by completion — and drops the `./` for the same reason:
   `TestPattern::parse` would otherwise read the whole selector as a path.
-- `src/runner.rs` - For each test: writes all extracted functions (test +
-  helper) to a temp script, forks a child that execs `<shell> -c` (the shell
-  the file's own parse settled on, or `--shebang`) with the original script
-  path as `argv[0]` so `$0` still works, redirects stdout to `stdout.log` and
-  stderr to `xtrace.log`, enables `set -e`, sources the script, and only then
-  turns on `set -x` before invoking the test function by name — so the xtrace
-  log starts at the test itself rather than at the function definitions. The
+- `src/runner.rs` - For each test: forks a child that execs `<shell> -c` (the
+  shell the file's own parse settled on, or `--shebang`) with the original
+  script path as `argv[0]` so `$0` still works. The script it is given is all
+  the file's extracted functions (test + helper) followed by `set -e`, a `cd`
+  into the test's clean working directory and only then `set -x` before the
+  test function is invoked by name — so the xtrace log starts at the test
+  itself rather than at the function definitions. The definitions are carried
+  in the script rather than sourced out of a file beside it: `.` is the one
+  command here a shell need not have, and attest runs whatever shell a
+  shebang names (issue #93). Nothing is emitted above them, since they are
+  rendered at the line numbers they have in the test file and `$LINENO` counts
+  from the first line of the script the shell is running — which is the whole
+  of how `diagnostics` maps a trace line back to the source. The cost is that
+  a file with more than about half a megabyte of function definitions in it
+  cannot be exec'd at all (`E2BIG`, which the spawn error explains). The logs
+  are opened by the parent and handed to the child as its stdout and stderr
+  rather than redirected by the script, so a shell that will not parse the
+  definitions — and so never runs a line of the script — still complains into
+  `xtrace.log` instead of over attest's own output. The
   child pivots into a per-test ephemeral root (see `src/overlay.rs`) when
   available, runs in its own
   session (so timeouts and ^C kill the whole process tree via its process group
