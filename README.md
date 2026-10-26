@@ -324,7 +324,11 @@ one — it scans that whatever it happens to be called.
 Scanning is cheap for the scripts in the tree that aren't tests: a file is only
 parsed as shell once its text actually spells a `test…` function definition, so
 a repository full of build and install scripts costs a read apiece rather than
-a parse apiece.
+a parse apiece. A `--filter` narrows that further, before anything is parsed:
+its file half is a path, so a file it can't name is never even read, and its
+name half says what a definition has to be called, so a file that spells no
+such name is read but not parsed. Re-running one test out of a large tree
+therefore costs about what running that one file costs.
 
 Not every script in a tree is shell `attest` can parse — zsh-only syntax, a
 generated or templated file, or just a script with a syntax error in it. Those
@@ -332,7 +336,9 @@ are reported on stderr and skipped, so one unrelated file can't take down a run
 it has no tests in. Point `attest` straight at such a file, though, and the
 parse error is fatal: you asked for that file specifically — unless it spells
 no test function at all, in which case it is never parsed, and the answer is
-that it holds no tests.
+that it holds no tests. A `--filter` that excludes the file has the same
+effect, and for the same reason: no test of yours can come out of it, so its
+syntax is nobody's business.
 
 Each test runs under the shell its file's shebang asks for, falling back to
 `/bin/sh` when that shell isn't installed and to `bash` for files without a

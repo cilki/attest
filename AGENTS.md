@@ -8,15 +8,22 @@
   the file half matches as a path suffix and a positional target only splits
   where its left half is an existing file, so a base-name-only listing is both
   ambiguous between same-named files and unusable as a target.
-  `parse_discovered` parses every discovered file that could hold a test
-  (`parser::may_define_test` settles that from the text, without a parse): a
+  `parse_discovered` parses every discovered file out of which the selection
+  could pick a test (`parser::Prescan` settles that from the file's path and
+  its text, without a parse): a
   parse error in a file the
   user named directly is
   fatal, while one in a file the directory walk turned up is reported on stderr
   and the file skipped, so an unparseable script elsewhere in the tree cannot
   abort the run. A file that spells no test function is never parsed at all,
   so it is never reported either — named or walked, it holds no test and that
-  is the answer the run gives. How much of the machine that parse gets is
+  is the answer the run gives, and a `--filter` narrows that the same way:
+  `Selection::resolve` builds the pattern before discovery, drops the files
+  its file half cannot name and hands its name half to the scan, so the tests
+  that come out are the same ones and almost none of the tree is parsed for
+  them (5x on a run, 9x on a `list`, over 60 450-line scripts).
+  `Selection::tests` still matches the whole pattern, since a `Prescan` only
+  ever rules files *out*. How much of the machine that parse gets is
   `parse_each`'s `Cores` argument, and it is decided by what *follows* the
   parse rather than by how big it is: a file's parse is independent of every
   other file's, but creating a thread leaves the process multi-threaded for
@@ -70,14 +77,25 @@
   is built from, and a file holding 25 tests paid it 25 times over, once more
   for every `--repeat`. Deriving them at parse time also means the script, the
   spans it is cut with and the shell all come from one read of the file, so
-  they cannot disagree. A file is only parsed at all once `may_define_test`
-  has found the shape of a `test…` definition in its text: the shell parse
+  they cannot disagree. A file is only parsed at all once `Prescan` has found
+  the shape of a selectable definition in its text: the shell parse
   costs about a microsecond per line, the walk hands it every script in the
   tree, and almost none of them define a test. A file that fails that scan
   gets an empty `tests` and an empty `script` — nothing can source a script
   none of whose tests can be selected. The scan may only ever err towards the
   parse: a false positive costs what would have been paid anyway, while a
-  false negative loses a test. Also holds `TestPattern`, the `[<file>/]<name>` selector behind
+  false negative loses a test. A `Prescan` is the whole of what a selection
+  rules out before a parse, so it carries the `--filter` as well as the
+  `test…` rule: the pattern's file half is a path suffix (`admits`, the same
+  `Path::ends_with` the match itself uses) and its name half fixes the literal
+  prefix the definition's name must carry — everything in front of the first
+  `*`, or all of a `*`-less pattern, since that matches as a prefix. One of
+  that and `test` has to contain the other, so the longer is the whole
+  constraint and a name half that extends neither (`--filter overlay`) means
+  no file in the tree holds a selectable test at all. The price of a
+  rejection is the same one the bare `test…` scan already pays: an
+  unparseable script the filter excludes is no longer named on stderr, and
+  neither is a test such a file defines twice. Also holds `TestPattern`, the `[<file>/]<name>` selector behind
   `--filter` and the positional target: the file half is a `Path::ends_with`
   suffix (whole components, no wildcards), the name half a `*` glob that
   degrades to a prefix match when it contains no `*`, and either half may be
