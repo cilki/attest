@@ -933,6 +933,56 @@ fn dir_non_empty(dir: &Path) -> bool {
     overlay::is_real_dir(dir) && std::fs::read_dir(dir).is_ok_and(|mut e| e.next().is_some())
 }
 
+/// Every directory `--save-context` reads out of a finished test's context, as
+/// `(what it is, where it is now, where it goes under the save dir)`.
+///
+/// Shallowest-first and in the order they have to be copied: the root
+/// overlay's upper layer lands at the top of the saved tree, each ephemeral
+/// submount's goes at the absolute path it stands for *inside* that tree, and
+/// the two directories the runner writes into the context dir itself take
+/// names of their own. The working directory is bind-mounted live, so it is in
+/// no overlay and no delta; the `--strace` logs never go through one either.
+///
+/// Listed rather than copied here so that one loop in [`save_test_context`]
+/// does all four, under one rule for what counts as something to copy, one
+/// for how a destination is created, and one for how a failure is reported.
+/// Written out a directory at a time, those were four near-copies that had
+/// already come out differently: the root layer was copied whenever it was a
+/// directory while the rest wanted a non-empty one, and only a submount delta
+/// had its destination built with [`overlay::create_dir_nofollow`] (the others
+/// go one component deep, where `copy_dir_recursive`'s own `unlink_if_symlink`
+/// happens to cover it).
+fn saved_dirs(
+    result: &TestResult,
+    submounts: &[overlay::Submount],
+) -> Vec<(String, PathBuf, PathBuf)> {
+    let context = &result.context;
+    let mut dirs = vec![(
+        "the filesystem delta".to_string(),
+        overlay::upper_dir(context),
+        PathBuf::new(),
+    )];
+    dirs.extend(submounts.iter().filter_map(|sm| {
+        let source = &sm.source;
+        Some((
+            format!("the {} delta", source.display()),
+            overlay::submount_upper_dir(context, sm.ephemeral_upper?),
+            source.strip_prefix("/").unwrap_or(source).to_path_buf(),
+        ))
+    }));
+    dirs.push((
+        "the working directory".to_string(),
+        cwd_dir(context),
+        PathBuf::from("cwd"),
+    ));
+    dirs.push((
+        "the strace logs".to_string(),
+        context.join("strace"),
+        PathBuf::from("strace"),
+    ));
+    dirs
+}
+
 /// Copy the files a finished test created or modified (the upper layers of its
 /// root overlay and of each ephemeral submount overlay, merged and laid out by
 /// absolute path — a write to `/tmp/x` lands at `<dst>/tmp/x`) plus its logs
@@ -954,52 +1004,30 @@ fn save_test_context(result: &TestResult, save_dir: &Path, submounts: &[overlay:
         );
         return;
     };
-    let upper = overlay::upper_dir(&result.context);
-    if overlay::is_real_dir(&upper) {
-        if let Err(e) = overlay::copy_dir_recursive(&upper, &dst) {
-            warn!("failed to save context for {}: {e}", result.name);
-        }
-    } else if let Err(e) = std::fs::create_dir_all(&dst) {
+    // Created up front rather than as a side effect of the first copy: a run
+    // without overlay isolation has no delta to copy at all, and the logs
+    // below still have to land somewhere.
+    if let Err(e) = std::fs::create_dir_all(&dst) {
         warn!("failed to save context for {}: {e}", result.name);
         return;
     }
-    for (i, sm) in submounts.iter().filter(|s| s.ephemeral).enumerate() {
-        let sub_upper = overlay::submount_upper_dir(&result.context, i);
-        if !dir_non_empty(&sub_upper) {
+
+    for (what, src, rel) in saved_dirs(result, submounts) {
+        if !dir_non_empty(&src) {
             continue;
         }
-        let rel = sm.source.strip_prefix("/").unwrap_or(&sm.source);
-        // `rel` is laid out inside the tree just filled from the root upper
-        // layer, so any of its leading components may be a symlink the test
-        // planted (e.g. `/var` replaced by a link to the user's home): create
-        // them explicitly instead of letting `create_dir_all` follow one.
-        let saved = overlay::create_dir_nofollow(&dst, rel)
-            .and_then(|sub_dst| overlay::copy_dir_recursive(&sub_upper, &sub_dst));
-        if let Err(e) = saved {
-            warn!(
-                "failed to save {} delta for {}: {e}",
-                sm.source.display(),
-                result.name
-            );
+        // Every destination is laid out inside the tree the entries before it
+        // have already filled, so any of its leading components may be a
+        // symlink the test planted (`/var` replaced by a link to the user's
+        // home, say): create them explicitly instead of letting
+        // `create_dir_all` follow one.
+        let copied = overlay::create_dir_nofollow(&dst, &rel)
+            .and_then(|into| overlay::copy_dir_recursive(&src, &into));
+        if let Err(e) = copied {
+            warn!("failed to save {what} for {}: {e}", result.name);
         }
     }
-    // The per-test working directory is live-bound inside isolated roots (it
-    // is not part of any overlay upper layer), so copy it explicitly.
-    let cwd = cwd_dir(&result.context);
-    if dir_non_empty(&cwd)
-        && let Err(e) = overlay::copy_dir_recursive(&cwd, &dst.join("cwd"))
-    {
-        warn!("failed to save cwd for {}: {e}", result.name);
-    }
-    // `--strace` logs are written straight into the context dir (not through
-    // any overlay), so they need copying too — otherwise they die with the
-    // temp context and there is no way to read them.
-    let strace = result.context.join("strace");
-    if dir_non_empty(&strace)
-        && let Err(e) = overlay::copy_dir_recursive(&strace, &dst.join("strace"))
-    {
-        warn!("failed to save strace logs for {}: {e}", result.name);
-    }
+
     for log in ["stdout.log", "xtrace.log"] {
         // Both ends of this copy are names a test gets to choose. The source
         // sits in its live context dir, where it can swap the log for a link
@@ -2173,7 +2201,7 @@ mod tests {
         let submounts = [overlay::Submount {
             source: PathBuf::from("/var/tmp"),
             is_dir: true,
-            ephemeral: true,
+            ephemeral_upper: Some(0),
         }];
 
         let save = TempDir::new().unwrap();

@@ -64,9 +64,20 @@ pub struct Submount {
     /// Directory mountpoints are recreated with `mkdir`; file binds (e.g.
     /// `/etc/resolv.conf`) get an empty file to bind over.
     pub is_dir: bool,
-    /// Re-established as an ephemeral overlay (writes discarded) rather than a
-    /// live recursive bind (writes shared with the host).
-    pub ephemeral: bool,
+    /// `Some(i)` when this mount is re-established as an ephemeral overlay
+    /// (writes discarded) rather than as a live recursive bind (writes shared
+    /// with the host), `i` identifying the per-test layer those writes land in
+    /// ([`submount_upper_dir`]).
+    ///
+    /// The index is assigned by the plan rather than recounted by whoever
+    /// needs it. Mounting a test's root ([`RootOverlay::build`]) and reading
+    /// its delta back out (`runner::save_test_context`) both need it, they are
+    /// in different modules, and each used to walk the plan counting ephemeral
+    /// entries to arrive at the same number: two spellings of "the i-th
+    /// ephemeral submount" that have to agree, with nothing but a doc comment
+    /// holding them together, and a delta saved under the wrong path — or not
+    /// at all — the moment they stop.
+    pub ephemeral_upper: Option<usize>,
 }
 
 /// Convert a path to a `CString` for use with libc mount/chdir calls.
@@ -306,6 +317,9 @@ fn plan_submounts(
     targets.dedup();
 
     let mut out: Vec<Submount> = Vec::new();
+    // Upper layers are numbered as the ephemeral entries are planned, so the
+    // number is settled here once and read off the plan everywhere else.
+    let mut next_upper = 0;
     for m in targets {
         if m == root {
             continue;
@@ -314,15 +328,21 @@ fn plan_submounts(
         if !is_ephemeral
             && out
                 .iter()
-                .any(|k| !k.ephemeral && m.starts_with(&k.source) && m != k.source)
+                .any(|k| k.ephemeral_upper.is_none() && m.starts_with(&k.source) && m != k.source)
         {
             continue; // already carried by a live ancestor's recursive bind
         }
         let is_dir = is_ephemeral || kind(&m).unwrap_or(true);
+        // An ephemeral entry takes the next free upper layer; a live bind has
+        // none of its own.
+        let ephemeral_upper = is_ephemeral.then(|| {
+            next_upper += 1;
+            next_upper - 1
+        });
         out.push(Submount {
             source: m,
             is_dir,
-            ephemeral: is_ephemeral,
+            ephemeral_upper,
         });
     }
     out
@@ -345,8 +365,8 @@ fn work_dir(context: &Path) -> PathBuf {
 fn merged_dir(context: &Path) -> PathBuf {
     context.join("merged")
 }
-/// Upper layer of the i-th ephemeral submount, counting `ephemeral` entries of
-/// the submount plan in order.
+/// Upper layer of the ephemeral submount numbered `i` by the plan (see
+/// [`Submount::ephemeral_upper`]).
 pub fn submount_upper_dir(context: &Path, i: usize) -> PathBuf {
     context.join(format!("sub{i}-upper"))
 }
@@ -407,28 +427,26 @@ impl RootOverlay {
         let (uid_map, gid_map) = id_maps();
 
         let mut steps = Vec::with_capacity(submounts.len());
-        let mut eph = 0;
         for sm in submounts {
             let target = cstr(&join_abs(&merged, &sm.source))?;
-            if sm.ephemeral {
-                let (sub_upper, sub_work) = (
-                    submount_upper_dir(context, eph),
-                    submount_work_dir(context, eph),
-                );
-                eph += 1;
-                std::fs::create_dir_all(&sub_upper)?;
-                std::fs::create_dir_all(&sub_work)?;
-                steps.push(MountStep::Overlay {
-                    opts: overlay_opts(&sm.source, &sub_upper, &sub_work, mode)?,
-                    target,
-                });
-            } else {
+            let Some(i) = sm.ephemeral_upper else {
                 steps.push(MountStep::Bind {
                     src: cstr(&sm.source)?,
                     dst: target,
                     is_dir: sm.is_dir,
                 });
-            }
+                continue;
+            };
+            let (sub_upper, sub_work) = (
+                submount_upper_dir(context, i),
+                submount_work_dir(context, i),
+            );
+            std::fs::create_dir_all(&sub_upper)?;
+            std::fs::create_dir_all(&sub_work)?;
+            steps.push(MountStep::Overlay {
+                opts: overlay_opts(&sm.source, &sub_upper, &sub_work, mode)?,
+                target,
+            });
         }
 
         Ok(RootOverlay {
@@ -882,7 +900,7 @@ mod tests {
             &[Submount {
                 source: PathBuf::from("/tmp"),
                 is_dir: true,
-                ephemeral: true,
+                ephemeral_upper: Some(0),
             }],
         )
         .unwrap();
@@ -966,9 +984,15 @@ mod tests {
         let plan = plan_submounts(mounts, Path::new("/workspace/proj"), all_dirs);
         let get = |p: &str| plan.iter().find(|s| s.source == Path::new(p)).unwrap();
         assert!(!plan.iter().any(|s| s.source == Path::new("/")));
-        assert!(!get("/proc").ephemeral);
-        assert!(get("/tmp").ephemeral);
-        assert!(get("/workspace").ephemeral);
+        assert!(get("/proc").ephemeral_upper.is_none());
+        assert!(get("/tmp").ephemeral_upper.is_some());
+        assert!(get("/workspace").ephemeral_upper.is_some());
+        // Each ephemeral entry owns a layer of its own, numbered from zero in
+        // plan order: the index is what pairs a saved delta with the path it
+        // was written to, so two of them sharing a number would merge or lose
+        // one test's writes.
+        let uppers: Vec<usize> = plan.iter().filter_map(|s| s.ephemeral_upper).collect();
+        assert_eq!(uppers, vec![0, 1]);
     }
 
     #[test]
@@ -982,8 +1006,11 @@ mod tests {
         let plan = plan_submounts(mounts, Path::new("/home/u/proj"), all_dirs);
         let get = |p: &str| plan.iter().find(|s| s.source == Path::new(p)).unwrap();
 
-        assert!(!get("/var").ephemeral, "/var itself stays live");
-        assert!(get("/var/tmp").ephemeral);
+        assert!(
+            get("/var").ephemeral_upper.is_none(),
+            "/var itself stays live"
+        );
+        assert!(get("/var/tmp").ephemeral_upper.is_some());
         assert!(get("/var/tmp").is_dir);
         // The overlay has to be mounted after the bind that carries its target.
         let order: Vec<&Path> = plan.iter().map(|s| s.source.as_path()).collect();
@@ -1006,7 +1033,8 @@ mod tests {
             plan.iter()
                 .find(|s| s.source == Path::new("/var"))
                 .unwrap()
-                .ephemeral
+                .ephemeral_upper
+                .is_some()
         );
         assert!(!plan.iter().any(|s| s.source == Path::new("/var/tmp")));
     }
@@ -1045,11 +1073,11 @@ mod tests {
         assert!(!paths.contains(&Path::new("/proc/sys/fs/binfmt_misc")));
         assert!(paths.contains(&Path::new("/workspace/nested")));
         assert!(
-            !plan
-                .iter()
+            plan.iter()
                 .find(|s| s.source == Path::new("/workspace/nested"))
                 .unwrap()
-                .ephemeral
+                .ephemeral_upper
+                .is_none()
         );
     }
 
