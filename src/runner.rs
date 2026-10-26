@@ -1388,7 +1388,7 @@ mod tests {
     fn parse_script(dir: &Path, script: &str) -> crate::parser::TestFile {
         let path = dir.join("t.sh");
         fs::write(&path, script).unwrap();
-        crate::parser::parse_test_file(&path).unwrap()
+        crate::parser::parse_test_file(&path, &crate::parser::Prescan::default()).unwrap()
     }
 
     /// Block until `pending` finishes, reaping it exactly the way the poll

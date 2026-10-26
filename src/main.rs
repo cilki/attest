@@ -218,6 +218,10 @@ fn split_path_arg(arg: &str) -> (PathBuf, Option<String>) {
 /// [`parser::TestFile`] carries the path it came from, so nothing else has to
 /// be kept alongside.
 ///
+/// `scan` is what the selection already rules out, and a file it rejects is
+/// not parsed (see [`parser::Prescan`]) — which, under a `--filter`, is most
+/// of a tree.
+///
 /// When the target was a single file the user named, a parse error is the
 /// answer to what they asked for and stays fatal. A directory target is
 /// different: the walk picks up *every* shell script in the tree, most of
@@ -229,12 +233,13 @@ fn parse_discovered(
     files: Vec<PathBuf>,
     explicit_file: bool,
     cores: Cores,
+    scan: &parser::Prescan,
 ) -> anyhow::Result<Vec<parser::TestFile>> {
     let mut parsed = Vec::with_capacity(files.len());
     // Reported here, on this thread and in discovery order, however the parse
     // was spread: which file was skipped is part of what the run covers, so
     // the warnings have to read the same way from one run to the next.
-    for result in parse_each(&files, cores) {
+    for result in parse_each(&files, cores, scan) {
         match result {
             Ok(test_file) => parsed.push(test_file),
             Err(e) if explicit_file => return Err(e),
@@ -293,7 +298,11 @@ enum Cores {
 /// files are claimed one at a time as workers come free, since a tree's
 /// scripts differ in length by orders of magnitude and a fixed split would
 /// leave whoever drew the big ones parsing alone.
-fn parse_each(files: &[PathBuf], cores: Cores) -> Vec<anyhow::Result<parser::TestFile>> {
+fn parse_each(
+    files: &[PathBuf],
+    cores: Cores,
+    scan: &parser::Prescan,
+) -> Vec<anyhow::Result<parser::TestFile>> {
     let workers = match cores {
         Cores::One => 1,
         Cores::All => std::thread::available_parallelism()
@@ -301,7 +310,10 @@ fn parse_each(files: &[PathBuf], cores: Cores) -> Vec<anyhow::Result<parser::Tes
             .min(files.len()),
     };
     if workers <= 1 {
-        return files.iter().map(|f| parser::parse_test_file(f)).collect();
+        return files
+            .iter()
+            .map(|f| parser::parse_test_file(f, scan))
+            .collect();
     }
 
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -309,11 +321,11 @@ fn parse_each(files: &[PathBuf], cores: Cores) -> Vec<anyhow::Result<parser::Tes
         Vec::with_capacity(files.len());
     std::thread::scope(|scope| {
         let handles: Vec<_> = (1..workers)
-            .map(|_| scope.spawn(|| parse_claimed(files, &next)))
+            .map(|_| scope.spawn(|| parse_claimed(files, &next, scan)))
             .collect();
         // This thread is one of the workers: spawning `workers` of them and
         // then only waiting would leave a core to the scheduler's discretion.
-        parsed.extend(parse_claimed(files, &next));
+        parsed.extend(parse_claimed(files, &next, scan));
         for handle in handles {
             match handle.join() {
                 Ok(done) => parsed.extend(done),
@@ -333,6 +345,7 @@ fn parse_each(files: &[PathBuf], cores: Cores) -> Vec<anyhow::Result<parser::Tes
 fn parse_claimed(
     files: &[PathBuf],
     next: &std::sync::atomic::AtomicUsize,
+    scan: &parser::Prescan,
 ) -> Vec<(usize, anyhow::Result<parser::TestFile>)> {
     let mut done = Vec::new();
     loop {
@@ -340,7 +353,7 @@ fn parse_claimed(
         let Some(file) = files.get(i) else {
             return done;
         };
-        done.push((i, parser::parse_test_file(file)));
+        done.push((i, parser::parse_test_file(file, scan)));
     }
 }
 
@@ -353,8 +366,13 @@ fn parse_claimed(
 struct Selection {
     /// The path half of the target, kept for the "nothing found" message.
     path: PathBuf,
-    /// `--filter`, or the name half the target carried.
+    /// `--filter`, or the name half the target carried, as written — kept for
+    /// the "nothing matched" message.
     filter: Option<String>,
+    /// The parsed form of [`Selection::filter`]. Built once, because it
+    /// decides which files are worth parsing as well as which of their tests
+    /// are selected, and those two have to be the same pattern.
+    pattern: Option<parser::TestPattern>,
     /// The files that parsed, in discovery order. Each file is parsed exactly
     /// once and kept alive here, so every test can borrow its path and the
     /// script the runner sources rather than re-deriving either per test (and
@@ -372,26 +390,44 @@ impl Selection {
     /// one (see [`Cores`] for why they ask for different amounts of machine).
     fn resolve(target: &str, filter: Option<String>, cores: Cores) -> anyhow::Result<Self> {
         let (path, inline_filter) = split_path_arg(target);
-        let files = parse_discovered(
-            discovery::discover_test_files(&path)?,
-            path.is_file(),
-            cores,
-        )?;
+        let filter = filter.or(inline_filter);
+        let pattern = filter.as_deref().map(parser::TestPattern::parse);
+
+        // What the selection already rules out, applied before the parse
+        // instead of after it: a filter normally excludes almost every script
+        // the walk turns up, and parsing one costs orders of magnitude more
+        // than deciding not to (see `parser::Prescan`).
+        let scan = pattern
+            .as_ref()
+            .map_or_else(parser::Prescan::default, parser::Prescan::of);
+        let files: Vec<PathBuf> = discovery::discover_test_files(&path)?
+            .into_iter()
+            .filter(|file| scan.admits(file))
+            .collect();
+
         Ok(Self {
+            files: parse_discovered(files, path.is_file(), cores, &scan)?,
             path,
-            filter: filter.or(inline_filter),
-            files,
+            filter,
+            pattern,
         })
     }
 
     /// The selected tests as `(function name, the file defining it)`, in
     /// discovery order.
+    ///
+    /// The pattern has the final say even though it already narrowed the
+    /// parse: a [`parser::Prescan`] only ever rules files *out*, so every file
+    /// here still reports every test in it.
     fn tests(&self) -> Vec<(&str, &parser::TestFile)> {
-        let pattern = self.filter.as_deref().map(parser::TestPattern::parse);
         self.files
             .iter()
             .flat_map(|file| file.tests.iter().map(move |name| (name.as_str(), file)))
-            .filter(|&(name, file)| pattern.as_ref().is_none_or(|p| p.matches(&file.path, name)))
+            .filter(|&(name, file)| {
+                self.pattern
+                    .as_ref()
+                    .is_none_or(|p| p.matches(&file.path, name))
+            })
             .collect()
     }
 
@@ -468,7 +504,9 @@ fn complete_tests(current: &std::ffi::OsStr, arg: Completing) -> Vec<CompletionC
     // Spread over the machine, because nothing here forks afterwards: a tab is
     // a keystroke, and parsing the tree is the whole of what the wait is (see
     // `parse_each`).
-    let parsed = parse_each(&files, Cores::All);
+    // Unconstrained: a completion offers every test there is, so there is
+    // nothing here for a `Prescan` to rule out.
+    let parsed = parse_each(&files, Cores::All, &parser::Prescan::default());
 
     let mut candidates = Vec::new();
     let mut offered_names = std::collections::HashSet::new();
@@ -661,7 +699,7 @@ mod tests {
     // Unterminated double quote: valid for no shell. Spelled inside a test
     // function, so the file is one the parser is asked about at all (a script
     // that spells no test function is never parsed — see
-    // `parser::may_define_test` and the test below).
+    // `parser::Prescan` and the test below).
     const BROKEN: &str = "#!/bin/bash\ntest_broken() {\n\techo \"unterminated\n}\n";
     // The same syntax error in the kind of script a tree can contain without
     // it having anything to do with the tests.
@@ -679,8 +717,13 @@ mod tests {
         let broken = script(tmp.path(), "broken.sh", BROKEN);
         let good = script(tmp.path(), "good.test", GOOD);
 
-        let parsed = parse_discovered(vec![broken, good.clone()], false, Cores::One)
-            .expect("one bad script must not abort a directory run");
+        let parsed = parse_discovered(
+            vec![broken, good.clone()],
+            false,
+            Cores::One,
+            &parser::Prescan::default(),
+        )
+        .expect("one bad script must not abort a directory run");
 
         // Only the file that parsed is kept, and it knows where it came from.
         assert_eq!(parsed.len(), 1);
@@ -693,7 +736,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let broken = script(tmp.path(), "broken.sh", BROKEN);
 
-        let Err(err) = parse_discovered(vec![broken], true, Cores::One) else {
+        let Err(err) =
+            parse_discovered(vec![broken], true, Cores::One, &parser::Prescan::default())
+        else {
             panic!("a file the user named must not be skipped silently");
         };
         assert!(err.to_string().starts_with("parse error in "), "{err}");
@@ -715,8 +760,8 @@ mod tests {
             .map(|i| script(tmp.path(), &format!("f{i:02}.sh"), bodies[i % bodies.len()]))
             .collect();
 
-        let spread = parse_each(&files, Cores::All);
-        let one = parse_each(&files, Cores::One);
+        let spread = parse_each(&files, Cores::All, &parser::Prescan::default());
+        let one = parse_each(&files, Cores::One, &parser::Prescan::default());
         assert_eq!(spread.len(), files.len());
         assert_eq!(one.len(), files.len());
 
@@ -753,11 +798,99 @@ mod tests {
         let broken = script(tmp.path(), "broken.sh", BROKEN_WITHOUT_TESTS);
 
         for named in [true, false] {
-            let parsed = parse_discovered(vec![broken.clone()], named, Cores::One)
-                .expect("a script with no test in it must not fail a run");
+            let parsed = parse_discovered(
+                vec![broken.clone()],
+                named,
+                Cores::One,
+                &parser::Prescan::default(),
+            )
+            .expect("a script with no test in it must not fail a run");
             assert_eq!(parsed.len(), 1);
             assert!(parsed[0].tests.is_empty());
         }
+    }
+
+    /// A `--filter` decides which files are parsed as well as which of their
+    /// tests come out, and narrowing the parse may not change the answer:
+    /// whichever half of the pattern did the narrowing, the selection is the
+    /// one the pattern describes.
+    #[test]
+    fn a_filter_selects_the_same_tests_whether_or_not_it_narrowed_the_parse() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        script(
+            tmp.path(),
+            "a.test",
+            "testAlpha() {\n\ttrue\n}\ntestBeta() {\n\ttrue\n}\n",
+        );
+        script(tmp.path(), "b.test", "testAlpha() {\n\ttrue\n}\n");
+        let dir = tmp.path().to_str().unwrap();
+
+        let selected = |filter: Option<&str>| {
+            let selection =
+                Selection::resolve(dir, filter.map(str::to_string), Cores::One).unwrap();
+            let tests: Vec<String> = selection
+                .tests()
+                .into_iter()
+                .map(|(name, file)| parser::selector(&file.path, name))
+                .collect();
+            (selection.files.len(), tests)
+        };
+
+        // No filter: both files parse and every test is selected.
+        let (parsed, tests) = selected(None);
+        assert_eq!(parsed, 2);
+        assert_eq!(tests.len(), 3);
+
+        // The file half rules b.test out before it is read at all.
+        let (parsed, tests) = selected(Some("a.test/"));
+        assert_eq!(parsed, 1);
+        assert_eq!(
+            tests,
+            [
+                parser::selector(&tmp.path().join("a.test"), "testAlpha"),
+                parser::selector(&tmp.path().join("a.test"), "testBeta"),
+            ]
+        );
+
+        // The name half leaves both files candidates but only one of them
+        // spells a name it can match.
+        let (_, tests) = selected(Some("testBeta"));
+        assert_eq!(
+            tests,
+            [parser::selector(&tmp.path().join("a.test"), "testBeta")]
+        );
+
+        // Both halves at once.
+        let (parsed, tests) = selected(Some("b.test/testAlpha"));
+        assert_eq!(parsed, 1);
+        assert_eq!(
+            tests,
+            [parser::selector(&tmp.path().join("b.test"), "testAlpha")]
+        );
+    }
+
+    /// A file no selected test can come out of is a file the run has nothing
+    /// to say about — the same bargain the bare `test…` scan already makes.
+    /// So an unparseable script a `--filter` excludes is not parsed, by either
+    /// half of the pattern, and nothing about it is reported.
+    #[test]
+    fn a_filter_excuses_the_files_it_excludes_from_the_parse() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        script(tmp.path(), "broken.sh", BROKEN);
+        script(tmp.path(), "good.test", GOOD);
+        let dir = tmp.path().to_str().unwrap();
+
+        // The file half: broken.sh is not even read.
+        let selection = Selection::resolve(dir, Some("good.test/".into()), Cores::One).unwrap();
+        assert_eq!(selection.files.len(), 1);
+        assert_eq!(selection.tests().len(), 1);
+
+        // The name half: broken.sh is read but, spelling no `testGood…`, it is
+        // never handed to the parser — so its syntax error is not reported and
+        // it contributes nothing.
+        let selection = Selection::resolve(dir, Some("testGood".into()), Cores::One).unwrap();
+        assert_eq!(selection.files.len(), 2);
+        assert_eq!(selection.tests().len(), 1);
     }
 
     /// A `./`-prefixed target keeps selecting the test it names.
@@ -815,7 +948,7 @@ mod tests {
         discovery::discover_test_files(Path::new("."))
             .unwrap()
             .into_iter()
-            .filter_map(|f| parser::parse_test_file(&f).ok())
+            .filter_map(|f| parser::parse_test_file(&f, &parser::Prescan::default()).ok())
             .flat_map(|tf| {
                 tf.tests
                     .iter()
