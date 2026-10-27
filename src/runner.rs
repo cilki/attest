@@ -248,7 +248,7 @@ pub struct TestResult {
 
 /// State held by the parent for a spawned test child that has not yet been
 /// waited on. Dropping this kills the child (if still running) and cleans up.
-struct PendingTest {
+struct PendingTest<'a> {
     child: Child,
     /// Set once the child has been waited on. The kernel is free to hand its
     /// pid to a new process from that moment, so nothing may be signalled
@@ -261,10 +261,14 @@ struct PendingTest {
     /// `None` after the path has been transferred to `TestResult`.
     context: Option<PathBuf>,
     source_path: PathBuf,
+    /// The parse the test was run from: the failure report renders its
+    /// snippet out of the script this holds (see
+    /// [`crate::diagnostics::print_failure_snippet`]).
+    file: &'a crate::parser::TestFile,
     cgroup: Option<crate::cgroup::TestCgroup>,
 }
 
-impl PendingTest {
+impl PendingTest<'_> {
     /// Kill the test's entire process tree: the child was made a session (and
     /// process-group) leader at spawn, so its pgid is its pid. The cgroup, when
     /// present, also catches processes that re-`setsid`'d themselves.
@@ -335,7 +339,7 @@ impl PendingTest {
     }
 }
 
-impl Drop for PendingTest {
+impl Drop for PendingTest<'_> {
     fn drop(&mut self) {
         // Kill the tree in case the test was abandoned before being reaped
         // (--bail, a timeout, ^C). A test that went through `reap` was already
@@ -452,7 +456,7 @@ pub struct TestSpec<'a> {
     pub file: &'a crate::parser::TestFile,
 }
 
-pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec<TestResult>> {
+pub fn run_all_tests<'a>(tests: Vec<TestSpec<'a>>, config: &RunConfig) -> Result<Vec<TestResult>> {
     // First thing in the run: the block has to be in place before any thread
     // that could take a `SIGCHLD` delivery instead of leaving it pending — the
     // status bar's ticker, below, is one (see `ChildWaiter`).
@@ -465,7 +469,7 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
 
     let max_parallel = config.parallel.max(1);
     let mut test_iter = tests.into_iter();
-    let mut pending_list: Vec<PendingTest> = Vec::new();
+    let mut pending_list: Vec<PendingTest<'a>> = Vec::new();
     let mut bail_flag = false;
     let mut rng: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -475,9 +479,6 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
     // `-vv`. Nothing else records that `-vv` was asked for: every site below
     // reads `config.verbose` for itself, the way the failure report does.
     let mut tailed: Option<Tailed> = None;
-    // Shared by every failure report in the run: a file is read and parsed the
-    // first time one of its tests fails, not once per failing test.
-    let mut sources = crate::diagnostics::SourceCache::default();
 
     let tmp = private_temp_dir()?;
 
@@ -526,7 +527,7 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
     }
 
     let mut context_names = std::collections::HashSet::new();
-    let mut spawn = |spec: TestSpec| {
+    let mut spawn = |spec: TestSpec<'a>| -> Result<PendingTest<'a>> {
         let dir = context_dir_name(&spec.display, &mut context_names);
         spawn_test(&spec, contexts_dir.join(dir), config, &env)
     };
@@ -584,8 +585,9 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
 
         // Non-blocking reap: walk the pending list, taking out whatever has
         // finished. `i` only advances past tests that are still running, so a
-        // removal leaves it pointing at the next candidate.
-        let mut completed: Vec<TestResult> = Vec::new();
+        // removal leaves it pointing at the next candidate. Each result keeps
+        // the parse it ran from alongside, for the failure report.
+        let mut completed: Vec<(TestResult, &crate::parser::TestFile)> = Vec::new();
         let mut i = 0;
         while i < pending_list.len() {
             let exit_status = match pending_list[i].reap() {
@@ -603,17 +605,18 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
             if bail_flag {
                 continue; // Drop kills + cleans up
             }
+            let file = pending.file;
             let result = build_result(pending, exit_status);
             if let Some(ref save_dir) = config.save_context {
                 save_test_context(&result, save_dir, &env.submounts);
             }
-            completed.push(result);
+            completed.push((result, file));
         }
 
         // Print results and start new tests.
         // Sort completed by name for deterministic output within a reap batch.
-        completed.sort_by(|a, b| a.name.cmp(&b.name));
-        for result in completed {
+        completed.sort_by(|(a, _), (b, _)| a.name.cmp(&b.name));
+        for (result, file) in completed {
             if config.json {
                 output::print_test_result_json(&result);
             } else {
@@ -626,9 +629,7 @@ pub fn run_all_tests(tests: Vec<TestSpec<'_>>, config: &RunConfig) -> Result<Vec
                     if config.verbose < 2 {
                         status.suspend(|| dump_xtrace_log(&result.name, &result.context));
                     }
-                    status.suspend(|| {
-                        crate::diagnostics::print_failure_snippet(&result, &mut sources)
-                    });
+                    status.suspend(|| crate::diagnostics::print_failure_snippet(&result, file));
                 }
             }
             if !result.outcome.passed() && config.bail {
@@ -750,12 +751,12 @@ fn context_dir_name(display_name: &str, taken: &mut std::collections::HashSet<St
 /// Spawn a child process that will run the test. Returns a `PendingTest` that
 /// the caller must reap (or simply drop to kill+clean up). `context` must be
 /// unique per test (the caller derives it from the unique display name).
-fn spawn_test(
-    spec: &TestSpec,
+fn spawn_test<'a>(
+    spec: &TestSpec<'a>,
     context: PathBuf,
     config: &RunConfig,
     env: &RunEnv,
-) -> Result<PendingTest> {
+) -> Result<PendingTest<'a>> {
     let display_name = &spec.display;
     std::fs::create_dir_all(&context)?;
 
@@ -913,6 +914,7 @@ fn spawn_test(
         start,
         context: Some(context),
         source_path: source_path_owned,
+        file: spec.file,
         cgroup,
     })
 }
@@ -2270,6 +2272,8 @@ mod tests {
         }
 
         let result = result_in(ctx, "test_wedge");
+        let srcdir = TempDir::new().unwrap();
+        let tf = parse_script(srcdir.path(), "test_wedge() {\n  false\n}\n");
 
         // Every place a finished test's logs are read back, on a deadline: a
         // regression is a hang rather than a failed assertion, so the test has
@@ -2279,10 +2283,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             dump_xtrace_log(&result.name, result.context.as_path());
-            crate::diagnostics::print_failure_snippet(
-                &result,
-                &mut crate::diagnostics::SourceCache::default(),
-            );
+            crate::diagnostics::print_failure_snippet(&result, &tf);
             output::print_test_result_json(&result);
             save_test_context(&result, &save_dir, &[]);
             let _ = tx.send(());

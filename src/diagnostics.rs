@@ -1,9 +1,7 @@
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-
-use brush_parser::ast::SourceLocation;
+use std::path::Path;
 
 use crate::output::{Palette, out_palette, outln};
+use crate::parser::TestFile;
 use crate::runner::{Outcome, TestResult};
 
 /// Information extracted from an xtrace log about the failing command.
@@ -23,81 +21,24 @@ struct BracketExpr {
     right: String,
 }
 
-/// What a snippet needs out of a test's source file, read and parsed once per
-/// file for the length of a run (see [`SourceCache`]).
-struct SourceFile {
-    text: String,
-    /// 0-based inclusive `(first, last)` line of every function definition in
-    /// the file, in source order.
-    functions: Vec<(usize, usize)>,
-}
-
-impl SourceFile {
-    fn read(path: &Path) -> Option<Self> {
-        let text = std::fs::read_to_string(path).ok()?;
-        let functions = function_bounds(&text);
-        Some(Self { text, functions })
-    }
-
-    /// Line range of the function definition enclosing `line` (0-based), or
-    /// `None` if the line is not inside a function.
-    fn enclosing_function(&self, line: usize) -> Option<(usize, usize)> {
-        self.functions
-            .iter()
-            .copied()
-            .find(|&(start, end)| (start..=end).contains(&line))
-    }
-}
-
-/// The source files a run has already rendered a snippet from.
+/// Print a source snippet showing where a failed test went wrong. `file` is the
+/// parse the test was run from.
 ///
-/// Every failure needs its file's text and the line ranges of the functions in
-/// it, and the ranges come from a full shell parse of the file (see
-/// [`function_bounds`]). Both depend only on the file, so a run that reports n
-/// failures out of one file used to read and re-parse that file n times — on
-/// the parent's critical path, between the failing test and the next one being
-/// spawned. Parsing is by far the most expensive thing a report does, so a
-/// suite failing in bulk (every test in a file asserting against the same
-/// changed behaviour — the ordinary way a suite fails) spent most of its run in
-/// it.
-///
-/// Reading once per file also keeps a snippet self-consistent: the annotated
-/// line and the function bounds that clamp the window around it come from the
-/// same text, rather than from two reads a test's worth of time apart.
-///
-/// What it holds is the text of each script a failure has been reported from —
-/// bounded by the tree the run covers, and each of them a file the discovery
-/// parse already read whole. Nothing a test writes goes in here; the logs are
-/// still streamed (see `crate::output::replay_log_err`).
-#[derive(Default)]
-pub struct SourceCache {
-    /// `None` for a file that could not be read or parsed, so it is not
-    /// retried once per failure either.
-    files: HashMap<PathBuf, Option<SourceFile>>,
-}
-
-impl SourceCache {
-    fn get(&mut self, path: &Path) -> Option<&SourceFile> {
-        self.files
-            .entry(path.to_path_buf())
-            .or_insert_with(|| SourceFile::read(path))
-            .as_ref()
-    }
-}
-
-/// Print a source snippet showing where a failed test went wrong.
-pub fn print_failure_snippet(result: &TestResult, sources: &mut SourceCache) {
+/// The lines rendered are the script's ([`TestFile::script`]): the xtrace line
+/// number is the shell's `$LINENO`, which counts lines of the script it is
+/// running, and that script is the file's function definitions at their own
+/// line numbers with nothing in front of them — so the number indexes the
+/// source directly, and the script *is* the source wherever a function is.
+/// Taking the lines, and the function bounds that clamp the window around
+/// them, from the parse rather than reading the file back means they come from
+/// the one text the test actually ran: no second read, no second shell parse
+/// per failure, and no way for the file to have changed in between.
+pub fn print_failure_snippet(result: &TestResult, file: &TestFile) {
     let Some(failure) = parse_xtrace_failure(&result.context) else {
         return;
     };
 
-    // The runner script carries each function at its original source line
-    // number, so the xtrace line number (the shell's `$LINENO`) indexes the
-    // original source directly — no text matching required.
-    let Some(source) = sources.get(&result.source_path) else {
-        return;
-    };
-    let lines: Vec<&str> = source.text.lines().collect();
+    let lines: Vec<&str> = file.script.lines().collect();
     let Some(line_idx) = failure.lineno.checked_sub(1) else {
         return;
     };
@@ -115,7 +56,7 @@ pub fn print_failure_snippet(result: &TestResult, sources: &mut SourceCache) {
 
     // Clamp the rendered context to the enclosing function so a snippet never
     // leaks into an adjacent test.
-    let (func_start_line, func_end_line) = source
+    let (func_start_line, func_end_line) = file
         .enclosing_function(line_idx)
         .unwrap_or((line_idx, line_idx));
 
@@ -215,32 +156,6 @@ fn parse_trace_line(line: &str) -> Option<FailureInfo> {
         lineno: lineno.trim().parse().ok()?,
         command: command.to_string(),
     })
-}
-
-/// 0-based inclusive line ranges of the function definitions in `source`, in
-/// source order. Used to clamp a rendered context window to the enclosing
-/// function.
-///
-/// The bounds come from the same shell parser the runner uses to extract test
-/// functions, so quoting, `${...}`, comments and heredocs are all accounted for
-/// — a brace-counting scan over the raw lines would miscount any of them and
-/// clamp the window to the wrong range. That parse is what makes this worth
-/// caching per file rather than computing per failure (see [`SourceCache`]).
-fn function_bounds(source: &str) -> Vec<(usize, usize)> {
-    let Ok(functions) = crate::parser::parse_functions(source) else {
-        return Vec::new();
-    };
-    functions
-        .iter()
-        .filter_map(|f| f.location())
-        // Spans are 1-based and inclusive of the closing brace's line.
-        .map(|span| {
-            (
-                span.start.line.saturating_sub(1),
-                span.end.line.saturating_sub(1),
-            )
-        })
-        .collect()
 }
 
 /// How many lines of context to show on each side of the annotated line.
@@ -830,89 +745,5 @@ mod tests {
             }
         }
         out
-    }
-
-    /// The bounds of the function enclosing `line` (0-based), parsed straight
-    /// from `source` — what a report asks a [`SourceFile`] for.
-    fn enclosing_function_bounds(source: &str, line: usize) -> Option<(usize, usize)> {
-        SourceFile {
-            text: source.to_string(),
-            functions: function_bounds(source),
-        }
-        .enclosing_function(line)
-    }
-
-    #[test]
-    fn a_source_file_is_read_and_parsed_once_per_run() {
-        // Every failure out of a file needs the same text and the same function
-        // bounds, and the bounds cost a full shell parse. Rewriting the file
-        // between the two lookups is how a second read makes itself visible.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("x.test");
-        std::fs::write(&path, "test_a() {\n  false\n}\n").unwrap();
-
-        let mut cache = SourceCache::default();
-        let first = cache.get(&path).expect("the file is readable");
-        assert_eq!(first.functions, vec![(0, 2)]);
-
-        std::fs::write(&path, "test_b() {\n  :\n}\ntest_c() {\n  :\n}\n").unwrap();
-        let again = cache.get(&path).expect("still cached");
-        assert_eq!(again.text, "test_a() {\n  false\n}\n");
-        assert_eq!(again.functions, vec![(0, 2)]);
-    }
-
-    #[test]
-    fn an_unreadable_source_is_not_retried_per_failure() {
-        // A file that is gone (a test that moved its own source, say) must not
-        // cost an `open` per failure either; the miss is remembered.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("missing.test");
-
-        let mut cache = SourceCache::default();
-        assert!(cache.get(&path).is_none());
-
-        std::fs::write(&path, "test_a() {\n  :\n}\n").unwrap();
-        assert!(
-            cache.get(&path).is_none(),
-            "the file was read a second time"
-        );
-    }
-
-    #[test]
-    fn enclosing_bounds_finds_containing_function() {
-        // 0-based lines: 0            1              2   3  4              5            6       7
-        let source = "helper() {\n  echo setup\n}\n\ntest_foo() {\n  echo hello\n  false\n}\n";
-        // Line 6 (`false`) is inside test_foo (lines 4..=7).
-        assert_eq!(enclosing_function_bounds(source, 6), Some((4, 7)));
-        // Line 1 (`echo setup`) is inside helper (lines 0..=2).
-        assert_eq!(enclosing_function_bounds(source, 1), Some((0, 2)));
-        // Line 3 (the blank separator) is inside no function.
-        assert_eq!(enclosing_function_bounds(source, 3), None);
-    }
-
-    #[test]
-    fn enclosing_bounds_handles_brace_on_next_line() {
-        assert_eq!(
-            enclosing_function_bounds("test_foo ()\n{\n  false\n}\n", 2),
-            Some((0, 3))
-        );
-    }
-
-    #[test]
-    fn enclosing_bounds_ignores_braces_inside_words() {
-        // Braces that are part of a string, a parameter expansion or a comment
-        // are not block delimiters; a line-by-line brace count would close the
-        // function early and lose the context window around the failing line.
-        let source = "test_foo() {\n  echo \"}\"\n  echo \"${x}\"\n  # }\n  false\n}\n";
-        assert_eq!(enclosing_function_bounds(source, 4), Some((0, 5)));
-    }
-
-    #[test]
-    fn enclosing_bounds_ignores_non_function_blocks() {
-        // A subshell or a brace group at top level is not a function, so a
-        // failure inside one gets no function clamp.
-        let source = "(\n  false\n)\n\ntest_foo() {\n  false\n}\n";
-        assert_eq!(enclosing_function_bounds(source, 1), None);
-        assert_eq!(enclosing_function_bounds(source, 5), Some((4, 6)));
     }
 }

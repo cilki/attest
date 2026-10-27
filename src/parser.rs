@@ -31,6 +31,17 @@ pub struct TestFile {
     /// run of one of this file's tests, so a file with no test in it has
     /// nothing to run them (see [`parse_test_file`]).
     pub script: String,
+    /// The 0-based inclusive line range each function definition occupies in
+    /// [`TestFile::script`], in source order.
+    ///
+    /// Recorded as the script is rendered, because that is the one place the
+    /// answer is certain: a located function sits at its source lines, and one
+    /// the parser gave no span for sits wherever the fallback rendering put
+    /// it. The failure snippet clamps its window to the function around the
+    /// failing line, and it used to re-read the file and parse it a second time
+    /// to find these — bounds for the *source*, which are only the bounds of
+    /// the script the shell ran when every function was located.
+    pub functions: Vec<(usize, usize)>,
     /// The shell the runner execs to define [`TestFile::script`] and call one
     /// of [`TestFile::tests`], unless `--shebang` overrides it (see
     /// [`crate::discovery::script_shell`]).
@@ -40,6 +51,17 @@ pub struct TestFile {
     /// used to reopen and re-read on every spawn, and so once more for every
     /// `--repeat`. The text this parse read is already the first line.
     pub shell: String,
+}
+
+impl TestFile {
+    /// Line range of the function definition enclosing `line` (0-based, a
+    /// line of [`TestFile::script`]), or `None` if the line is inside none.
+    pub fn enclosing_function(&self, line: usize) -> Option<(usize, usize)> {
+        self.functions
+            .iter()
+            .copied()
+            .find(|&(start, end)| (start..=end).contains(&line))
+    }
 }
 
 /// A pattern for selecting tests, parsed from `[<file>/]<name-pattern>`.
@@ -277,7 +299,7 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 
 /// Parse shell source and return every function definition it contains, in
 /// source order.
-pub(crate) fn parse_functions(source: &str) -> anyhow::Result<Vec<FunctionDefinition>> {
+fn parse_functions(source: &str) -> anyhow::Result<Vec<FunctionDefinition>> {
     let reader = BufReader::new(source.as_bytes());
     let options = ParserOptions::default();
     let mut parser = Parser::new(reader, &options);
@@ -334,6 +356,7 @@ pub fn parse_test_file(path: &Path, scan: &Prescan) -> anyhow::Result<TestFile> 
             path: path.to_path_buf(),
             tests: Vec::new(),
             script: String::new(),
+            functions: Vec::new(),
             shell: crate::discovery::script_shell(&contents),
         });
     }
@@ -364,14 +387,16 @@ pub fn parse_test_file(path: &Path, scan: &Prescan) -> anyhow::Result<TestFile> 
         tests.push(f.fname.value.clone());
     }
 
+    // All built here, from the text this parse came from, so the script, the
+    // spans it is cut with, the bounds a snippet clamps to and the shell that
+    // runs it can never be out of step: the file is read once and all of them
+    // come from that one read.
+    let (script, bounds) = build_functions_source(&functions, &contents);
     Ok(TestFile {
         path: path.to_path_buf(),
         tests,
-        // Both built here, from the text this parse came from, so the script,
-        // the spans it is cut with and the shell that runs it can never be
-        // out of step: the file is read once and all three come from that one
-        // read.
-        script: build_functions_source(&functions, &contents),
+        script,
+        functions: bounds,
         shell: crate::discovery::script_shell(&contents),
     })
 }
@@ -394,9 +419,17 @@ pub fn parse_test_file(path: &Path, scan: &Prescan) -> anyhow::Result<TestFile> 
 /// `source` is empty — falls back to the reformatted AST rendering: line
 /// alignment is lost, but the script still defines and runs the same
 /// functions.
-pub(crate) fn build_functions_source(functions: &[FunctionDefinition], source: &str) -> String {
+///
+/// Returns the script and, for each function, the 0-based inclusive range of
+/// lines it occupies *in that script* — exact whichever way the function was
+/// rendered, since this is where it was put.
+pub(crate) fn build_functions_source(
+    functions: &[FunctionDefinition],
+    source: &str,
+) -> (String, Vec<(usize, usize)>) {
     let src_lines: Vec<&str> = source.lines().collect();
     let mut out = String::new();
+    let mut bounds = Vec::with_capacity(functions.len());
     // 1-based line number of the next line to be written to `out`.
     let mut line = 1usize;
 
@@ -406,33 +439,44 @@ pub(crate) fn build_functions_source(functions: &[FunctionDefinition], source: &
         } else {
             func.location()
         };
-        let Some(span) = located else {
-            for l in func.to_string().lines() {
-                out.push_str(l);
-                out.push('\n');
-                line += 1;
+        // Where this function's first line lands, whichever way it is rendered.
+        let first = match located {
+            None => {
+                let first = line;
+                for l in func.to_string().lines() {
+                    out.push_str(l);
+                    out.push('\n');
+                    line += 1;
+                }
+                first
             }
-            continue;
+            Some(span) => {
+                // Functions are yielded in source order, so this only pads
+                // forward.
+                while line < span.start.line {
+                    out.push('\n');
+                    line += 1;
+                }
+
+                let first = line;
+                // `end.line` is the line of the closing brace (inclusive here).
+                let last = span.end.line.min(src_lines.len());
+                for idx in span.start.line..=last {
+                    if let Some(text) = src_lines.get(idx - 1) {
+                        out.push_str(text);
+                    }
+                    out.push('\n');
+                    line += 1;
+                }
+                first
+            }
         };
-
-        // Functions are yielded in source order, so this only pads forward.
-        while line < span.start.line {
-            out.push('\n');
-            line += 1;
-        }
-
-        // `end.line` is the line of the closing brace (inclusive here).
-        let last = span.end.line.min(src_lines.len());
-        for idx in span.start.line..=last {
-            if let Some(text) = src_lines.get(idx - 1) {
-                out.push_str(text);
-            }
-            out.push('\n');
-            line += 1;
+        if line > first {
+            bounds.push((first - 1, line - 2));
         }
     }
 
-    out
+    (out, bounds)
 }
 
 fn extract_functions(program: &Program) -> Vec<FunctionDefinition> {
@@ -628,6 +672,54 @@ mod tests {
         assert_eq!(gen_lines[3], "", "top-level/gap line 3 should be blank");
     }
 
+    /// The bounds of the function enclosing `line` (0-based) of the script
+    /// rendered from `source` — what a failure snippet asks a [`TestFile`] for.
+    fn enclosing_function_bounds(source: &str, line: usize) -> Option<(usize, usize)> {
+        let tmp = TempDir::new().unwrap();
+        let path = write_script(tmp.path(), "bounds.test", source);
+        parse_test_file(&path, &Prescan::default())
+            .unwrap()
+            .enclosing_function(line)
+    }
+
+    #[test]
+    fn enclosing_bounds_finds_containing_function() {
+        // 0-based lines: 0            1              2   3  4              5            6       7
+        let source = "helper() {\n  echo setup\n}\n\ntest_foo() {\n  echo hello\n  false\n}\n";
+        // Line 6 (`false`) is inside test_foo (lines 4..=7).
+        assert_eq!(enclosing_function_bounds(source, 6), Some((4, 7)));
+        // Line 1 (`echo setup`) is inside helper (lines 0..=2).
+        assert_eq!(enclosing_function_bounds(source, 1), Some((0, 2)));
+        // Line 3 (the blank separator) is inside no function.
+        assert_eq!(enclosing_function_bounds(source, 3), None);
+    }
+
+    #[test]
+    fn enclosing_bounds_handles_brace_on_next_line() {
+        assert_eq!(
+            enclosing_function_bounds("test_foo ()\n{\n  false\n}\n", 2),
+            Some((0, 3))
+        );
+    }
+
+    #[test]
+    fn enclosing_bounds_ignores_braces_inside_words() {
+        // Braces that are part of a string, a parameter expansion or a comment
+        // are not block delimiters; a line-by-line brace count would close the
+        // function early and lose the context window around the failing line.
+        let source = "test_foo() {\n  echo \"}\"\n  echo \"${x}\"\n  # }\n  false\n}\n";
+        assert_eq!(enclosing_function_bounds(source, 4), Some((0, 5)));
+    }
+
+    #[test]
+    fn enclosing_bounds_ignores_non_function_blocks() {
+        // A subshell or a brace group at top level is not a function, so a
+        // failure inside one gets no function clamp.
+        let source = "(\n  false\n)\n\ntest_foo() {\n  false\n}\n";
+        assert_eq!(enclosing_function_bounds(source, 1), None);
+        assert_eq!(enclosing_function_bounds(source, 5), Some((4, 6)));
+    }
+
     #[test]
     fn functions_source_falls_back_when_the_source_is_unavailable() {
         // Without the original text there are no line numbers to preserve, so
@@ -637,7 +729,14 @@ mod tests {
         let source = "helper() {\n  echo 42\n}\n\ntest_foo() {\n  test \"$(helper)\" = 42\n}\n";
         let functions = parse_functions(source).unwrap();
 
-        let generated = build_functions_source(&functions, "");
+        let (generated, bounds) = build_functions_source(&functions, "");
+        // Even so, where each function landed is known exactly: the two are
+        // re-rendered back to back, `helper` as three lines and `test_foo` as
+        // the three after it.
+        assert_eq!(bounds.len(), 2, "{generated}");
+        assert_eq!(bounds[0].0, 0);
+        assert_eq!(bounds[1].0, bounds[0].1 + 1);
+        assert_eq!(bounds[1].1 + 1, generated.lines().count());
         let tmp = TempDir::new().unwrap();
         let script = write_script(tmp.path(), "fallback.sh", &generated);
 

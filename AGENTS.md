@@ -214,13 +214,17 @@
   between its trace line and the end of the file, so the trace cannot be found
   by reading a tail — but the output it has to be found behind is as big as the
   test made it, and need not contain a newline at all.
-  The source file behind a snippet is read, and parsed for the function bounds
-  that clamp the rendered window, once per file per run (`SourceCache`, owned
-  by the run loop): the text and the bounds depend only on the file, while a
-  failing suite reports one failure per *test*, so a file with n failing tests
-  in it used to cost n reads and n shell parses on the parent's critical path.
-  One read also keeps a snippet self-consistent — the annotated line and the
-  bounds come from the same text rather than from two reads a test apart.
+  The lines a snippet renders, and the function bounds that clamp its window,
+  come from the `parser::TestFile` the test was run from (`script` and
+  `functions`, which `build_functions_source` records as it lays each
+  function out) rather than from reading the file back: the xtrace line
+  number is `$LINENO` of the script the shell ran, so that script is the text
+  it indexes, and it is already in memory for every test of the file. The
+  report used to re-read the source and parse it a second time for the bounds
+  — once per file per run, behind a cache — which was a second parse of text
+  the discovery parse had already laid out, and bounds for the *file* rather
+  than for the script wherever the two differ (a function the parser gave no
+  span for is re-rendered from its AST at some other line).
   The source lines the snippet renders go through `escape_c1` first:
   `annotate_snippets` substitutes the C0 controls in the source it is given
   but prints `U+0080`–`U+009F` through, and those are controls a UTF-8
