@@ -751,8 +751,12 @@ The snippet points at the last command the trace recorded, with up to three
 lines of context on either side, clamped to the enclosing function so it never
 runs on into the next test. Subshell lines are skipped when locating it, so a
 command that failed inside `$(...)` or in one side of a pipe is reported at the
-statement containing it rather than at the command itself. A timed-out test
-gets the same snippet under `test timed out`, pointing at whatever it was
+statement containing it rather than at the command itself. So is anything an
+`EXIT` trap ran: the shell runs `trap 'rm -rf "$tmp"' EXIT` *after* the
+failure, with line numbers of its own (`+1: rm -rf /tmp/…` in the trace), and
+the snippet stays on the last command of the test before the trap fired —
+whether the trap is a command string or names a cleanup function. A timed-out
+test gets the same snippet under `test timed out`, pointing at whatever it was
 running when the clock ran out.
 
 When the failing command is a comparison — `[`, `test` or `[[` with `=`, `==`,

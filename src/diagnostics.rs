@@ -12,6 +12,8 @@ struct FailureInfo {
     lineno: usize,
     /// The command text as shown in xtrace (e.g. `'[' ABC = DEF ']'`).
     command: String,
+    /// 0-based inclusive line range of the function `lineno` sits in.
+    function: (usize, usize),
 }
 
 /// A parsed `[` (test) expression from xtrace output.
@@ -34,14 +36,12 @@ struct BracketExpr {
 /// the one text the test actually ran: no second read, no second shell parse
 /// per failure, and no way for the file to have changed in between.
 pub fn print_failure_snippet(result: &TestResult, file: &TestFile) {
-    let Some(failure) = parse_xtrace_failure(&result.context) else {
+    let Some(failure) = parse_xtrace_failure(&result.context, file) else {
         return;
     };
 
     let lines: Vec<&str> = file.script.lines().collect();
-    let Some(line_idx) = failure.lineno.checked_sub(1) else {
-        return;
-    };
+    let line_idx = failure.lineno - 1;
     if line_idx >= lines.len() {
         return;
     }
@@ -56,9 +56,7 @@ pub fn print_failure_snippet(result: &TestResult, file: &TestFile) {
 
     // Clamp the rendered context to the enclosing function so a snippet never
     // leaks into an adjacent test.
-    let (func_start_line, func_end_line) = file
-        .enclosing_function(line_idx)
-        .unwrap_or((line_idx, line_idx));
+    let (func_start_line, func_end_line) = failure.function;
 
     outln!(
         "{}",
@@ -79,12 +77,34 @@ pub fn print_failure_snippet(result: &TestResult, file: &TestFile) {
     }
 }
 
-/// Parse the xtrace log to find the last executed command (which is the one that failed).
-fn parse_xtrace_failure(tmp_dir: &Path) -> Option<FailureInfo> {
+/// Parse the xtrace log to find the command the test failed at: the last one
+/// the test's own body ran.
+///
+/// Every command a test runs is a line of one of `file`'s functions — the
+/// script the shell is given ([`TestFile::script`]) is nothing but those
+/// definitions, rendered at their own line numbers, and one call. A top-level
+/// trace line whose number falls inside no function is therefore not the
+/// test's: it is either that call, which is always the first line of the log,
+/// or an `EXIT` trap action. The shell runs a trap string after the function
+/// it was set in has already been unwound, with `$LINENO` counting from the
+/// string's own first line, so `trap 'rm -rf "$tmp"' EXIT` traces as
+/// `+1: rm -rf /tmp/…` after the command that actually failed — and used to
+/// have the snippet point at line 1 of the file, the shebang. The body is over
+/// once such a line appears, so the scan ends there: what follows is the trap
+/// running, whether it names a function (whose lines *are* in the script) or
+/// not, and the failure belongs to the last command of the body before it.
+///
+/// `DEBUG` and `ERR` actions are not this case — bash traces them one `+`
+/// deeper, like a subshell, and [`parse_trace_line`] already skips those. What
+/// this cannot see through is a file whose first line opens a function: the
+/// trap's `+1:` then reads as that function's, and the snippet points into it
+/// as it always did. A shebang or a comment on line 1 is enough to tell them
+/// apart.
+fn parse_xtrace_failure(tmp_dir: &Path, file: &TestFile) -> Option<FailureInfo> {
     // Open the log the runner created for the test, never a symlink the test
     // left at that name (see `overlay::open_nofollow`).
-    let file = crate::overlay::open_nofollow(&tmp_dir.join("xtrace.log")).ok()?;
-    let mut reader = std::io::BufReader::new(file);
+    let log = crate::overlay::open_nofollow(&tmp_dir.join("xtrace.log")).ok()?;
+    let mut reader = std::io::BufReader::new(log);
 
     // Walk it a line at a time rather than reading it whole: the log holds
     // everything the test and the programs it ran sent to stderr, so it is as
@@ -92,12 +112,29 @@ fn parse_xtrace_failure(tmp_dir: &Path) -> Option<FailureInfo> {
     // sits between its trace line and the end of the file — a tail would miss
     // exactly the command a noisy failure needs attributing to.
     let mut last_match: Option<FailureInfo> = None;
+    let mut first = true;
     let mut line = Vec::new();
     while read_capped_line(&mut reader, &mut line).unwrap_or(false) {
         // Lossy because a test is free to write non-UTF-8 to its stderr, and a
         // diagnostic is better than none.
-        if let Some(info) = parse_trace_line(&String::from_utf8_lossy(&line)) {
-            last_match = Some(info);
+        let text = String::from_utf8_lossy(&line);
+        let Some((lineno, command)) = parse_trace_line(&text) else {
+            continue;
+        };
+        let is_call = std::mem::replace(&mut first, false);
+        let function = lineno
+            .checked_sub(1)
+            .and_then(|idx| file.enclosing_function(idx));
+        match function {
+            Some(function) => {
+                last_match = Some(FailureInfo {
+                    lineno,
+                    command: command.to_string(),
+                    function,
+                })
+            }
+            None if is_call => {}
+            None => break,
         }
     }
     last_match
@@ -140,11 +177,11 @@ fn read_capped_line(
     }
 }
 
-/// One line of an xtrace log as a [`FailureInfo`], if it traces a command at
-/// the top level: `+<lineno>: <command>` in the runner's `PS4` format.
-/// Subshell traces (`++`, `+++`, …) and anything the test printed itself are
-/// not commands this failure can be attributed to.
-fn parse_trace_line(line: &str) -> Option<FailureInfo> {
+/// One line of an xtrace log as its `$LINENO` and command, if it traces a
+/// command at the top level: `+<lineno>: <command>` in the runner's `PS4`
+/// format. Subshell traces (`++`, `+++`, …) and anything the test printed
+/// itself are not commands a failure can be attributed to.
+fn parse_trace_line(line: &str) -> Option<(usize, &str)> {
     // A `\r` before the newline belongs to the terminal conventions of
     // whatever wrote the line, not to the trace (`str::lines` drops it too).
     let rest = line.strip_suffix('\r').unwrap_or(line).strip_prefix('+')?;
@@ -152,10 +189,7 @@ fn parse_trace_line(line: &str) -> Option<FailureInfo> {
         return None;
     }
     let (lineno, command) = rest.split_once(": ")?;
-    Some(FailureInfo {
-        lineno: lineno.trim().parse().ok()?,
-        command: command.to_string(),
-    })
+    Some((lineno.trim().parse().ok()?, command))
 }
 
 /// How many lines of context to show on each side of the annotated line.
@@ -601,30 +635,104 @@ mod tests {
         assert_eq!(escape_for_display("plain"), "plain");
     }
 
+    /// A parsed file with the given script and function bounds.
+    fn test_file(script: &str, functions: Vec<(usize, usize)>) -> TestFile {
+        TestFile {
+            path: "x.test".into(),
+            tests: vec!["test_x".into()],
+            script: script.into(),
+            functions,
+            shell: "bash".into(),
+        }
+    }
+
+    /// A file whose one function spans lines 1 through `lines`, so a trace
+    /// line numbered anywhere in that range reads as the test's own.
+    fn one_function(lines: usize) -> TestFile {
+        let script = format!("test_x() {{\n{}}}\n", ":\n".repeat(lines - 2));
+        test_file(&script, vec![(0, lines - 1)])
+    }
+
+    /// A log written to a fresh context dir, parsed against `file`.
+    fn failure_of(log: &str, file: &TestFile) -> Option<FailureInfo> {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("xtrace.log"), log).unwrap();
+        parse_xtrace_failure(tmp.path(), file)
+    }
+
     #[test]
     fn parse_xtrace_finds_last_command() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let xtrace = tmp.path().join("xtrace.log");
-        std::fs::write(
-            &xtrace,
+        let info = failure_of(
             "+3: echo hello\n+4: echo world\n+5: '[' ABC = DEF ']'\n",
+            &one_function(10),
         )
         .unwrap();
-
-        let info = parse_xtrace_failure(tmp.path()).unwrap();
         assert_eq!(info.lineno, 5);
         assert_eq!(info.command, "'[' ABC = DEF ']'");
+        assert_eq!(info.function, (0, 9));
     }
 
     #[test]
     fn parse_xtrace_skips_subshell() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let xtrace = tmp.path().join("xtrace.log");
-        std::fs::write(&xtrace, "+3: echo hello\n++4: subshell_cmd\n+5: false\n").unwrap();
-
-        let info = parse_xtrace_failure(tmp.path()).unwrap();
+        let info = failure_of(
+            "+3: echo hello\n++4: subshell_cmd\n+5: false\n",
+            &one_function(10),
+        )
+        .unwrap();
         assert_eq!(info.lineno, 5);
         assert_eq!(info.command, "false");
+    }
+
+    #[test]
+    fn parse_xtrace_skips_the_runners_own_call() {
+        // The first trace line is the runner invoking the test, numbered past
+        // the end of the definitions. It is no command of the test's, and it
+        // must not end the scan before the test has run anything either.
+        let info = failure_of("+40: test_x\n+5: false\n", &one_function(10)).unwrap();
+        assert_eq!(info.lineno, 5);
+        assert_eq!(info.command, "false");
+    }
+
+    #[test]
+    fn parse_xtrace_stops_at_an_exit_trap_action() {
+        // `trap 'rm -rf "$tmp"' EXIT`, the usual cleanup idiom: the shell runs
+        // the trap string after the failure with `$LINENO` restarted at 1, so
+        // its commands trace as lines of the file's header. The failing
+        // command is the last one the body ran before the trap fired, not the
+        // trap's `rm` — and not line 1 of the file, which used to be the
+        // snippet's answer.
+        let file = test_file(
+            "\n\ntest_x() {\n  trap 'rm -rf x' EXIT\n  '[' a = b ']'\n}\n",
+            vec![(2, 5)],
+        );
+        let log = "+20: test_x\n+4: trap 'rm -rf x' EXIT\n+5: '[' a = b ']'\n+1: rm -rf x\n";
+        let info = failure_of(log, &file).unwrap();
+        assert_eq!(info.lineno, 5);
+        assert_eq!(info.command, "'[' a = b ']'");
+        assert_eq!(info.function, (2, 5));
+    }
+
+    #[test]
+    fn parse_xtrace_stops_at_an_exit_trap_calling_a_function() {
+        // `trap cleanup EXIT`: the action itself traces outside every function,
+        // but the function it calls is in the script, so its lines would read
+        // as the test's own if the scan carried on past the action. The body
+        // was over the moment the trap fired.
+        let file = test_file(
+            "\ncleanup() {\n  rm -f marker\n}\ntest_x() {\n  trap cleanup EXIT\n  false\n}\n",
+            vec![(1, 3), (4, 7)],
+        );
+        let log = "+20: test_x\n+6: trap cleanup EXIT\n+7: false\n+1: cleanup\n+3: rm -f marker\n";
+        let info = failure_of(log, &file).unwrap();
+        assert_eq!(info.lineno, 7);
+        assert_eq!(info.command, "false");
+        assert_eq!(info.function, (4, 7));
+    }
+
+    #[test]
+    fn parse_xtrace_declines_when_no_command_of_the_test_ran() {
+        // Nothing to point at: the only trace line is the runner's call.
+        assert!(failure_of("+40: test_x\n", &one_function(10)).is_none());
     }
 
     #[test]
@@ -635,12 +743,10 @@ mod tests {
         // all. The scan has to reach it without holding the whole log, and
         // without holding one of its lines either — the output here has no
         // newlines in it, so it is a single line as far as the scan can tell.
-        let tmp = tempfile::TempDir::new().unwrap();
         let mut log = String::from("+3: setup\n+7: noisy_command\n");
         log.push_str(&"x".repeat(MAX_LINE * 3));
-        std::fs::write(tmp.path().join("xtrace.log"), &log).unwrap();
 
-        let info = parse_xtrace_failure(tmp.path()).unwrap();
+        let info = failure_of(&log, &one_function(10)).unwrap();
         assert_eq!(info.lineno, 7);
         assert_eq!(info.command, "noisy_command");
     }
@@ -649,13 +755,11 @@ mod tests {
     fn parse_xtrace_resumes_after_an_over_long_line() {
         // An over-long line is truncated, not treated as the end of the log:
         // the trace lines after it still have to be found.
-        let tmp = tempfile::TempDir::new().unwrap();
         let mut log = String::from("+3: setup\n");
         log.push_str(&"y".repeat(MAX_LINE * 2));
         log.push_str("\n+9: false\n");
-        std::fs::write(tmp.path().join("xtrace.log"), &log).unwrap();
 
-        let info = parse_xtrace_failure(tmp.path()).unwrap();
+        let info = failure_of(&log, &one_function(10)).unwrap();
         assert_eq!(info.lineno, 9);
         assert_eq!(info.command, "false");
     }
@@ -665,11 +769,9 @@ mod tests {
         // A trace line longer than the cap loses its tail, so no operand diff
         // comes out of it — but the line number is at the front of the line,
         // so the snippet still points at the command that failed.
-        let tmp = tempfile::TempDir::new().unwrap();
         let log = format!("+4: '[' {} = b ']'\n", "a".repeat(MAX_LINE * 2));
-        std::fs::write(tmp.path().join("xtrace.log"), &log).unwrap();
 
-        let info = parse_xtrace_failure(tmp.path()).unwrap();
+        let info = failure_of(&log, &one_function(10)).unwrap();
         assert_eq!(info.lineno, 4);
         assert_eq!(info.command.len(), MAX_LINE - "+4: ".len());
         assert!(parse_bracket_expr(&info.command).is_none());
@@ -677,10 +779,7 @@ mod tests {
 
     #[test]
     fn parse_xtrace_reads_the_last_line_without_a_trailing_newline() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("xtrace.log"), "+3: echo hi\n+4: false").unwrap();
-
-        let info = parse_xtrace_failure(tmp.path()).unwrap();
+        let info = failure_of("+3: echo hi\n+4: false", &one_function(10)).unwrap();
         assert_eq!(info.lineno, 4);
         assert_eq!(info.command, "false");
     }

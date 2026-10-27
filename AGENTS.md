@@ -200,7 +200,17 @@
 - `src/diagnostics.rs` - On failure, parses `xtrace.log` to find the last
   executed command (skipping `++` subshell traces, so a failure inside
   `$(...)` is attributed to the statement around it), maps it back to the
-  original source file, and renders an annotate-snippets error snippet.
+  original source file, and renders an annotate-snippets error snippet. Only
+  a trace line inside one of the file's functions can be the test's own: the
+  script is nothing but those definitions at their own line numbers plus one
+  call, which is always the first trace line. Any other top-level line is an
+  `EXIT` trap action — bash runs the trap string after unwinding the function
+  with `$LINENO` restarted at 1, so `trap 'rm -rf "$tmp"' EXIT` traces as
+  `+1: rm -rf …` after the failure and used to put the snippet on the shebang
+  — and `parse_xtrace_failure` stops there, so the failure stays on the last
+  command of the body even when the trap goes on to call a function whose
+  lines are in the file. (`DEBUG`/`ERR` actions trace at `++` depth and are
+  already skipped as subshells.)
   Also shows `left`/`right` operands for a failed `[`/`test`/`[[` comparison
   and, for `=`/`==`/`!=`, an inline character-level diff of them. `[` and
   `test` are one builtin under two names, and xtrace renders them the same way
