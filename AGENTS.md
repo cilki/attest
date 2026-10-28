@@ -133,7 +133,12 @@
   definitions — and so never runs a line of the script — still complains into
   `xtrace.log` instead of over attest's own output. The
   child pivots into a per-test ephemeral root (see `src/overlay.rs`) when
-  available, runs in its own
+  available. Only that and entering a per-test cgroup need a `pre_exec` hook;
+  a test needing neither is started with `posix_spawn` (`spawn_detached`,
+  `POSIX_SPAWN_SETSID` + an empty `SETSIGMASK` + `SIGPIPE` to default), since
+  any hook makes `std` `fork(2)` the parent and wait out the child's exec —
+  ~0.3ms more per test, on the one thread that spawns them all. Either way
+  `PendingTest` holds a bare pid and does its own `waitpid`. It runs in its own
   session (so timeouts and ^C kill the whole process tree via its process group
   and, when cgroups are active, `cgroup.kill`). Parallel by default via
   `fork(2)` with configurable parallelism (`--parallel`). The poll loop that

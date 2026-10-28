@@ -3,7 +3,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus};
+use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
@@ -249,10 +249,16 @@ pub struct TestResult {
 /// State held by the parent for a spawned test child that has not yet been
 /// waited on. Dropping this kills the child (if still running) and cleans up.
 struct PendingTest<'a> {
-    child: Child,
-    /// Set once the child has been waited on. The kernel is free to hand its
-    /// pid to a new process from that moment, so nothing may be signalled
-    /// through it any more — see [`PendingTest::kill_tree`].
+    /// The test's shell, by pid: it is spawned either through `Command` or
+    /// straight through `posix_spawn` (see [`spawn_detached`]), and only a pid
+    /// is common to both. Waiting on it is this struct's job alone.
+    pid: u32,
+    /// The child's exit status, once it has been waited on.
+    status: Option<ExitStatus>,
+    /// Set once the child has exited and its tree has been torn down; it is
+    /// consumed straight after. The kernel is free to hand the pid to a new
+    /// process from that moment, so nothing may be signalled through it any
+    /// more — see [`PendingTest::kill_tree`].
     reaped: bool,
     /// Set to `true` when the child was killed due to exceeding `--timeout`.
     timed_out: bool,
@@ -278,21 +284,51 @@ impl PendingTest<'_> {
     /// pgid — to an unrelated process, and `kill(-pgid)` would SIGKILL
     /// somebody else's process group. So pid-based signalling stops at that
     /// point and only `cgroup.kill`, which is keyed to a directory and can
-    /// never be misdirected, still runs. (`Child::kill` is no help as a guard:
-    /// it quietly succeeds on an already-waited-for child.)
+    /// never be misdirected, still runs.
     fn kill_tree(&mut self) {
         if let Some(ref cg) = self.cgroup {
             cg.kill_all();
         }
-        if self.reaped {
+        if self.reaped || self.status.is_some() {
             return;
         }
-        unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) };
-        let _ = self.child.kill();
+        let pid = self.pid as libc::pid_t;
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+
+    /// Consume the child's zombie and record its exit status: blocking when
+    /// `flags` is `0`, or only if it has already exited with `WNOHANG`. Once
+    /// recorded the status is returned without asking the kernel again — the
+    /// pid is no longer this test's to ask about.
+    fn wait_status(&mut self, flags: libc::c_int) -> std::io::Result<Option<ExitStatus>> {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(status) = self.status {
+            return Ok(Some(status));
+        }
+        let mut raw = 0;
+        loop {
+            match unsafe { libc::waitpid(self.pid as libc::pid_t, &mut raw, flags) } {
+                0 => return Ok(None),
+                -1 => {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(err);
+                    }
+                }
+                _ => {
+                    let status = ExitStatus::from_raw(raw);
+                    self.status = Some(status);
+                    return Ok(Some(status));
+                }
+            }
+        }
     }
 
     /// Has the child exited? `waitid` with `WNOWAIT` answers that without
-    /// consuming the zombie, so [`Child::try_wait`] can still reap it and the
+    /// consuming the zombie, so [`Self::wait_status`] can still reap it and the
     /// pid — and the pgid derived from it — stays reserved for as long as
     /// [`Self::reap`] needs to signal the group.
     fn has_exited(&self) -> std::io::Result<bool> {
@@ -302,7 +338,7 @@ impl PendingTest<'_> {
         let ret = unsafe {
             libc::waitid(
                 libc::P_PID,
-                self.child.id(),
+                self.pid,
                 &mut info,
                 libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
             )
@@ -335,7 +371,7 @@ impl PendingTest<'_> {
             self.kill_tree();
             self.reaped = true;
         }
-        self.child.try_wait()
+        self.wait_status(libc::WNOHANG)
     }
 }
 
@@ -345,7 +381,7 @@ impl Drop for PendingTest<'_> {
         // (--bail, a timeout, ^C). A test that went through `reap` was already
         // torn down there, and `kill_tree` is a no-op once that has happened.
         self.kill_tree();
-        let _ = self.child.wait();
+        let _ = self.wait_status(0);
         if let Some(ref dir) = self.context {
             let _ = std::fs::remove_dir_all(dir);
         }
@@ -579,7 +615,7 @@ pub fn run_all_tests<'a>(tests: Vec<TestSpec<'a>>, config: &RunConfig) -> Result
         // timing fuzziness.
         if let Some(fuzz_level) = config.fuzz {
             for pending in &pending_list {
-                fuzz_tick(pending.child.id(), fuzz_level, &mut rng);
+                fuzz_tick(pending.pid, fuzz_level, &mut rng);
             }
         }
 
@@ -837,56 +873,70 @@ fn spawn_test<'a>(
     // <shell> -c <script> <source_path>: passing source_path as argv[0]
     // makes $0 inside the test functions refer to the original script.
     let source_str = source_path_owned.to_str().unwrap_or("bash").to_string();
-    let mut cmd = Command::new(shell);
-    cmd.args(["-c", &runner_content, &source_str])
-        .stdout(stdout_log)
-        .stderr(xtrace_log);
+    let procs = cgroup.as_ref().and_then(|cg| cg.procs_cstring());
+    let isolated = root_plan.is_some();
+    let start = Instant::now();
+    let spawned = if procs.is_none() && root_plan.is_none() {
+        // Nothing has to happen between fork and exec that `posix_spawn`
+        // cannot do itself (see `spawn_detached`).
+        spawn_detached(
+            shell,
+            &runner_content,
+            &source_str,
+            &stdout_log,
+            &xtrace_log,
+        )
+    } else {
+        let mut cmd = Command::new(shell);
+        cmd.args(["-c", &runner_content, &source_str])
+            .stdout(stdout_log)
+            .stderr(xtrace_log);
 
-    // Detach into a fresh session/process group so timeouts and cleanup can
-    // kill the whole test tree with one kill(-pgid).
-    //
-    // The signal mask is emptied in the same hook: the run blocks SIGCHLD in
-    // the parent (see `ChildWaiter`) and a mask survives both fork and exec, so
-    // a test's shell would otherwise start with SIGCHLD blocked — and a shell
-    // that cannot take SIGCHLD does not notice its own background jobs
-    // finishing, which is `wait` in a test hanging. `std` happens to reset the
-    // mask before exec as well, but that is not something it promises, and the
-    // promise is one tests depend on. Nothing here allocates, as the hook
-    // requires.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            let mut empty: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&mut empty);
-            libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
-            Ok(())
-        });
-    }
-
-    // Place the child into its cgroup after fork, before exec. The parent has
-    // live threads (status-bar ticker), so the hook must not allocate:
-    // add_self_to is async-signal-safe and the path CString is built here.
-    // TODO don't include test setup in cgroup
-    if let Some(ref cg) = cgroup
-        && let Some(procs) = cg.procs_cstring()
-    {
+        // Detach into a fresh session/process group so timeouts and cleanup can
+        // kill the whole test tree with one kill(-pgid).
+        //
+        // The signal mask is emptied in the same hook: the run blocks SIGCHLD in
+        // the parent (see `ChildWaiter`) and a mask survives both fork and exec, so
+        // a test's shell would otherwise start with SIGCHLD blocked — and a shell
+        // that cannot take SIGCHLD does not notice its own background jobs
+        // finishing, which is `wait` in a test hanging. `std` happens to reset the
+        // mask before exec as well, but that is not something it promises, and the
+        // promise is one tests depend on. Nothing here allocates, as the hook
+        // requires.
         unsafe {
-            cmd.pre_exec(move || {
-                crate::cgroup::add_self_to(&procs);
+            cmd.pre_exec(|| {
+                libc::setsid();
+                let mut empty: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut empty);
+                libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
                 Ok(())
             });
         }
-    }
 
-    // Registered after the cgroup hook so cgroup placement happens in the host
-    // namespace before we unshare into a private mount namespace.
-    let isolated = root_plan.is_some();
-    if let Some(plan) = root_plan {
-        overlay::register_root_mount(&mut cmd, plan);
-    }
+        // Place the child into its cgroup after fork, before exec. The parent has
+        // live threads (status-bar ticker), so the hook must not allocate:
+        // add_self_to is async-signal-safe and the path CString is built here.
+        // TODO don't include test setup in cgroup
+        if let Some(procs) = procs {
+            unsafe {
+                cmd.pre_exec(move || {
+                    crate::cgroup::add_self_to(&procs);
+                    Ok(())
+                });
+            }
+        }
 
-    let start = Instant::now();
-    let child = cmd.spawn().map_err(|e| {
+        // Registered after the cgroup hook so cgroup placement happens in the host
+        // namespace before we unshare into a private mount namespace.
+        if let Some(plan) = root_plan {
+            overlay::register_root_mount(&mut cmd, plan);
+        }
+
+        // Dropping a `Child` neither waits for nor kills it: from here on the
+        // pid is all there is, and `PendingTest` does the waiting.
+        cmd.spawn().map(|child| child.id())
+    };
+    let pid = spawned.map_err(|e| {
         // The script rides in the argument vector, and Linux caps how long a
         // single argument may be — 32 pages classically, a slice of the stack
         // limit on newer kernels, so half a megabyte of shell either way. Only
@@ -907,7 +957,8 @@ fn spawn_test<'a>(
     })?;
 
     Ok(PendingTest {
-        child,
+        pid,
+        status: None,
         reaped: false,
         timed_out: false,
         name: display_name.clone(),
@@ -917,6 +968,107 @@ fn spawn_test<'a>(
         file: spec.file,
         cgroup,
     })
+}
+
+unsafe extern "C" {
+    /// The process's environment, which a test inherits whole.
+    static environ: *const *mut libc::c_char;
+}
+
+/// Spawn `<shell> -c <script> <source>` with `stdout`/`stderr` as its output,
+/// in a session of its own and with an empty signal mask — what the
+/// `pre_exec` hook in [`spawn_test`] does — through `posix_spawn` rather than
+/// `Command`. Returns the child's pid.
+///
+/// Any `pre_exec` hook makes `std` `fork(2)` the whole parent, where without
+/// one it `posix_spawn`s: the child shares the parent's memory until it execs
+/// instead of copying its page tables, and it is the parent that waits for
+/// that exec — at about 0.3ms more per test, which on a parallel run of short
+/// tests was most of what the one thread spawning them all spent. The two
+/// things the hook does have `posix_spawn` attributes of their own
+/// (`POSIX_SPAWN_SETSID`, `POSIX_SPAWN_SETSIGMASK`), so a test that needs
+/// nothing else — no overlay root, no cgroup to enter — gets them that way.
+///
+/// `SIGPIPE` goes back to its default as well, as `Command` does: Rust
+/// ignores it, and an ignored signal survives exec, so `yes | head -1` in a
+/// test would otherwise spin on `EPIPE` instead of dying of it.
+fn spawn_detached(
+    shell: &str,
+    script: &str,
+    source: &str,
+    stdout: &std::fs::File,
+    stderr: &std::fs::File,
+) -> std::io::Result<u32> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+
+    let nul = |s: &str| {
+        CString::new(s).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "nul byte in argument")
+        })
+    };
+    let program = nul(shell)?;
+    let args = [nul(shell)?, nul("-c")?, nul(script)?, nul(source)?];
+    let mut argv: Vec<*mut libc::c_char> = args.iter().map(|a| a.as_ptr().cast_mut()).collect();
+    argv.push(std::ptr::null_mut());
+
+    let check = |ret: libc::c_int| match ret {
+        0 => Ok(()),
+        e => Err(std::io::Error::from_raw_os_error(e)),
+    };
+    unsafe {
+        let mut actions: libc::posix_spawn_file_actions_t = std::mem::zeroed();
+        check(libc::posix_spawn_file_actions_init(&mut actions))?;
+        let mut attr: libc::posix_spawnattr_t = std::mem::zeroed();
+        if let Err(e) = check(libc::posix_spawnattr_init(&mut attr)) {
+            libc::posix_spawn_file_actions_destroy(&mut actions);
+            return Err(e);
+        }
+
+        let spawned = (|| {
+            check(libc::posix_spawn_file_actions_adddup2(
+                &mut actions,
+                stdout.as_raw_fd(),
+                libc::STDOUT_FILENO,
+            ))?;
+            check(libc::posix_spawn_file_actions_adddup2(
+                &mut actions,
+                stderr.as_raw_fd(),
+                libc::STDERR_FILENO,
+            ))?;
+
+            let mut empty: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut empty);
+            check(libc::posix_spawnattr_setsigmask(&mut attr, &empty))?;
+            let mut default: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut default);
+            libc::sigaddset(&mut default, libc::SIGPIPE);
+            check(libc::posix_spawnattr_setsigdefault(&mut attr, &default))?;
+            // `libc` declares these flags with two different integer types.
+            let flags = libc::c_int::from(libc::POSIX_SPAWN_SETSID)
+                | libc::POSIX_SPAWN_SETSIGMASK
+                | libc::POSIX_SPAWN_SETSIGDEF;
+            check(libc::posix_spawnattr_setflags(
+                &mut attr,
+                flags as libc::c_short,
+            ))?;
+
+            let mut pid: libc::pid_t = 0;
+            check(libc::posix_spawnp(
+                &mut pid,
+                program.as_ptr(),
+                &actions,
+                &attr,
+                argv.as_ptr(),
+                environ,
+            ))?;
+            Ok(pid as u32)
+        })();
+
+        libc::posix_spawnattr_destroy(&mut attr);
+        libc::posix_spawn_file_actions_destroy(&mut actions);
+        spawned
+    }
 }
 
 /// Build a `TestResult` from a `PendingTest` whose child has already exited
