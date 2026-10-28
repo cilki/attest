@@ -177,7 +177,7 @@ try:
   print(add(sys.argv[1], sys.argv[2]))
 except ValueError:
   sys.exit(1)
-" "$1" "$2"
+" "$@"
 ```
 
 Inline tests can be nice because the closer the tests are to the code that's
