@@ -347,7 +347,17 @@ fn starts_with_c1(buf: &[u8]) -> bool {
 fn sanitize_log(buf: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     // A `0xc2` that turns out not to lead a C1 control only costs the slow
     // path, which copies it through unchanged.
-    if !buf.iter().copied().any(|b| needs_escape(b) || b == C1_LEAD) {
+    //
+    // Asked a block at a time, with no early exit inside a block, so the
+    // compiler can test a whole block per instruction: this is the question
+    // every byte of a replayed log is put to, and `any` over the bytes one by
+    // one cannot be vectorized.
+    let dirty = |block: &[u8]| {
+        block
+            .iter()
+            .fold(false, |acc, &b| acc | needs_escape(b) | (b == C1_LEAD))
+    };
+    if !buf.chunks(64).any(dirty) {
         return std::borrow::Cow::Borrowed(buf);
     }
     let mut out = Vec::with_capacity(buf.len());

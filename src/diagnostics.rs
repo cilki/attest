@@ -115,6 +115,11 @@ fn parse_xtrace_failure(tmp_dir: &Path, file: &TestFile) -> Option<FailureInfo> 
     let mut first = true;
     let mut line = Vec::new();
     while read_capped_line(&mut reader, &mut line).unwrap_or(false) {
+        // Most of a noisy log is the test's own output, which can never be a
+        // trace line: settle that on the first byte, before decoding it.
+        if line.first() != Some(&b'+') {
+            continue;
+        }
         // Lossy because a test is free to write non-UTF-8 to its stderr, and a
         // diagnostic is better than none.
         let text = String::from_utf8_lossy(&line);
@@ -164,7 +169,10 @@ fn read_capped_line(
             return Ok(any);
         }
         any = true;
-        let newline = buf.iter().position(|&b| b == b'\n');
+        // `memchr` rather than `iter().position`: the log is mostly the test's
+        // own output, so finding the end of each line is most of what the scan
+        // does, and the byte-at-a-time loop is not vectorized.
+        let newline = memchr::memchr(b'\n', buf);
         let len = newline.unwrap_or(buf.len());
         let room = MAX_LINE.saturating_sub(line.len());
         line.extend_from_slice(&buf[..room.min(len)]);

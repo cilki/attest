@@ -114,6 +114,7 @@ dependencies = [
  "clap_complete",
  "indicatif",
  "libc",
+ "memchr",
  "serde",
  "serde_json",
  "similar",
