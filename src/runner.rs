@@ -130,6 +130,10 @@ struct Tailed {
     file: std::fs::File,
     /// How many bytes have been printed so far.
     offset: u64,
+    /// Another test's trace or result has been printed since this trace last
+    /// was, so the next bytes of it need their header again: without one they
+    /// read as the tail of whatever was printed in between.
+    interrupted: bool,
 }
 
 impl Tailed {
@@ -144,6 +148,7 @@ impl Tailed {
             name: pending.name.clone(),
             file,
             offset: 0,
+            interrupted: false,
         })
     }
 
@@ -158,6 +163,10 @@ impl Tailed {
     /// in the file is all of it. Until then a trailing [`output::C1_LEAD`] is
     /// left unconsumed and re-read next time (see [`output::replay_log_err`]).
     fn flush_new(&mut self, last: bool) {
+        if self.interrupted && self.has_new() {
+            xtrace_header(&self.name);
+            self.interrupted = false;
+        }
         if self.file.seek(SeekFrom::Start(self.offset)).is_err() {
             return;
         }
@@ -169,13 +178,28 @@ impl Tailed {
 /// tail if this was the test holding it, otherwise dump its whole log (it
 /// never got the tail, because another test held it or because it finished
 /// before the parent could open the file).
-fn finish_xtrace(tailed: &mut Option<Tailed>, pending: &PendingTest) {
+///
+/// The run loop calls this as it prints the test's result rather than as it
+/// reaps the test, so the trace lands directly above the `PASS`/`FAIL` line it
+/// belongs to: several tests finish in one tick whenever they are fast, and
+/// settling them all at reap time stacked every trace of the batch above all
+/// of its results.
+///
+/// Whatever is printed for a test that is not the holder lands in the middle
+/// of the holder's trace, so the holder is marked [`Tailed::interrupted`] and
+/// announces itself again before its next line.
+fn finish_xtrace(tailed: &mut Option<Tailed>, name: &str, context: &Path) {
     match tailed {
-        Some(t) if t.name == pending.name => {
+        Some(t) if t.name == name => {
             t.flush_new(true);
             *tailed = None;
         }
-        _ => dump_xtrace_log(&pending.name, pending.context.as_ref().unwrap()),
+        _ => {
+            dump_xtrace_log(name, context);
+            if let Some(t) = tailed {
+                t.interrupted = true;
+            }
+        }
     }
 }
 
@@ -598,11 +622,12 @@ pub fn run_all_tests<'a>(tests: Vec<TestSpec<'a>>, config: &RunConfig) -> Result
                 }
                 Err(e) => return Err(anyhow!("reaping test child failed: {e}")),
             };
-            if config.verbose >= 2 {
-                status.suspend(|| finish_xtrace(&mut tailed, &pending_list[i]));
-            }
             let pending = pending_list.remove(i);
             if bail_flag {
+                if config.verbose >= 2 {
+                    let context = pending.context.as_deref().unwrap();
+                    status.suspend(|| finish_xtrace(&mut tailed, &pending.name, context));
+                }
                 continue; // Drop kills + cleans up
             }
             let file = pending.file;
@@ -614,9 +639,19 @@ pub fn run_all_tests<'a>(tests: Vec<TestSpec<'a>>, config: &RunConfig) -> Result
         }
 
         // Print results and start new tests.
-        // Sort completed by name for deterministic output within a reap batch.
-        completed.sort_by(|(a, _), (b, _)| a.name.cmp(&b.name));
+        // Sort completed by name for deterministic output within a reap batch,
+        // except that the test holding the xtrace tail goes first: its header
+        // and the start of its trace are already on the terminal, so the rest
+        // of it has to follow them before any other test's trace is dumped.
+        let holder = tailed.as_ref().map(|t| t.name.as_str());
+        completed.sort_by(|(a, _), (b, _)| {
+            (Some(a.name.as_str()) != holder, &a.name)
+                .cmp(&(Some(b.name.as_str()) != holder, &b.name))
+        });
         for (result, file) in completed {
+            if config.verbose >= 2 {
+                status.suspend(|| finish_xtrace(&mut tailed, &result.name, &result.context));
+            }
             if config.json {
                 output::print_test_result_json(&result);
             } else {
@@ -2315,6 +2350,7 @@ mod tests {
             name: "test_split".to_string(),
             file: overlay::open_nofollow(&log).unwrap(),
             offset: 0,
+            interrupted: false,
         };
 
         tailed.flush_new(false);
@@ -2333,6 +2369,43 @@ mod tests {
         fs::write(&log, b"+1: payload\xc2\x9b2K\xc2").unwrap();
         tailed.flush_new(true);
         assert_eq!(tailed.offset, 16);
+    }
+
+    #[test]
+    fn xtrace_streaming_reannounces_a_trace_another_test_cut_into() {
+        // Under `-vv` a test that finishes while another holds the tail gets
+        // its trace and result printed in the middle of the holder's trace.
+        // The holder's next lines must then come under its header again, or
+        // they read as the end of the test printed in between — but only once
+        // it has something to say, so a quiet holder adds no empty header.
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("xtrace.log");
+        fs::write(&log, b"+1: first\n").unwrap();
+        let other = TempDir::new().unwrap();
+
+        let mut tailed = Some(Tailed {
+            name: "test_holder".to_string(),
+            file: overlay::open_nofollow(&log).unwrap(),
+            offset: 0,
+            interrupted: false,
+        });
+        tailed.as_mut().unwrap().flush_new(false);
+
+        finish_xtrace(&mut tailed, "test_other", other.path());
+        let holder = tailed.as_mut().expect("the holder keeps the tail");
+        assert!(holder.interrupted, "another test's output went unnoticed");
+
+        holder.flush_new(false);
+        assert!(holder.interrupted, "re-announced with nothing to follow");
+
+        fs::write(&log, b"+1: first\n+2: second\n").unwrap();
+        holder.flush_new(false);
+        assert!(!holder.interrupted);
+        assert_eq!(holder.offset, 21);
+
+        // The holder finishing releases the tail rather than dumping itself.
+        finish_xtrace(&mut tailed, "test_holder", tmp.path());
+        assert!(tailed.is_none());
     }
 
     #[test]
