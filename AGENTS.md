@@ -373,7 +373,10 @@ off, so a test asserting on a pipeline must set it itself (see
   shake out flaky tests
 - `--fuzz [VALUE]` — randomly pause and resume each test's descendant processes
   (`SIGSTOP`/`SIGCONT`) to introduce timing non-determinism. Optional
-  aggressiveness in (0,1); higher pauses more often (default: 0.5)
+  aggressiveness in (0,1); higher pauses more often (default: 0.5). The
+  argument after a bare `--fuzz` is only taken as its value when it reads as a
+  number (`bind_bare_fuzz` rewrites the flag to `--fuzz=0.5` otherwise), so
+  `attest --fuzz <target>` leaves the target alone
 - `--shebang SHELL` — force this shell for every test, ignoring each script's own
   shebang (e.g. `/bin/bash`, `/usr/bin/zsh`)
 - `--json` — print results as JSONL (one JSON object per test) instead of the

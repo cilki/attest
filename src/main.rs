@@ -8,6 +8,7 @@ mod runner;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::output::errln;
@@ -25,6 +26,43 @@ fn parse_fuzz(s: &str) -> Result<f64, String> {
         ))
     }
 }
+
+/// Makes a bare `--fuzz` leave the argument after it alone unless that
+/// argument is a number.
+///
+/// `--fuzz`'s value is optional, and clap settles an optional value by
+/// position alone: whatever follows the flag is taken as its value. So
+/// `attest --fuzz examples/race_condition.test` — the README's own example —
+/// handed the target to `parse_fuzz` and failed with "not a valid number". A
+/// bare `--fuzz` followed by something that does not read as a number is
+/// spelled `--fuzz=0.5` instead, which leaves the next argument to be the
+/// target (or a subcommand) it was meant as. Anything that does read as one
+/// is still the value, so `--fuzz 0.9` and an out-of-range `--fuzz 1.5` are
+/// handled by `parse_fuzz` exactly as before.
+fn bind_bare_fuzz(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    let mut args: Vec<OsString> = args.into_iter().collect();
+    // argv[0] is the program name; nothing after a `--` is an option.
+    let end = args
+        .iter()
+        .skip(1)
+        .position(|a| a == "--")
+        .map_or(args.len(), |i| i + 1);
+    for i in 1..end {
+        if args[i] != "--fuzz" {
+            continue;
+        }
+        let next_is_number = args
+            .get(i + 1)
+            .and_then(|a| a.to_str())
+            .is_some_and(|a| a.parse::<f64>().is_ok());
+        if !next_is_number {
+            args[i] = OsString::from(format!("--fuzz={FUZZ_DEFAULT}"));
+        }
+    }
+    args
+}
+
+const FUZZ_DEFAULT: &str = "0.5";
 
 fn parse_timeout(s: &str) -> Result<f64, String> {
     let v: f64 = s
@@ -109,7 +147,7 @@ struct Cli {
     /// Randomly pause and resume individual descendant processes of each test to
     /// introduce timing non-determinism. Optionally accepts an aggressiveness value
     /// in (0,1) where higher values pause processes more frequently (default: 0.5)
-    #[arg(long, num_args = 0..=1, default_missing_value = "0.5", value_parser = parse_fuzz)]
+    #[arg(long, num_args = 0..=1, default_missing_value = FUZZ_DEFAULT, value_parser = parse_fuzz)]
     fuzz: Option<f64>,
 
     /// Run each test this many times
@@ -565,7 +603,7 @@ fn exit_broken_pipe() -> ! {
 fn main() -> anyhow::Result<()> {
     clap_complete::CompleteEnv::with_factory(Cli::command).complete();
 
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(bind_bare_fuzz(std::env::args_os()));
 
     let env_filter = if cli.debug {
         tracing_subscriber::EnvFilter::new("attest=debug")
@@ -704,6 +742,57 @@ mod tests {
     // The same syntax error in the kind of script a tree can contain without
     // it having anything to do with the tests.
     const BROKEN_WITHOUT_TESTS: &str = "#!/bin/bash\nfoo() {\n\techo \"unterminated\n}\n";
+
+    fn cli(args: &[&str]) -> Result<Cli, clap::Error> {
+        let argv = std::iter::once("attest")
+            .chain(args.iter().copied())
+            .map(OsString::from);
+        Cli::try_parse_from(bind_bare_fuzz(argv))
+    }
+
+    #[test]
+    fn bare_fuzz_leaves_the_target_after_it_alone() {
+        // The README's own example.
+        let parsed = cli(&["--fuzz", "examples/race_condition.test"]).unwrap();
+        assert_eq!(parsed.fuzz, Some(0.5));
+        assert_eq!(parsed.path.as_deref(), Some("examples/race_condition.test"));
+
+        let parsed = cli(&["--fuzz", "list", "."]).unwrap();
+        assert_eq!(parsed.fuzz, Some(0.5));
+        assert!(matches!(parsed.command, Some(Commands::List { .. })));
+
+        let parsed = cli(&["--fuzz", "-v", "."]).unwrap();
+        assert_eq!(parsed.fuzz, Some(0.5));
+        assert_eq!(parsed.verbose, 1);
+
+        let parsed = cli(&[".", "--fuzz"]).unwrap();
+        assert_eq!(parsed.fuzz, Some(0.5));
+    }
+
+    #[test]
+    fn fuzz_still_takes_a_number_after_it() {
+        let parsed = cli(&["--fuzz", "0.9", "."]).unwrap();
+        assert_eq!(parsed.fuzz, Some(0.9));
+        assert_eq!(parsed.path.as_deref(), Some("."));
+
+        let parsed = cli(&["--fuzz=0.2", "."]).unwrap();
+        assert_eq!(parsed.fuzz, Some(0.2));
+
+        // Out of range is still an error about --fuzz, not a missing path.
+        let err = cli(&["--fuzz", "1.5", "."]).err().unwrap();
+        assert!(
+            err.to_string().contains("strictly between 0 and 1"),
+            "{err}"
+        );
+        assert!(cli(&["--fuzz"]).is_ok());
+    }
+
+    #[test]
+    fn fuzz_after_double_dash_is_a_target() {
+        let parsed = cli(&["--", "--fuzz"]).unwrap();
+        assert_eq!(parsed.fuzz, None);
+        assert_eq!(parsed.path.as_deref(), Some("--fuzz"));
+    }
 
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
