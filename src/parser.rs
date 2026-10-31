@@ -43,8 +43,7 @@ pub struct TestFile {
     /// the script the shell ran when every function was located.
     pub functions: Vec<(usize, usize)>,
     /// The shell the runner execs to define [`TestFile::script`] and call one
-    /// of [`TestFile::tests`], unless `--shebang` overrides it (see
-    /// [`crate::discovery::script_shell`]).
+    /// of [`TestFile::tests`] (see [`crate::discovery::script_shell`]).
     ///
     /// Kept here for the same reason the script is: it depends only on the
     /// file, and deriving it needs the file's first line — which the runner

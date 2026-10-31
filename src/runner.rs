@@ -443,8 +443,6 @@ pub struct RunConfig {
     /// Randomly SIGSTOP/SIGCONT individual descendant processes of each test to introduce
     /// timing non-determinism.
     pub fuzz: Option<f64>,
-    /// Override the shell used to run test scripts, ignoring the script's own shebang.
-    pub shebang: Option<String>,
     /// Disable overlayfs isolation; run each test directly in the working directory.
     pub no_overlay: bool,
     pub no_cgroups: bool,
@@ -458,10 +456,6 @@ struct RunEnv {
     overlay_mode: Option<overlay::Mode>,
     /// How each mount under `/` is re-established inside per-test roots.
     submounts: Vec<overlay::Submount>,
-    /// `--shebang`, resolved once for the run: the shell every test runs under
-    /// instead of the one its own file's shebang names
-    /// ([`crate::parser::TestFile::shell`]).
-    shell_override: Option<String>,
 }
 
 /// One test to run: the name it is reported under, the shell function to
@@ -537,10 +531,6 @@ pub fn run_all_tests<'a>(tests: Vec<TestSpec<'a>>, config: &RunConfig) -> Result
         invocation_dir,
         overlay_mode,
         submounts,
-        shell_override: config
-            .shebang
-            .as_deref()
-            .map(crate::discovery::resolve_shell),
     };
 
     // Contexts always live in the temp dir; `--save-context` copies each test's
@@ -852,7 +842,7 @@ fn spawn_test<'a>(
         .unwrap_or_else(|_| spec.file.path.clone());
     // Settled once per file at parse time, so a spawn neither re-reads the
     // script's shebang nor looks the shell up on PATH again.
-    let shell = env.shell_override.as_deref().unwrap_or(&spec.file.shell);
+    let shell = &spec.file.shell;
 
     let cgroup = if config.no_cgroups {
         None
@@ -1416,7 +1406,6 @@ mod tests {
             invocation_dir: invocation_dir.to_path_buf(),
             overlay_mode: None,
             submounts: Vec::new(),
-            shell_override: None,
         }
     }
 
@@ -1746,33 +1735,6 @@ mod tests {
         assert!(!edited_ran.exists(), "the spawn re-read the file's shebang");
     }
 
-    /// `--shebang` still wins over whatever the file asked for.
-    #[test]
-    fn the_shell_override_beats_the_files_own_shebang() {
-        let tmp = TempDir::new().unwrap();
-        let (own, own_ran) = shell_shim(&tmp.path().join("own"));
-        let (forced, forced_ran) = shell_shim(&tmp.path().join("forced"));
-
-        let tf = parse_script(tmp.path(), &script_with_shebang(&own));
-        let env = RunEnv {
-            shell_override: Some(forced.to_string_lossy().into_owned()),
-            ..no_overlay_env(tmp.path())
-        };
-
-        let ctx = private_temp_dir().unwrap();
-        let mut pending = spawn_test(
-            &spec(&tf, "test_x", "test_x"),
-            ctx.path().to_path_buf(),
-            &RunConfig::default(),
-            &env,
-        )
-        .unwrap();
-        assert!(reap_blocking(&mut pending).success());
-
-        assert!(forced_ran.exists(), "--shebang was not honoured");
-        assert!(!own_ran.exists(), "the file's own shebang won");
-    }
-
     /// A stand-in for the shell issue #93 is about: one with no `.`, no
     /// `source` and no `eval`.
     ///
@@ -1804,14 +1766,12 @@ mod tests {
     #[test]
     fn a_shell_without_a_dot_command_still_runs_its_tests() {
         let tmp = TempDir::new().unwrap();
-        let env = RunEnv {
-            shell_override: Some(no_dot_shell(tmp.path()).to_string_lossy().into_owned()),
-            ..no_overlay_env(tmp.path())
-        };
+        let shebang = format!("#!{}\n", no_dot_shell(tmp.path()).display());
+        let env = no_overlay_env(tmp.path());
 
         let r = run_script(
             tmp.path(),
-            "helper() {\n  echo 42\n}\ntest_x() {\n  [ \"$(helper)\" = 42 ]\n}\n",
+            &format!("{shebang}helper() {{\n  echo 42\n}}\ntest_x() {{\n  [ \"$(helper)\" = 42 ]\n}}\n"),
             "test_x",
             &RunConfig::default(),
             &env,
@@ -1826,7 +1786,7 @@ mod tests {
         // asking for no sourcing rather than `enable -n` quietly doing nothing.
         let sourcing = run_script(
             tmp.path(),
-            "test_dot() {\n  . /dev/null\n}\n",
+            &format!("{shebang}test_dot() {{\n  . /dev/null\n}}\n"),
             "test_dot",
             &RunConfig::default(),
             &env,
@@ -1854,14 +1814,11 @@ mod tests {
         let shell = tmp.path().join("bash");
         fs::write(&shell, "#!/bin/sh\necho 'bad syntax' >&2\nexit 2\n").unwrap();
         fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let env = RunEnv {
-            shell_override: Some(shell.to_string_lossy().into_owned()),
-            ..no_overlay_env(tmp.path())
-        };
+        let env = no_overlay_env(tmp.path());
 
         let r = run_script(
             tmp.path(),
-            "test_x() {\n  :\n}\n",
+            &format!("#!{}\ntest_x() {{\n  :\n}}\n", shell.display()),
             "test_x",
             &RunConfig::default(),
             &env,
@@ -2084,7 +2041,6 @@ mod tests {
             invocation_dir: invocation_dir.to_path_buf(),
             overlay_mode: Some(mode),
             submounts,
-            shell_override: None,
         })
     }
 

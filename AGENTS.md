@@ -114,7 +114,7 @@
   `list` and by completion — and drops the `./` for the same reason:
   `TestPattern::parse` would otherwise read the whole selector as a path.
 - `src/runner.rs` - For each test: forks a child that execs `<shell> -c` (the
-  shell the file's own parse settled on, or `--shebang`) with the original
+  shell the file's own parse settled on) with the original
   script path as `argv[0]` so `$0` still works. The script it is given is all
   the file's extracted functions (test + helper) followed by `set -e`, a `cd`
   into the test's clean working directory and only then `set -x` before the
@@ -316,7 +316,7 @@ pull in — and run — tests from outside the tree, and one pointing at an ance
 would yield each test once per level), while a path passed directly is always
 scanned whatever it is named. Each test runs under the shell named by its file's shebang, falling
 back to `/bin/sh` when that shell is not installed and to `bash` when there is
-no recognized shebang (`--shebang` overrides this for every test). Every command
+no recognized shebang. Every command
 in a test function is an implicit assertion - if it exits nonzero, the test
 fails. Non-test functions (helpers/setup) are also extracted and made available
 to tests.
@@ -377,8 +377,6 @@ off, so a test asserting on a pipeline must set it itself (see
   argument after a bare `--fuzz` is only taken as its value when it reads as a
   number (`bind_bare_fuzz` rewrites the flag to `--fuzz=0.5` otherwise), so
   `attest --fuzz <target>` leaves the target alone
-- `--shebang SHELL` — force this shell for every test, ignoring each script's own
-  shebang (e.g. `/bin/bash`, `/usr/bin/zsh`)
 - `--json` — print results as JSONL (one JSON object per test) instead of the
   colored terminal output
 - `--no-cgroups` — disable cgroup resource tracking

@@ -486,8 +486,6 @@ there isn't always the same thing:
 - `--strace CMD` — run CMD under strace, saving the log to the test's context
   dir. `CMD` is a command name or a path to one; tests that call it by its base
   name get the traced version
-- `--shebang SHELL` — force one shell for every test, ignoring each file's own
-  shebang
 - `--no-overlay` — skip filesystem isolation and run each test directly in the
   working directory
 - `--no-cgroups` — don't track per-test CPU, memory and IO usage with cgroups

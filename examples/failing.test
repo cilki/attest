@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 
-testHostname() {
-	hostname
+testWhoami() {
+	whoami
 }
 
-testFailing() {
-	hostname 1
+testWhoamiFailing() {
+	whoami 1
 }

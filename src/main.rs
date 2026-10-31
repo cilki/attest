@@ -154,11 +154,6 @@ struct Cli {
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
     repeat: u64,
 
-    /// Override the shell used to run tests, ignoring each script's own shebang
-    /// (e.g. `/bin/bash`, `/usr/bin/zsh`)
-    #[arg(long)]
-    shebang: Option<String>,
-
     /// Disable overlayfs isolation; run each test directly in the working directory
     #[arg(long)]
     no_overlay: bool,
@@ -685,15 +680,6 @@ fn main() -> anyhow::Result<()> {
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
 
-            // An explicit --shebang must name a shell that actually exists.
-            // Otherwise tests would silently fall back to /bin/sh and report
-            // results for a shell the user never asked for.
-            if let Some(ref shell) = cli.shebang
-                && !discovery::shell_exists(shell)
-            {
-                anyhow::bail!("--shebang: shell not found: {shell}");
-            }
-
             let config = runner::RunConfig {
                 parallel: cli.parallel,
                 bail: cli.bail,
@@ -705,7 +691,6 @@ fn main() -> anyhow::Result<()> {
                 strace: cli.strace,
                 timeout: cli.timeout.map(std::time::Duration::from_secs_f64),
                 fuzz: cli.fuzz,
-                shebang: cli.shebang,
                 no_overlay: cli.no_overlay,
                 no_cgroups: cli.no_cgroups,
             };
