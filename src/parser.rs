@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
@@ -8,6 +8,8 @@ use brush_parser::ast::{
 };
 use brush_parser::{Parser, ParserOptions};
 use tracing::warn;
+
+use crate::decorator::{self, Decorator};
 
 /// File containing tests.
 pub struct TestFile {
@@ -50,9 +52,33 @@ pub struct TestFile {
     /// used to reopen and re-read on every spawn, and so once more for every
     /// `--repeat`. The text this parse read is already the first line.
     pub shell: String,
+    /// The `#attest(...)` blocks in the file, each with the name of the test
+    /// it sits above (see [`attach_decorators`]). A test may have several.
+    pub decorators: Vec<(String, Decorator)>,
+    /// The 1-based line each test's definition starts on, for the tests the
+    /// parser located. `--add-decorators` writes a block directly above it;
+    /// a test with no entry (no span from the parser) gets none.
+    pub test_lines: HashMap<String, usize>,
 }
 
 impl TestFile {
+    /// Does `test` have an `#attest(...)` block above it?
+    pub fn has_decorator(&self, test: &str) -> bool {
+        self.decorators.iter().any(|(name, _)| name == test)
+    }
+
+    /// Every condition asserted on `test`, across all of its blocks, in
+    /// source order.
+    pub fn conditions_of<'a>(
+        &'a self,
+        test: &'a str,
+    ) -> impl Iterator<Item = &'a crate::decorator::Condition> + 'a {
+        self.decorators
+            .iter()
+            .filter(move |(name, _)| name == test)
+            .flat_map(|(_, d)| d.conditions.iter())
+    }
+
     /// Line range of the function definition enclosing `line` (0-based, a
     /// line of [`TestFile::script`]), or `None` if the line is inside none.
     pub fn enclosing_function(&self, line: usize) -> Option<(usize, usize)> {
@@ -357,11 +383,38 @@ pub fn parse_test_file(path: &Path, scan: &Prescan) -> anyhow::Result<TestFile> 
             script: String::new(),
             functions: Vec::new(),
             shell: crate::discovery::script_shell(&contents),
+            decorators: Vec::new(),
+            test_lines: HashMap::new(),
         });
     }
 
-    let functions = parse_functions(&contents)
-        .map_err(|e| anyhow::anyhow!("parse error in {}: {e}", path.display()))?;
+    let parse_error =
+        |e: &dyn std::fmt::Display| anyhow::anyhow!("parse error in {}: {e}", path.display());
+
+    // A decorator is a comment, and the shell parse drops every comment on its
+    // way to the functions: the blocks come from the text, and are tied to the
+    // function the parse puts directly below each. A malformed block is a
+    // parse error of the file — the alternative, an assertion the run silently
+    // never checks, is the one thing a decorator must not become. The blocks
+    // are scanned before the shell parse because the likeliest mistake, a
+    // multi-line block whose continuation lines lack their `#`, is a shell
+    // syntax error too, and "`#attest(` is not closed" names it better than
+    // "syntax error at line 3" does.
+    let blocks = decorator::scan(&contents).map_err(|e| parse_error(&e))?;
+
+    let functions = parse_functions(&contents).map_err(|e| parse_error(&e))?;
+
+    // Where each located function starts, 1-based. `location()` is the name's
+    // span joined with the body's, and the name is on the definition's first
+    // line whether or not a `function` keyword precedes it.
+    let starts: HashMap<usize, &str> = functions
+        .iter()
+        .filter_map(|f| Some((f.location()?.start.line, f.fname.value.as_str())))
+        .collect();
+
+    let mut keep = HashSet::new();
+    let decorators =
+        attach_decorators(blocks, &starts, &contents, &mut keep).map_err(|e| parse_error(&e))?;
 
     // A shell function defined more than once in the same file is shadowed:
     // when the runner defines them all and calls the name, only the last
@@ -390,14 +443,87 @@ pub fn parse_test_file(path: &Path, scan: &Prescan) -> anyhow::Result<TestFile> 
     // spans it is cut with, the bounds a snippet clamps to and the shell that
     // runs it can never be out of step: the file is read once and all of them
     // come from that one read.
-    let (script, bounds) = build_functions_source(&functions, &contents);
+    let (script, bounds) = build_functions_source(&functions, &contents, &keep);
+    // A test defined twice is the last definition (the one the shell runs),
+    // so that is where its decorator would go; `starts` is unordered, so
+    // take the greatest line per name.
+    let mut test_lines: HashMap<String, usize> = HashMap::new();
+    for (&line, &name) in &starts {
+        if name.starts_with(TEST_PREFIX) {
+            let entry = test_lines.entry(name.to_string()).or_insert(line);
+            *entry = (*entry).max(line);
+        }
+    }
     Ok(TestFile {
         path: path.to_path_buf(),
         tests,
         script,
         functions: bounds,
         shell: crate::discovery::script_shell(&contents),
+        decorators,
+        test_lines,
     })
+}
+
+/// Tie each `#attest(...)` block to the test it decorates: the function whose
+/// definition starts below it, with nothing but comment lines in between.
+///
+/// Comments may sit between the two because a doc comment usually does
+/// (`## Checks the help flag` is the README's own convention for describing a
+/// test). A blank line or a line of code there is a block that decorates
+/// nothing, and that is an error rather than a block quietly dropped — as is
+/// one above a function that is not a test, which no run would ever check it
+/// against.
+///
+/// `starts` maps the 1-based line each located function starts on to its
+/// name. `keep` collects the 1-based lines from each block down to its
+/// function: the block itself and the comments under it, which the script
+/// carries verbatim so that a violation's snippet shows the file as written
+/// (see [`build_functions_source`]).
+fn attach_decorators(
+    blocks: Vec<Decorator>,
+    starts: &HashMap<usize, &str>,
+    source: &str,
+    keep: &mut HashSet<usize>,
+) -> Result<Vec<(String, Decorator)>, decorator::Error> {
+    if blocks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let lines: Vec<&str> = source.lines().collect();
+
+    let mut attached = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        block.check_supported()?;
+        keep.extend(block.lines());
+        let mut line = block.last_line + 1;
+        let name = loop {
+            if let Some(name) = starts.get(&line) {
+                break *name;
+            }
+            match lines.get(line - 1) {
+                Some(text) if decorator::is_comment_line(text) => {
+                    keep.insert(line);
+                    line += 1;
+                }
+                _ => {
+                    return Err(decorator::Error {
+                        line: block.first_line,
+                        message: "`#attest(...)` is not directly above a test function".to_string(),
+                    });
+                }
+            }
+        };
+        if !name.starts_with(TEST_PREFIX) {
+            return Err(decorator::Error {
+                line: block.first_line,
+                message: format!(
+                    "`#attest(...)` decorates `{name}`, which is not a test (its name does not start with `test`)"
+                ),
+            });
+        }
+        attached.push((name.to_string(), block));
+    }
+    Ok(attached)
 }
 
 /// Build the definitions the runner puts at the head of a test's script.
@@ -412,7 +538,13 @@ pub fn parse_test_file(path: &Path, scan: &Prescan) -> anyhow::Result<TestFile> 
 /// heuristics needed on the diagnostics side.
 ///
 /// Only function definitions are emitted (top-level code is dropped), so
-/// running the script never runs a test file's top-level statements.
+/// running the script never runs a test file's top-level statements. The one
+/// exception is `keep`: the 1-based source lines of the file's `#attest(...)`
+/// blocks, which are copied through at their own line numbers instead of
+/// being blanked. They are comments, so the shell runs nothing more for them
+/// — but they are also what a violation's snippet has to show, and the
+/// snippet renders the script, not the file (see
+/// [`crate::diagnostics::print_violations`]).
 ///
 /// A function the parser gave no location for — and every function when
 /// `source` is empty — falls back to the reformatted AST rendering: line
@@ -425,6 +557,7 @@ pub fn parse_test_file(path: &Path, scan: &Prescan) -> anyhow::Result<TestFile> 
 pub(crate) fn build_functions_source(
     functions: &[FunctionDefinition],
     source: &str,
+    keep: &HashSet<usize>,
 ) -> (String, Vec<(usize, usize)>) {
     let src_lines: Vec<&str> = source.lines().collect();
     let mut out = String::new();
@@ -451,8 +584,13 @@ pub(crate) fn build_functions_source(
             }
             Some(span) => {
                 // Functions are yielded in source order, so this only pads
-                // forward.
+                // forward. A decorator line in the gap is copied, not blanked.
                 while line < span.start.line {
+                    if keep.contains(&line)
+                        && let Some(text) = src_lines.get(line - 1)
+                    {
+                        out.push_str(text);
+                    }
                     out.push('\n');
                     line += 1;
                 }
@@ -728,7 +866,7 @@ mod tests {
         let source = "helper() {\n  echo 42\n}\n\ntest_foo() {\n  test \"$(helper)\" = 42\n}\n";
         let functions = parse_functions(source).unwrap();
 
-        let (generated, bounds) = build_functions_source(&functions, "");
+        let (generated, bounds) = build_functions_source(&functions, "", &HashSet::new());
         // Even so, where each function landed is known exactly: the two are
         // re-rendered back to back, `helper` as three lines and `test_foo` as
         // the three after it.
@@ -1015,6 +1153,140 @@ mod tests {
         let result = parse_test_file(&path, &Prescan::default()).unwrap();
         assert_eq!(result.tests, ["test_dup"]);
         assert_eq!(result.script, source);
+    }
+
+    /// The names each test's conditions were written against, in order.
+    fn condition_texts(tf: &TestFile, test: &str) -> Vec<String> {
+        tf.conditions_of(test).map(|c| c.text.clone()).collect()
+    }
+
+    #[test]
+    fn decorator_attaches_to_the_function_below_it() {
+        let tmp = TempDir::new().unwrap();
+        let source = "\
+#!/bin/sh
+
+# attest(cpu < 10ms)
+testA() {
+  true
+}
+
+testB() {
+  true
+}
+
+#attest(
+#  pids <= 3,
+#  wall < 1s,
+#)
+## And a doc comment in between is fine.
+testC() {
+  true
+}
+";
+        let path = write_script(tmp.path(), "deco.test", source);
+        let tf = parse_test_file(&path, &Prescan::default()).unwrap();
+        assert_eq!(tf.tests, ["testA", "testB", "testC"]);
+        assert_eq!(condition_texts(&tf, "testA"), ["cpu < 10ms"]);
+        assert!(condition_texts(&tf, "testB").is_empty());
+        assert_eq!(condition_texts(&tf, "testC"), ["pids <= 3", "wall < 1s"]);
+
+        // Every line of a block is in the script at its own line number, so
+        // a snippet can point at it, and so is the doc comment between a
+        // block and its function; every other top-level line is blanked.
+        let script: Vec<&str> = tf.script.lines().collect();
+        let src: Vec<&str> = source.lines().collect();
+        for idx in [2, 11, 12, 13, 14, 15] {
+            assert_eq!(script[idx], src[idx], "line {idx}");
+        }
+        assert_eq!(script[0], "");
+        assert_eq!(script[1], "");
+        // And the function bounds are what they were without the blocks.
+        assert_eq!(tf.enclosing_function(3), Some((3, 5)));
+        assert_eq!(tf.enclosing_function(11), None);
+    }
+
+    #[test]
+    fn test_lines_say_where_each_definition_starts() {
+        let tmp = TempDir::new().unwrap();
+        let source = "#!/bin/sh\n\n# attest(cpu < 1s)\ntestA() {\n  true\n}\n\nhelper() {\n  true\n}\n\n## doc\nfunction testB {\n  true\n}\n\ntestA() {\n  echo shadowed\n}\n";
+        let path = write_script(tmp.path(), "lines.test", source);
+        let tf = parse_test_file(&path, &Prescan::default()).unwrap();
+        // The last definition of a shadowed name is the one that runs, so it
+        // is the one a generated block would sit above.
+        assert_eq!(tf.test_lines["testA"], 17);
+        assert_eq!(tf.test_lines["testB"], 13);
+        assert!(!tf.test_lines.contains_key("helper"));
+        assert!(tf.has_decorator("testA"));
+        assert!(!tf.has_decorator("testB"));
+    }
+
+    #[test]
+    fn several_blocks_on_one_test_add_up() {
+        let tmp = TempDir::new().unwrap();
+        let source = "#attest(cpu < 10ms)\n# attest(pids <= 2)\ntestA() {\n  true\n}\n";
+        let path = write_script(tmp.path(), "stack.test", source);
+        let tf = parse_test_file(&path, &Prescan::default()).unwrap();
+        assert_eq!(condition_texts(&tf, "testA"), ["cpu < 10ms", "pids <= 2"]);
+    }
+
+    #[test]
+    fn decorator_recognizes_every_spelling_of_a_definition() {
+        let tmp = TempDir::new().unwrap();
+        for source in [
+            "#attest(cpu < 1s)\ntest_x() {\n  true\n}\n",
+            "#attest(cpu < 1s)\nfunction test_x {\n  true\n}\n",
+            "#attest(cpu < 1s)\nfunction test_x() {\n  true\n}\n",
+            "#attest(cpu < 1s)\ntest_x ()\n{\n  true\n}\n",
+            "#attest(cpu < 1s)\n  test_x() {\n  true\n}\n",
+        ] {
+            let path = write_script(tmp.path(), "spelling.test", source);
+            let tf = parse_test_file(&path, &Prescan::default()).expect(source);
+            assert_eq!(condition_texts(&tf, "test_x"), ["cpu < 1s"], "{source:?}");
+        }
+    }
+
+    #[test]
+    fn a_detached_decorator_is_a_parse_error() {
+        let tmp = TempDir::new().unwrap();
+        for (source, what) in [
+            // A blank line between the block and the function.
+            ("#attest(cpu < 1s)\n\ntest_x() {\n  true\n}\n", "blank"),
+            // Code in between.
+            ("#attest(cpu < 1s)\nx=1\ntest_x() {\n  true\n}\n", "code"),
+            // Nothing below at all.
+            ("test_x() {\n  true\n}\n#attest(cpu < 1s)\n", "eof"),
+            // Inside a function body.
+            ("test_x() {\n  #attest(cpu < 1s)\n  true\n}\n", "body"),
+            // Above a helper rather than a test.
+            (
+                "#attest(cpu < 1s)\nhelper() {\n  true\n}\n\ntest_x() {\n  helper\n}\n",
+                "helper",
+            ),
+            // Malformed.
+            ("#attest(cpu < 1 s)\ntest_x() {\n  true\n}\n", "unit"),
+            // Not enforced yet.
+            ("#attest(hosts in {})\ntest_x() {\n  true\n}\n", "hosts"),
+        ] {
+            let path = write_script(tmp.path(), "bad.test", source);
+            let err = parse_test_file(&path, &Prescan::default())
+                .err()
+                .unwrap_or_else(|| panic!("{what}: parsed {source:?}"));
+            let msg = err.to_string();
+            assert!(msg.contains("parse error in"), "{what}: {msg}");
+            assert!(msg.contains("line "), "{what}: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_doc_comment_mentioning_attest_is_not_a_decorator() {
+        let tmp = TempDir::new().unwrap();
+        let source =
+            "## attest(cpu < 1s) is the syntax, but this is prose\ntest_x() {\n  true\n}\n";
+        let path = write_script(tmp.path(), "doc.test", source);
+        let tf = parse_test_file(&path, &Prescan::default()).unwrap();
+        assert!(tf.decorators.is_empty());
+        assert_eq!(tf.script.lines().next(), Some(""));
     }
 
     #[test]

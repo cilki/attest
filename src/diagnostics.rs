@@ -64,7 +64,7 @@ pub fn print_failure_snippet(result: &TestResult, file: &TestFile) {
             title,
             &result.source_path,
             &lines,
-            line_idx,
+            Highlight::line(line_idx),
             func_start_line,
             func_end_line,
             out_palette().is_colored(),
@@ -74,6 +74,76 @@ pub fn print_failure_snippet(result: &TestResult, file: &TestFile) {
     // If the failing command is a `[` expression, show operand details
     if let Some(expr) = parse_bracket_expr(&failure.command) {
         render_bracket_diff(&expr);
+    }
+}
+
+/// Report each `#attest(...)` condition the test failed, with a snippet that
+/// points at the condition itself.
+///
+/// The test's commands all succeeded — that is the only case in which
+/// conditions are checked — so there is no command to blame and the trace
+/// holds no failure to replay. What there is to show is the assertion, which
+/// the script carries at its own line number (the parser keeps decorator
+/// lines, see `parser::build_functions_source`), and the number that broke it,
+/// which is the snippet's label. The window runs from the condition down to
+/// the end of the function it decorates, so the test's name is in view too.
+pub fn print_violations(result: &TestResult, file: &TestFile) {
+    let lines: Vec<&str> = file.script.lines().collect();
+    for violation in &result.violations {
+        let line_idx = violation.line - 1;
+        if line_idx >= lines.len() {
+            outln!(
+                "error: {} (asserted `{}` at line {})",
+                violation.message,
+                violation.condition,
+                violation.line
+            );
+            continue;
+        }
+        // The decorator sits above its function, outside every bound; the
+        // function it belongs to is the first one that starts below it.
+        let func_end = file
+            .functions
+            .iter()
+            .find(|&&(start, _)| start > line_idx)
+            .map_or(lines.len() - 1, |&(_, end)| end);
+        outln!(
+            "{}",
+            render_snippet(
+                "assertion on the run failed",
+                &result.source_path,
+                &lines,
+                Highlight {
+                    line: line_idx,
+                    span: Some(violation.span.clone()),
+                    label: Some(&violation.message),
+                },
+                line_idx,
+                func_end,
+                out_palette().is_colored(),
+            )
+        );
+    }
+}
+
+/// What a snippet points at: a line of the script, optionally only a byte
+/// range of it, optionally with a label.
+struct Highlight<'a> {
+    /// 0-based line index.
+    line: usize,
+    /// Byte range within the line. `None` highlights the whole line past its
+    /// indentation.
+    span: Option<std::ops::Range<usize>>,
+    label: Option<&'a str>,
+}
+
+impl Highlight<'_> {
+    fn line(line: usize) -> Self {
+        Self {
+            line,
+            span: None,
+            label: None,
+        }
     }
 }
 
@@ -222,19 +292,22 @@ fn escape_c1(line: &str) -> std::borrow::Cow<'_, str> {
     crate::output::escape_chars(line, is_c1)
 }
 
-/// Render an annotate-snippets diagnostic highlighting `lines[line_idx]`, with
-/// up to [`CONTEXT_LINES`] lines of surrounding context on each side, clamped
-/// to the enclosing function so a snippet never leaks into an adjacent test.
+/// Render an annotate-snippets diagnostic highlighting `lines[highlight.line]`,
+/// with up to [`CONTEXT_LINES`] lines of surrounding context on each side,
+/// clamped to the enclosing function so a snippet never leaks into an adjacent
+/// test.
 fn render_snippet(
     title: &str,
     source_path: &Path,
     lines: &[&str],
-    line_idx: usize,
+    highlight: Highlight,
     func_start_line: usize,
     func_end_line: usize,
     colored: bool,
 ) -> String {
     use annotate_snippets::{AnnotationKind, Level, Renderer, Snippet};
+
+    let line_idx = highlight.line;
 
     // A file name comes out of the directory walk, so it is as much the tree's
     // choice as a test name is: annotate-snippets substitutes the control
@@ -256,20 +329,29 @@ fn render_snippet(
         lines[start..end].iter().copied().map(escape_c1).collect();
     let source = window.join("\n");
 
-    // Annotate the whole failing line within the rendered window, skipping its
-    // leading indentation. `join("\n")` puts one byte between lines.
+    // Annotate the failing line within the rendered window — the whole of it
+    // past its indentation, or the range asked for. `join("\n")` puts one byte
+    // between lines.
     let line_start: usize = window[..line_idx - start].iter().map(|l| l.len() + 1).sum();
     let failing = &*window[line_idx - start];
     let indent = failing.len() - failing.trim_start().len();
+    let (from, to) = match highlight.span {
+        // Escaping may have moved bytes about; clamp the range into the line
+        // rather than reach past it.
+        Some(range) => (range.start.min(failing.len()), range.end.min(failing.len())),
+        None => (indent, failing.len()),
+    };
+    let mut annotation = AnnotationKind::Primary.span(line_start + from..line_start + to);
+    if let Some(label) = highlight.label {
+        annotation = annotation.label(label);
+    }
 
     let report = &[Level::ERROR.primary_title(title).element(
         Snippet::source(&source)
             .path(&*path_str)
             .line_start(start + 1)
             .fold(false)
-            .annotation(
-                AnnotationKind::Primary.span(line_start + indent..line_start + failing.len()),
-            ),
+            .annotation(annotation),
     )];
 
     let renderer = if colored {
@@ -651,6 +733,8 @@ mod tests {
             script: script.into(),
             functions,
             shell: "bash".into(),
+            decorators: Vec::new(),
+            test_lines: Default::default(),
         }
     }
 
@@ -805,7 +889,15 @@ mod tests {
             "  false",
             "}",
         ];
-        let rendered = render_snippet("command failed", Path::new("t.sh"), &lines, 2, 0, 3, true);
+        let rendered = render_snippet(
+            "command failed",
+            Path::new("t.sh"),
+            &lines,
+            Highlight::line(2),
+            0,
+            3,
+            true,
+        );
 
         assert!(
             !rendered.contains('\u{9b}'),
@@ -832,6 +924,50 @@ mod tests {
             "{rendered}"
         );
         assert_eq!(strip_ansi(underline[0]).trim_end().len() - caret_col, 5);
+    }
+
+    #[test]
+    fn violation_snippet_underlines_the_one_condition_and_labels_it() {
+        // Two conditions on one line: the caret has to sit under the one that
+        // failed, with what was measured as its label, and the window runs
+        // down to the function so the test's name is in view.
+        let lines = [
+            "#!/bin/sh",
+            "",
+            "#attest(cpu < 10ms, pids <= 3)",
+            "test_x() {",
+            "  true",
+            "}",
+        ];
+        let span = lines[2].find("pids <= 3").unwrap();
+        let rendered = render_snippet(
+            "assertion on the run failed",
+            Path::new("t.sh"),
+            &lines,
+            Highlight {
+                line: 2,
+                span: Some(span..span + "pids <= 3".len()),
+                label: Some("pids was 5"),
+            },
+            2,
+            5,
+            false,
+        );
+        assert!(rendered.contains("pids was 5"), "{rendered}");
+        assert!(rendered.contains("test_x() {"), "{rendered}");
+        assert!(!rendered.contains("#!/bin/sh"), "{rendered}");
+        let underline = rendered.lines().find(|l| l.contains("^^^")).unwrap();
+        let caret_col = underline.find('^').unwrap();
+        let cond_line = rendered.lines().find(|l| l.contains("#attest(")).unwrap();
+        assert_eq!(cond_line.find("pids <= 3"), Some(caret_col), "{rendered}");
+        assert_eq!(
+            underline
+                .trim_end()
+                .strip_suffix(" pids was 5")
+                .map(str::len),
+            Some(caret_col + "pids <= 3".len()),
+            "{rendered}"
+        );
     }
 
     /// Drop the SGR sequences `Renderer::styled` wraps the snippet in, so a

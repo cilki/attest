@@ -113,6 +113,71 @@
   `selector` is the other direction — the single spelling of the join, used by
   `list` and by completion — and drops the `./` for the same reason:
   `TestPattern::parse` would otherwise read the whole selector as a path.
+  `parse_test_file` also ties the file's `#attest(...)` blocks to its tests
+  (`attach_decorators`): brush drops comments in the tokenizer, so the blocks
+  come from `decorator::scan` over the text and are attached to the function
+  whose `location()` starts below each, across any comment lines in between
+  (a doc comment usually sits there). A block that nothing follows, that a
+  blank or a line of code separates from its function, that decorates a
+  non-test function, or that uses a form nothing enforces yet is a parse
+  error of the file: an assertion the run would silently never check is worse
+  than a loud one. The scan runs *before* the shell parse so that the
+  likeliest mistake — continuation lines without their `#` — is named as an
+  unclosed block rather than as the shell's syntax error. The lines from a
+  block down to its function are the one exception to "only definitions are
+  emitted": `build_functions_source` copies them into `script` at their own
+  line numbers instead of blanking them (they are comments, so the shell runs
+  nothing more) because a violation's snippet renders the script, and has to
+  show the condition as written.
+- `src/decorator.rs` - The `#attest(...)` grammar and its evaluation. A
+  block opens on a line that is exactly one `#` (`##` is a doc comment), blanks,
+  `attest`, blanks, `(`, and closes at the first `)` outside braces, across
+  any number of comment lines whose `#` is stripped; `scan` returns every block
+  with its lines, and `parse_conditions` splits the joined text at the commas
+  outside braces (trailing comma allowed, empty block or empty condition an
+  error) and keeps each condition's line and byte span so the report can
+  underline exactly it. A condition is `METRIC OP QTY`, `QTY OP METRIC` or
+  `QTY OP METRIC OP QTY` (one metric, a chain pointing one way, a non-empty
+  range), with the unit family fixed by the metric (`Unit`: durations in
+  microseconds, sizes in bytes, counts bare) — or one of the set forms
+  `syscalls in`/`not in {…}`, `hosts in {…}`, `writes in {…}`, which parse but
+  are refused by `check_supported` until something enforces them. `Condition::
+  check` measures the metric out of a `Sample` (the `wall` duration plus the
+  cgroup's `ResourceStats`; `cpu` is user+system, the number the resource line
+  shows) and yields `Ok`, a `Violation` (line, span, condition text, `cpu was
+  12.2ms`, plus the metric, the measurement and the `Bound` it broke) or
+  `Unmeasured` when the run has no number for it. Each `Bound` carries its
+  `Literal` — the number token's line, byte span and text — recorded in
+  `parse_operand` as an offset into the condition and mapped onto the file's
+  lines in `parse_conditions`; a chain written across lines has its two
+  literals on two lines, which is why the position is per bound. That literal
+  is the whole of what `--update-decorators` rewrites.
+- `src/decorate.rs` - `--update-decorators` and `--add-decorators`: planned
+  from the `TestResult`s a finished run returns, applied once after it, never
+  reached by an interrupted run. `bound_for` is the one rule for a new number:
+  the extreme sample (max for an upper bound, min for a lower — this is how
+  `--repeat` folds) with headroom, ×1.25 rounded up or ×0.8 rounded down to
+  two significant figures in the base unit, so it reads as a chosen number and
+  never lands on a sample; a count is exact; whatever came out must admit
+  every sample or the exact bound past the extreme is used instead, and the
+  one bound nothing satisfies (`> x` under a sample of 0) is `None` and
+  skipped with a warning. `plan_updates` groups violations by the literal's
+  `(path, line, column)` and emits a `Replace` of that token only; a bound
+  that held is never touched, and nothing but the number is. `plan_additions`
+  writes an `Insert` of `# attest(cpu < …, mem < …, pids <= …)` (the
+  `Metric::GENERATED` subset the run measured — `wall` is scheduler noise and
+  `io_*` rarely the point) directly above the definition line
+  (`TestFile::test_lines`, so a test the parser gave no span for gets none),
+  at the definition's indentation, for a test with no block
+  (`TestFile::has_decorator`) whose every run's commands succeeded. Directly
+  above the definition rather than above a doc comment, because the line
+  above a definition is known to be its own while a comment further up may be
+  the previous function's. `apply` reads each file once, checks every
+  `Replace`'s old text is still where the parse put it (a file edited during
+  the run is skipped with a warning, not guessed at), applies bottom-up and
+  right-to-left so no edit moves another, and `fs::write`s in place so the
+  inode and the `+x` bit survive. The summary lists each edit with the file
+  relative to the cwd, on stdout, or on stderr under `--json`.
 - `src/runner.rs` - For each test: forks a child that execs `<shell> -c` (the
   shell the file's own parse settled on) with the original
   script path as `argv[0]` so `$0` still works. The script it is given is all
@@ -148,6 +213,22 @@
   copies each test's filesystem delta plus logs to the output dir. Display
   names (and thus context dirs) are unique per test: a test name defined in
   more than one file is qualified as `file.test:test_name`.
+  `build_result` is where a test's `#attest(...)` conditions are checked,
+  since it is the one place that has the outcome, the wall duration and the
+  cgroup's stats together: only a run whose commands all succeeded is judged
+  (a failed or timed-out run's numbers are those of a test that never got to
+  its end), a violated condition turns `Pass` into `Fail` and goes on
+  `TestResult::violations`, and a metric the run has no number for —
+  `--no-cgroups`, no cgroup v2, a controller not enabled — is reported once
+  per run per metric on stderr (`warn_unmeasured`) and leaves the outcome
+  alone, since a condition on a number nobody has is not one the test can
+  fail. `commands_succeeded` is what the report loop reads: a violation-only
+  failure gets `diagnostics::print_violations` and no xtrace replay, because
+  there is no failed command in the trace to replay or to blame. Under
+  `RunConfig::update_decorators` a violation is recorded but the outcome
+  stays `Pass` — the run exists to find the right bounds. `TestResult::test`
+  is the function's name as written (the display name may be qualified and
+  numbered), which is what `decorate` keys additions by.
   Every context lives under the run's one temp dir, which
   `private_temp_dir` creates mode `0700`: a context holds the test's working
   directory, every file it wrote in its ephemeral root, and an `xtrace.log`
@@ -240,6 +321,15 @@
   but prints `U+0080`–`U+009F` through, and those are controls a UTF-8
   terminal obeys (`U+009B` is `CSI`). Escaping happens before the annotation
   span is measured, since it moves the offsets the span is built from.
+  `print_violations` is the report for a test that failed only its
+  `#attest(...)` conditions: one snippet per violation, rendered from the same
+  `script` (the parser keeps decorator lines in it at their own line numbers
+  for exactly this), with a `Highlight` that underlines just the condition's
+  byte span — `cpu < 10ms` inside `#attest(cpu < 10ms, pids <= 3)` — and
+  carries `cpu was 12.2ms` as the annotation's label. The window runs from
+  the condition to the end of the function below it, so the test's name is in
+  view; the decorator sits outside every function bound, so the clamp is
+  found as the first function starting under it.
 - `src/output.rs` - ANSI-colored terminal output for PASS/FAIL and summary, plus
   the `Palette` that decides whether those sequences are written at all. A
   styled write takes them from the palette of the stream it is bound for
@@ -258,8 +348,9 @@
   `--json` carries no styling either way. Also holds
   the `--json` JSONL encoder (`print_test_result_json`): one object per test with
   `name`, `file`, `status` (`pass`/`fail`/`timeout`), `duration_ms`, `stdout`,
-  `xtrace`, `strace` and `resources`. The schema is documented in the README, so
-  keep both in step when changing it.
+  `xtrace`, `strace`, `resources` and `violations` (always a list; a decorator
+  failure is a plain `fail` with the detail there). The schema is documented in
+  the README, so keep both in step when changing it.
   Test names and discovered file names go into a report line through
   `escape_label`, which spells their control characters `\xNN`: both are
   arbitrary bytes from the tree (a shell takes almost anything as a function
@@ -328,6 +419,19 @@ enables `set -e` and `set -x` and nothing more — `pipefail` in particular is
 off, so a test asserting on a pipeline must set it itself (see
 `examples/race_condition.test`).
 
+A comment block of the form `# attest(cond, cond, ...)` directly above a test
+function (comment lines, a doc comment included, may sit between) is a
+decorator: each condition compares one metric of the run — `cpu`, `wall`,
+`mem`, `io_read`, `io_write`, `pids`, with the unit family the metric fixes —
+against a value with `<`, `<=`, `>`, `>=`, or brackets it (`2ms < cpu <
+10ms`). The block may span several `#` lines and take a trailing comma; blanks
+are allowed around `attest`; `##` never opens one. A violated condition fails
+the test once its commands have all succeeded (see `examples/md5sum.test`,
+and the README's "Decorators"). The set forms `syscalls in`/`not in {…}`,
+`hosts in {…}` and `writes in {…}` parse but are rejected until enforced.
+`--add-decorators` writes such a block, and `--update-decorators` rewrites
+a bound's number when the run breaks it.
+
 ## CLI options
 
 - `--parallel N` — max concurrent tests (default: CPU cores)
@@ -380,6 +484,12 @@ off, so a test asserting on a pipeline must set it itself (see
 - `--json` — print results as JSONL (one JSON object per test) instead of the
   colored terminal output
 - `--no-cgroups` — disable cgroup resource tracking
+- `--update-decorators` — a violated `#attest(...)` bound does not fail the
+  test; after the run the literal is rewritten to admit what was measured,
+  with headroom. `--add-decorators` — after the run, a block bounding `cpu`,
+  `mem` and `pids` is inserted above every test that has none. Both fold
+  `--repeat`, write once after a finished run, and are independent (see
+  `src/decorate.rs`)
 - `-d`, `--debug` — enable debug logging
 
 ## Building and running

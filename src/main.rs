@@ -1,4 +1,6 @@
 mod cgroup;
+mod decorate;
+mod decorator;
 mod diagnostics;
 mod discovery;
 mod output;
@@ -161,6 +163,18 @@ struct Cli {
     /// Disable cgroup resource tracking
     #[arg(long)]
     no_cgroups: bool,
+
+    /// Rewrite each `#attest(...)` bound the run broke so that it admits what
+    /// was measured, with headroom, instead of failing the test. Pairs with
+    /// --repeat, which folds every run's measurement into one bound
+    #[arg(long)]
+    update_decorators: bool,
+
+    /// Write a `#attest(...)` block above each test that has none, bounding
+    /// the cpu, mem and pids the run measured (with headroom). Pairs with
+    /// --repeat
+    #[arg(long)]
+    add_decorators: bool,
 
     /// Enable debug logging
     #[arg(short = 'd', long)]
@@ -693,10 +707,32 @@ fn main() -> anyhow::Result<()> {
                 fuzz: cli.fuzz,
                 no_overlay: cli.no_overlay,
                 no_cgroups: cli.no_cgroups,
+                update_decorators: cli.update_decorators,
             };
 
             let results = runner::run_all_tests(all_tests, &config)?;
             any_failed = results.iter().any(|r| !r.outcome.passed());
+
+            // Only reached by a run that finished: an interrupted one errored
+            // out above, so nothing is ever written from half a run.
+            if cli.update_decorators || cli.add_decorators {
+                let mut edits = Vec::new();
+                if cli.update_decorators {
+                    edits.extend(decorate::plan_updates(&results));
+                }
+                if cli.add_decorators {
+                    // Results name files by canonical path (the runner
+                    // resolves them for `$0`), so key the parses the same way.
+                    let files: std::collections::HashMap<PathBuf, &parser::TestFile> = selection
+                        .files
+                        .iter()
+                        .map(|f| (f.path.canonicalize().unwrap_or_else(|_| f.path.clone()), f))
+                        .collect();
+                    edits.extend(decorate::plan_additions(&results, &files));
+                }
+                let applied = decorate::apply(edits);
+                decorate::print_summary(&applied, cli.json);
+            }
         }
     }
 

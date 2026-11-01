@@ -5,10 +5,16 @@ testHelp() {
 	md5sum --help
 }
 
+# attest(
+#   wall < 1s,
+#   pids <= 3,
+# )
 testVersion() {
 	md5sum --version
 }
 
+## Known input, known output.
+# attest(mem < 20MiB)
 testHello() {
 	result=$(echo hello | md5sum)
 

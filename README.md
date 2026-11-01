@@ -102,6 +102,130 @@ script the shell is handed, so running a test asks the shell for nothing beyond
 defining a function and calling it — a shell that implements neither `.` nor
 `source` nor `eval` runs its tests just the same.
 
+### Decorators
+
+The commands in a test assert on what it *does*. A decorator asserts on the
+*run* — how much time, memory or how many processes it took — and is written
+as a comment directly above the test function:
+
+```sh
+# attest(2ms < cpu < 10ms, mem < 50MiB)
+testHello() {
+	result=$(echo hello | md5sum)
+
+	[ "${result}" = "b1946ac92492d2347c6235b4d2611184  -" ]
+}
+```
+
+Being a comment, it changes nothing about the script: the shell never sees it,
+and the file still sources and runs as it did. When the test's commands all
+succeed, each condition is checked against what the run measured, and one that
+doesn't hold fails the test with a report that points at the condition:
+
+```
+FAIL  testHello                                (5ms)
+error: assertion on the run failed
+ --> md5sum.test:3:10
+  |
+3 | # attest(2ms < cpu < 10ms, mem < 50MiB)
+  |          ^^^^^^^^^^^^^^^^ cpu was 12.2ms
+4 | testHello() {
+5 |     result=$(echo hello | md5sum)
+  |
+```
+
+A block holds any number of conditions separated by commas (a trailing one is
+fine), and can be spread over several comment lines, with blanks allowed
+around `attest`:
+
+```sh
+# attest(
+#   2ms < cpu < 10ms,
+#   pids <= 3,
+# )
+## Doc comments may still sit between the block and the test.
+testHello() {
+```
+
+Each condition compares one metric against a value, from either side, or
+brackets it between two: `cpu < 10ms`, `10ms > cpu`, `2ms <= cpu <= 10ms`.
+The operators are `<`, `<=`, `>` and `>=`, and a chain has to point the same
+way throughout. The metrics are the numbers of the resource usage line
+described under [Resource usage](#resource-usage):
+
+| metric | what it measures | units |
+|---|---|---|
+| `cpu` | user plus system CPU time | `us`, `ms`, `s` |
+| `wall` | wall-clock time from spawn to exit | `us`, `ms`, `s` |
+| `mem` | peak memory | `B`, `KiB`, `MiB`, `GiB` (or `KB`, `MB`, `GB`) |
+| `io_read`, `io_write` | bytes read from and written to block devices | same |
+| `pids` | the most processes alive at once | a whole number |
+
+A value takes the unit of its metric and nothing else — `cpu < 10` is a parse
+error, as is `mem < 10ms`. Decimals are fine (`1.5ms`, `0.5MiB`).
+
+Two things to know about what the numbers mean. Everything but `wall` comes
+from the test's cgroup, so where attest can't create one — `--no-cgroups`, no
+cgroup v2, or no permission — those conditions aren't checked at all: the run
+says so once on stderr and the test's outcome is whatever its commands made
+it. And the cgroup is joined before the shell starts, so `cpu`, `mem` and
+`pids` include the shell's own startup (a few milliseconds and a couple of
+megabytes of bash) on top of what the test did; an upper bound is a safer
+thing to assert than a lower one.
+
+Conditions are only checked for a test whose commands all succeeded. A test
+that failed on its own, or was killed by `--timeout`, is reported for that —
+the numbers belong to a run that never reached its end.
+
+A decorator that isn't directly above a test function (a blank line between
+the two, or a helper underneath it), a condition that doesn't parse, or a
+`#attest(` whose continuation lines lack their `#` (the shell would read them
+as code) is a parse error of the file, reported like any other: fatal when
+the file was named on the command line, a warning that skips the file when a
+directory walk found it. An assertion that is written down and silently never
+checked would be worse. Note that exactly one `#` opens a block — `## attest(…)`
+is a doc comment, whatever it goes on to say.
+
+#### Generating and updating decorators
+
+Nobody knows what a test's CPU time is before running it, so attest can write
+the numbers for you:
+
+```sh
+# Give every undecorated test a block bounding what this run measured
+attest --add-decorators .
+
+# Loosen whichever bounds the run broke, instead of failing on them
+attest --update-decorators --repeat 10 .
+```
+
+`--add-decorators` inserts one line directly above each test that has no
+block — `# attest(cpu < 15ms, mem < 3.8MiB, pids <= 6)`, with whichever of
+those three the run could measure — and leaves every test that already has
+one alone, even if it bounds only some of them. `--update-decorators` turns a
+violated condition from a failure into an edit: the test passes, and the one
+number that was wrong is replaced in place, so `cpu < 10ms, pids <= 3` with
+`cpu` measured at 12.2ms becomes `cpu < 16ms, pids <= 3`. Bounds that held
+are never touched, and neither is anything but the number.
+
+A new bound is the measurement plus headroom — ×1.25 for an upper bound,
+×0.8 for a lower one, rounded outwards to two significant figures — so the
+ordinary jitter of the next run doesn't break it again. A count (`pids`) is
+written exactly. Both flags fold `--repeat`: an upper bound comes from the
+largest of the runs, a lower one from the smallest, which is what makes
+`--repeat` the way to get bounds that hold. Only a test whose commands all
+succeeded contributes; a run that failed or timed out has no numbers worth
+writing. The files are rewritten once, after the whole run, and never after
+an interrupted one; a file that changed while the run was going is left alone
+with a warning. What was written is listed after the summary:
+
+```
+Updated 2 conditions, added 1 decorator in 2 files:
+  md5sum.test:3  cpu < 10ms  ->  cpu < 16ms
+  md5sum.test:9  pids <= 3  ->  pids <= 5
+  sleep.test:4  + # attest(cpu < 2.5ms, mem < 2.1MiB, pids <= 2)
+```
+
 ### Inline tests
 
 If you're testing something that's itself a shell script, you can also include
@@ -489,6 +613,10 @@ there isn't always the same thing:
 - `--no-overlay` — skip filesystem isolation and run each test directly in the
   working directory
 - `--no-cgroups` — don't track per-test CPU, memory and IO usage with cgroups
+- `--update-decorators` — rewrite the `#attest(...)` bounds the run broke
+  instead of failing on them; `--add-decorators` — write a block above each
+  test that has none (see [Generating and updating
+  decorators](#generating-and-updating-decorators))
 - `-d`, `--debug` — enable debug logging
 
 ### Stopping a run early
@@ -561,11 +689,20 @@ Every object carries the same keys:
   command's base name (`--strace /usr/bin/curl` appears as `curl`); `{}`
   without `--strace`
 - `resources` — cgroup usage, or `null` when it isn't available
+- `violations` — the test's [decorator](#decorators) conditions that didn't
+  hold; `[]` when every one held or none was written
 
 When present, `resources` holds whichever of `cpu_user_usec`,
 `cpu_system_usec`, `memory_peak`, `io_read_bytes`, `io_write_bytes` and
 `pids_peak` the cgroup reported — the same numbers as the resource usage line
 described below, in microseconds and bytes.
+
+Each entry of `violations` is an object with `line` (the 1-based line of the
+condition in the file), `condition` (its text as written, `cpu < 10ms`) and
+`message` (what was measured instead, `cpu was 12.2ms`). A test with any is
+`fail`: a decorator failure is a failure of the ordinary kind — except under
+`--update-decorators`, where it is `pass` and the entry says what was
+rewritten. The list of edits then goes to stderr, so stdout stays JSONL.
 
 The exit status is unchanged by `--json`: 1 if any test failed, 0 otherwise.
 
@@ -757,6 +894,12 @@ whether the trap is a command string or names a cleanup function. A timed-out
 test gets the same snippet under `test timed out`, pointing at whatever it was
 running when the clock ran out.
 
+A test that failed only a [decorator](#decorators) condition gets a different
+report: its commands all succeeded, so there is no xtrace to replay and no
+command to blame. Instead, one snippet per failed condition under `assertion
+on the run failed` underlines the condition itself, labelled with what the
+run measured.
+
 When the failing command is a comparison — `[`, `test` or `[[` with `=`, `==`,
 `!=`, `-eq`, `-ne`, `-lt`, `-le`, `-gt` or `-ge` — both operands are recovered
 from the trace and printed as `left` and `right`, so you don't have to pick them
@@ -843,7 +986,8 @@ nothing to report are left out.
 These numbers come from a cgroup created per test, so the line is absent
 altogether when `attest` can't make one — cgroup v2 not mounted, or no
 permission to create a child cgroup, which `-d` will tell you about — and when
-you pass `--no-cgroups`.
+you pass `--no-cgroups`. A [decorator](#decorators) turns any of them into an
+assertion.
 
 ## Installation
 

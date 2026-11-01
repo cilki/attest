@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 
+use crate::decorator;
 use crate::output;
 use crate::output::errln;
 use crate::overlay;
@@ -263,11 +264,32 @@ impl Outcome {
 
 pub struct TestResult {
     pub name: String,
+    /// The shell function's name as written in the file — what `name` is
+    /// derived from, and what the file's decorators are keyed by.
+    pub test: String,
     pub outcome: Outcome,
     pub duration: Duration,
     pub context: PathBuf,
     pub source_path: PathBuf,
     pub resources: Option<crate::cgroup::ResourceStats>,
+    /// The test's `#attest(...)` conditions that did not hold. Only a test
+    /// whose script succeeded has its conditions checked, so a non-empty list
+    /// is the whole reason the outcome is [`Outcome::Fail`] — the commands
+    /// all ran, and the report says so by pointing at the condition rather
+    /// than at the last of them (see [`crate::diagnostics::print_violations`]).
+    /// Under `--update-decorators` the outcome stays [`Outcome::Pass`] and the
+    /// list is what gets rewritten (see [`crate::decorate`]).
+    pub violations: Vec<crate::decorator::Violation>,
+}
+
+impl TestResult {
+    /// Did every command of the test succeed, whatever its decorators said?
+    /// Decides whether the failure report replays the trace and blames a
+    /// command — both of which would mislead for a test that failed only
+    /// a condition on its run.
+    pub fn commands_succeeded(&self) -> bool {
+        self.outcome == Outcome::Pass || !self.violations.is_empty()
+    }
 }
 
 /// State held by the parent for a spawned test child that has not yet been
@@ -287,8 +309,12 @@ struct PendingTest<'a> {
     source_path: PathBuf,
     /// The parse the test was run from: the failure report renders its
     /// snippet out of the script this holds (see
-    /// [`crate::diagnostics::print_failure_snippet`]).
+    /// [`crate::diagnostics::print_failure_snippet`]), and the function's
+    /// decorators are looked up in it by `test`.
     file: &'a crate::parser::TestFile,
+    /// The shell function's name, as written in the file (the display name
+    /// may be qualified and numbered).
+    test: &'a str,
     cgroup: Option<crate::cgroup::TestCgroup>,
 }
 
@@ -446,6 +472,10 @@ pub struct RunConfig {
     /// Disable overlayfs isolation; run each test directly in the working directory.
     pub no_overlay: bool,
     pub no_cgroups: bool,
+    /// A violated `#attest(...)` condition is recorded but does not fail the
+    /// test: the run is there to find out what the bounds should be, and
+    /// `decorate::plan_updates` rewrites them from the violations afterwards.
+    pub update_decorators: bool,
 }
 
 /// Run-wide isolation state shared by every spawned test.
@@ -621,7 +651,7 @@ pub fn run_all_tests<'a>(tests: Vec<TestSpec<'a>>, config: &RunConfig) -> Result
                 continue; // Drop kills + cleans up
             }
             let file = pending.file;
-            let result = build_result(pending, exit_status);
+            let result = build_result(pending, exit_status, config);
             if let Some(ref save_dir) = config.save_context {
                 save_test_context(&result, save_dir, &env.submounts);
             }
@@ -650,11 +680,18 @@ pub fn run_all_tests<'a>(tests: Vec<TestSpec<'a>>, config: &RunConfig) -> Result
                     status.suspend(|| output::print_test_result(&result));
                 }
                 if !result.outcome.passed() {
-                    // At -vv the streamer already showed this test's xtrace.
-                    if config.verbose < 2 {
-                        status.suspend(|| dump_xtrace_log(&result.name, &result.context));
+                    if result.commands_succeeded() {
+                        // Every command ran and returned zero; the trace has
+                        // no failure in it to replay, and the last command
+                        // is not to blame. The condition is.
+                        status.suspend(|| crate::diagnostics::print_violations(&result, file));
+                    } else {
+                        // At -vv the streamer already showed this test's xtrace.
+                        if config.verbose < 2 {
+                            status.suspend(|| dump_xtrace_log(&result.name, &result.context));
+                        }
+                        status.suspend(|| crate::diagnostics::print_failure_snippet(&result, file));
                     }
-                    status.suspend(|| crate::diagnostics::print_failure_snippet(&result, file));
                 }
             }
             if !result.outcome.passed() && config.bail {
@@ -940,15 +977,16 @@ fn spawn_test<'a>(
         context: Some(context),
         source_path: source_path_owned,
         file: spec.file,
+        test: spec.name,
         cgroup,
     })
 }
 
 /// Build a `TestResult` from a `PendingTest` whose child has already exited
 /// with the given status.
-fn build_result(mut pending: PendingTest, status: ExitStatus) -> TestResult {
+fn build_result(mut pending: PendingTest, status: ExitStatus, config: &RunConfig) -> TestResult {
     let duration = pending.start.elapsed();
-    let outcome = if pending.timed_out {
+    let mut outcome = if pending.timed_out {
         Outcome::Timeout
     } else if status.success() {
         Outcome::Pass
@@ -959,16 +997,69 @@ fn build_result(mut pending: PendingTest, status: ExitStatus) -> TestResult {
     // Read stats before dropping cgroup (which removes the directory).
     let resources = pending.cgroup.as_ref().map(|cg| cg.read_stats());
 
+    // A decorator is a condition on a run of the test, and a run that failed
+    // on its own — or was killed on the clock — is not one it says anything
+    // about: the numbers are those of a test that never got to the end.
+    let mut violations = Vec::new();
+    if outcome == Outcome::Pass {
+        let sample = decorator::Sample {
+            wall: duration,
+            resources: resources.as_ref(),
+        };
+        for condition in pending.file.conditions_of(pending.test) {
+            match condition.check(&sample) {
+                decorator::Verdict::Ok => {}
+                decorator::Verdict::Violated(v) => violations.push(v),
+                decorator::Verdict::Unmeasured(metric) => warn_unmeasured(metric),
+            }
+        }
+        // A run that exists to find the right bounds is not failed by the
+        // wrong ones; the violations are what it came for.
+        if !violations.is_empty() && !config.update_decorators {
+            outcome = Outcome::Fail;
+        }
+    }
+
     TestResult {
         name: pending.name.clone(),
+        test: pending.test.to_string(),
         outcome,
         duration,
         context: pending.context.take().unwrap(),
         source_path: pending.source_path.clone(),
         resources,
+        violations,
     }
     // pending drops here: reaped=true skips kill/wait, tmp_dir=None skips
     // dir removal, cgroup drops removing the cgroup directory.
+}
+
+/// Say once per run, per metric, that conditions on it are going unchecked.
+///
+/// On stderr directly rather than in the log: a condition that is written
+/// down and not checked changes what the run covers, so it has to show up
+/// whatever the log level is — but once, since every test's `cpu` condition
+/// is unmeasured for the same reason.
+fn warn_unmeasured(metric: decorator::Metric) {
+    static WARNED: [AtomicBool; decorator::Metric::ALL.len()] =
+        [const { AtomicBool::new(false) }; decorator::Metric::ALL.len()];
+    let slot = decorator::Metric::ALL
+        .iter()
+        .position(|&m| m == metric)
+        .expect("every metric is in ALL");
+    if WARNED[slot].swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let hint = match metric {
+        decorator::Metric::Wall => String::new(),
+        _ => " (cgroup v2 unavailable, --no-cgroups, or the controller is not enabled; -d says which)"
+            .to_string(),
+    };
+    errln!(
+        "warning: `{}` conditions are not checked: {} did not report it{hint}",
+        metric.name(),
+        metric.source()
+    );
 }
 
 /// Is `dir` a directory of its own (not a symlink to one) holding at least one
@@ -1481,7 +1572,7 @@ mod tests {
         .unwrap();
         let status = reap_blocking(&mut pending);
         Finished {
-            result: build_result(pending, status),
+            result: build_result(pending, status, config),
             _context: ctx,
         }
     }
@@ -1497,11 +1588,13 @@ mod tests {
     fn result_in(context: PathBuf, name: &str) -> TestResult {
         TestResult {
             name: name.to_string(),
+            test: name.to_string(),
             outcome: Outcome::Fail,
             duration: Duration::from_millis(1),
             context,
             source_path: PathBuf::from("t.sh"),
             resources: None,
+            violations: Vec::new(),
         }
     }
 
@@ -1515,6 +1608,66 @@ mod tests {
             &RunConfig::default(),
             &no_overlay_env(tmp.path()),
         )
+    }
+
+    /// `wall` needs no cgroup, so it is the decorator a unit test can count
+    /// on being checked wherever the tests run.
+    #[test]
+    fn a_decorator_the_run_breaks_fails_the_test() {
+        let script = "#attest(wall < 1us)\ntest_x() {\n  true\n}\n";
+        let r = run_inline(script, "test_x");
+        assert_eq!(r.outcome, Outcome::Fail);
+        assert_eq!(r.violations.len(), 1, "{:?}", r.violations);
+        let v = &r.violations[0];
+        assert_eq!(v.line, 1);
+        assert_eq!(v.condition, "wall < 1us");
+        assert!(v.message.starts_with("wall was "), "{}", v.message);
+        // The commands themselves all ran: the report must not blame one.
+        assert!(r.commands_succeeded());
+    }
+
+    #[test]
+    fn a_decorator_the_run_meets_leaves_the_test_passing() {
+        let script = "# attest(\n#   wall < 60s,\n# )\ntest_x() {\n  true\n}\n";
+        let r = run_inline(script, "test_x");
+        assert_eq!(r.outcome, Outcome::Pass);
+        assert!(r.violations.is_empty());
+    }
+
+    #[test]
+    fn under_update_decorators_a_violation_is_recorded_but_does_not_fail() {
+        let script = "#attest(wall < 1us)\ntest_x() {\n  true\n}\n";
+        let tmp = TempDir::new().unwrap();
+        let config = RunConfig {
+            update_decorators: true,
+            ..Default::default()
+        };
+        let r = run_script(
+            tmp.path(),
+            script,
+            "test_x",
+            &config,
+            &no_overlay_env(tmp.path()),
+        );
+        assert_eq!(r.outcome, Outcome::Pass);
+        assert_eq!(r.violations.len(), 1);
+        assert_eq!(r.test, "test_x");
+        // The literal to rewrite is where the file has it.
+        let lit = &r.violations[0].broken.bound.literal;
+        assert_eq!(lit.line, 1);
+        assert_eq!(&script.lines().next().unwrap()[lit.span.clone()], "1us");
+    }
+
+    #[test]
+    fn a_failing_test_is_not_also_judged_on_its_decorators() {
+        // The numbers are those of a run that never got to the end, so the
+        // only verdict is the command's — and the report stays the command's
+        // too.
+        let script = "#attest(wall < 1us)\ntest_x() {\n  false\n}\n";
+        let r = run_inline(script, "test_x");
+        assert_eq!(r.outcome, Outcome::Fail);
+        assert!(r.violations.is_empty());
+        assert!(!r.commands_succeeded());
     }
 
     /// The run's temp dir carries every test's logs, working directory and
@@ -1771,7 +1924,9 @@ mod tests {
 
         let r = run_script(
             tmp.path(),
-            &format!("{shebang}helper() {{\n  echo 42\n}}\ntest_x() {{\n  [ \"$(helper)\" = 42 ]\n}}\n"),
+            &format!(
+                "{shebang}helper() {{\n  echo 42\n}}\ntest_x() {{\n  [ \"$(helper)\" = 42 ]\n}}\n"
+            ),
             "test_x",
             &RunConfig::default(),
             &env,

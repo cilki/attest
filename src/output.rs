@@ -688,8 +688,24 @@ impl serde::Serialize for TestResultJson<'_> {
         map.serialize_entry("xtrace", &LogField(result.context.join("xtrace.log")))?;
         map.serialize_entry("strace", &strace_logs(&result.context))?;
         map.serialize_entry("resources", &resource_stats_json(result.resources.as_ref()))?;
+        map.serialize_entry("violations", &violations_json(&result.violations))?;
         map.end()
     }
+}
+
+/// The `#attest(...)` conditions a test failed, as `--json` reports them:
+/// always present, `[]` when every condition held (or none was written).
+fn violations_json(violations: &[crate::decorator::Violation]) -> Value {
+    violations
+        .iter()
+        .map(|v| {
+            serde_json::json!({
+                "line": v.line,
+                "condition": v.condition,
+                "message": v.message,
+            })
+        })
+        .collect()
 }
 
 /// Write the one JSONL line for `result` to `out`.
@@ -763,7 +779,7 @@ fn print_resource_stats(r: &crate::cgroup::ResourceStats) {
     }
 }
 
-fn format_bytes(b: u64) -> String {
+pub(crate) fn format_bytes(b: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = 1024 * KIB;
     const GIB: u64 = 1024 * MIB;
@@ -915,11 +931,13 @@ mod tests {
     fn result_in(context: &Path, name: &str) -> TestResult {
         TestResult {
             name: name.to_string(),
+            test: name.to_string(),
             outcome: Outcome::Timeout,
             duration: Duration::from_millis(1500),
             context: context.to_path_buf(),
             source_path: PathBuf::from("/repo/a b.test"),
             resources: None,
+            violations: Vec::new(),
         }
     }
 
@@ -1069,6 +1087,42 @@ mod tests {
         assert_eq!(parsed["stdout"], json!(""));
         assert_eq!(parsed["xtrace"], json!(""));
         assert_eq!(parsed["strace"], json!({}));
+        assert_eq!(parsed["violations"], json!([]));
+    }
+
+    #[test]
+    fn json_violations_name_the_condition_and_what_was_measured() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut result = result_in(tmp.path(), "test_slow");
+        result.outcome = Outcome::Fail;
+        result.violations = vec![crate::decorator::Violation {
+            line: 3,
+            span: 8..18,
+            condition: "cpu < 10ms".into(),
+            message: "cpu was 12.2ms".into(),
+            metric: crate::decorator::Metric::Cpu,
+            measured: 12_200,
+            broken: crate::decorator::Broken {
+                bound: crate::decorator::Bound {
+                    value: 10_000,
+                    inclusive: false,
+                    literal: crate::decorator::Literal {
+                        line: 3,
+                        span: 14..18,
+                        text: "10ms".into(),
+                    },
+                },
+                upper: true,
+            },
+        }];
+        let parsed = test_result_json(&result);
+        // A violation is a failure of the ordinary kind: the status is the
+        // documented `fail`, and the detail is in its own key.
+        assert_eq!(parsed["status"], json!("fail"));
+        assert_eq!(
+            parsed["violations"],
+            json!([{ "line": 3, "condition": "cpu < 10ms", "message": "cpu was 12.2ms" }])
+        );
     }
 
     #[test]
