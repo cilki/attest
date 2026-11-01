@@ -156,10 +156,6 @@ struct Cli {
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
     repeat: u64,
 
-    /// Disable overlayfs isolation; run each test directly in the working directory
-    #[arg(long)]
-    no_overlay: bool,
-
     /// Disable cgroup resource tracking
     #[arg(long)]
     no_cgroups: bool,
@@ -705,7 +701,6 @@ fn main() -> anyhow::Result<()> {
                 strace: cli.strace,
                 timeout: cli.timeout.map(std::time::Duration::from_secs_f64),
                 fuzz: cli.fuzz,
-                no_overlay: cli.no_overlay,
                 no_cgroups: cli.no_cgroups,
                 update_decorators: cli.update_decorators,
             };

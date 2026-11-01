@@ -253,9 +253,15 @@
   caller to uid 0 so the test sees itself as root in its namespace). A private
   UTS namespace keeps hostname changes inside the test.
   `probe_support` rehearses the full setup (same options, same `pivot_root`)
-  once per run in a throwaway child; if no mode works, the runner warns once
-  and runs without isolation, while a per-test setup failure after a successful
-  probe fails the run loudly rather than silently running unisolated. All
+  once per run in a throwaway child; if no mode works the run does not start
+  — there is no running a test outside an overlay — and the error
+  (`Unsupported`) names the `Stage` each mode tripped on and its errno, which
+  the probe child reports back over a pipe since the exit status has no room
+  for both. A per-test setup failure after a successful probe fails the run
+  loudly rather than silently running unisolated. The runner's unit tests
+  follow the same rule: `overlay_env`/`run_script` return `None` where no
+  overlay can be mounted and the test returns early, since there is nothing
+  else to run a test in. All
   mounts happen in the forked child's private mount namespace via `pre_exec`,
   so they are torn down automatically on exit and never pollute the host.
   The test's own context dir is bind-mounted back in **live** (the logs are
@@ -471,8 +477,6 @@ a bound's number when the run breaks it.
   `DIR/<test>/cwd/` (it is live-bound, not part of any overlay),
   `stdout.log`/`xtrace.log` to `DIR/<test>/`, and any `--strace` logs at
   `DIR/<test>/strace/CMD.log` for debugging
-- `--no-overlay` — disable overlayfs isolation; run each test directly in the
-  working directory (same as the automatic fallback when overlays are unavailable)
 - `--repeat N` — run each test N times (default: 1); combine with `--fuzz` to
   shake out flaky tests
 - `--fuzz [VALUE]` — randomly pause and resume each test's descendant processes

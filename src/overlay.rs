@@ -20,10 +20,12 @@
 //!
 //! [`probe_support`] rehearses the full production setup (same option strings,
 //! same pivot_root) once per run in a throwaway child; if neither mode works
-//! the caller falls back to running without isolation (with a warning). After
-//! a successful probe, a per-test setup failure aborts that test's spawn
-//! loudly ([`setup_root`] reports the failing step's errno through `pre_exec`)
-//! instead of silently running the test against the real filesystem.
+//! the run does not start — there is no running a test outside an overlay, so
+//! the error names the step each mode tripped on and the errno it got
+//! ([`Unsupported`]). After a successful probe, a per-test setup failure
+//! aborts that test's spawn loudly ([`setup_root`] reports the failing step's
+//! errno through `pre_exec`) instead of silently running the test against the
+//! real filesystem.
 //!
 //! Mounting overlayfs needs `CAP_SYS_ADMIN`. When attest already has it
 //! ([`Mode::Privileged`]) we just unshare a mount namespace. Otherwise we
@@ -470,25 +472,71 @@ impl RootOverlay {
 /// filesystem believing it is isolated.
 pub fn register_root_mount(cmd: &mut Command, plan: RootOverlay) {
     unsafe {
-        cmd.pre_exec(move || setup_root(&plan));
+        cmd.pre_exec(move || {
+            setup_root(&plan).map_err(|(_, errno)| std::io::Error::from_raw_os_error(errno))
+        });
+    }
+}
+
+/// The step of [`setup_root`] that failed. Only the probe gets to see it (the
+/// `pre_exec` pipe carries an errno and nothing else), and it is what turns
+/// "cannot isolate tests" into something the user can act on: `unshare`
+/// failing with `EPERM` is user namespaces being disabled, the root overlay
+/// failing with `EPERM` is overlayfs refusing an unprivileged mount.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Stage {
+    Namespace,
+    Privatize,
+    RootOverlay,
+    Submount,
+    ContextBind,
+    PivotRoot,
+    Chdir,
+}
+
+impl Stage {
+    const ALL: [Stage; 7] = [
+        Stage::Namespace,
+        Stage::Privatize,
+        Stage::RootOverlay,
+        Stage::Submount,
+        Stage::ContextBind,
+        Stage::PivotRoot,
+        Stage::Chdir,
+    ];
+
+    fn describe(self, mode: Mode) -> &'static str {
+        match (self, mode) {
+            (Stage::Namespace, Mode::Privileged) => "unshare(CLONE_NEWNS)",
+            (Stage::Namespace, Mode::Userns) => "unshare(CLONE_NEWUSER) or writing its id maps",
+            (Stage::Privatize, _) => "making / private",
+            (Stage::RootOverlay, _) => "mounting the overlay over /",
+            (Stage::Submount, _) => "mounting a submount's overlay",
+            (Stage::ContextBind, _) => "binding the context dir",
+            (Stage::PivotRoot, _) => "pivot_root",
+            (Stage::Chdir, _) => "entering the invocation dir",
+        }
     }
 }
 
 /// Construct the ephemeral root inside the forked child. Only async-signal-safe
 /// libc calls; all strings were built in the parent. Errors carry the failing
-/// step's errno — the only detail that survives the `pre_exec` pipe.
-unsafe fn setup_root(p: &RootOverlay) -> std::io::Result<()> {
-    fn fail() -> std::io::Result<()> {
-        Err(std::io::Error::last_os_error())
+/// step and its errno.
+unsafe fn setup_root(p: &RootOverlay) -> Result<(), (Stage, i32)> {
+    fn fail(stage: Stage) -> Result<(), (Stage, i32)> {
+        Err((stage, std::io::Error::last_os_error().raw_os_error().unwrap_or(0)))
     }
     unsafe {
         // Namespaces (mount ns; + user ns when unprivileged) and stop propagation.
-        if !enter_namespace(p.mode, &p.uid_map, &p.gid_map) || !privatize_mounts() {
-            return fail();
+        if !enter_namespace(p.mode, &p.uid_map, &p.gid_map) {
+            return fail(Stage::Namespace);
+        }
+        if !privatize_mounts() {
+            return fail(Stage::Privatize);
         }
         // Ephemeral overlay over the whole root.
         if !mount_overlay(&p.merged, &p.root_opts) {
-            return fail();
+            return fail(Stage::RootOverlay);
         }
         for step in &p.steps {
             match step {
@@ -497,7 +545,7 @@ unsafe fn setup_root(p: &RootOverlay) -> std::io::Result<()> {
                 MountStep::Overlay { opts, target } => {
                     libc::mkdir(target.as_ptr(), 0o755);
                     if !mount_overlay(target, opts) {
-                        return fail();
+                        return fail(Stage::Submount);
                     }
                 }
                 // Best-effort: a live bind that fails only limits what the test
@@ -541,14 +589,14 @@ unsafe fn setup_root(p: &RootOverlay) -> std::io::Result<()> {
             std::ptr::null(),
         ) != 0
         {
-            return fail();
+            return fail(Stage::ContextBind);
         }
         // Switch into the new root, then drop the old one.
         libc::mkdir(p.put_old.as_ptr(), 0o755);
         if libc::chdir(p.merged.as_ptr()) != 0
             || libc::syscall(libc::SYS_pivot_root, p.merged.as_ptr(), p.put_old.as_ptr()) != 0
         {
-            return fail();
+            return fail(Stage::PivotRoot);
         }
         libc::chdir(c"/".as_ptr());
         libc::umount2(c"/oldroot".as_ptr(), libc::MNT_DETACH);
@@ -556,51 +604,162 @@ unsafe fn setup_root(p: &RootOverlay) -> std::io::Result<()> {
         // Land in the (now ephemeral) invocation directory; the runner script
         // then cds into the per-test working directory.
         if libc::chdir(p.chdir_to.as_ptr()) != 0 {
-            return fail();
+            return fail(Stage::Chdir);
         }
     }
     Ok(())
 }
 
+/// Why one [`Mode`] could not build a root here.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ProbeFailure {
+    /// The plan could not be built in the parent (a context dir that could
+    /// not be created, say).
+    Plan(String),
+    /// A step of [`setup_root`] failed in the probe child.
+    Setup { stage: Stage, errno: i32 },
+    /// The child died without reporting — killed, or `fork` failed.
+    Lost,
+}
+
+/// No mode could build a root: one reason per mode tried, in the order they
+/// were tried.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Unsupported {
+    pub attempts: Vec<(Mode, ProbeFailure)>,
+}
+
+impl std::fmt::Display for Unsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "every test runs in an overlay of /, and none can be mounted here:")?;
+        for (mode, failure) in &self.attempts {
+            let name = match mode {
+                Mode::Privileged => "with CAP_SYS_ADMIN",
+                Mode::Userns => "in a user namespace",
+            };
+            write!(f, "\n  {name}: ")?;
+            match failure {
+                ProbeFailure::Plan(e) => write!(f, "{e}")?,
+                ProbeFailure::Setup { stage, errno } => write!(
+                    f,
+                    "{} failed: {}",
+                    stage.describe(*mode),
+                    std::io::Error::from_raw_os_error(*errno)
+                )?,
+                ProbeFailure::Lost => write!(f, "the probe died without reporting")?,
+            }
+        }
+        write!(
+            f,
+            "\n(run as root or with CAP_SYS_ADMIN, or enable unprivileged user namespaces; \
+             nested containers and sandboxes are the usual places this happens)"
+        )
+    }
+}
+
 /// Rehearse the full production setup (same option strings, same pivot_root)
 /// with `mode`, in a forked child so the caller's namespaces are never touched.
-fn probe_mode(scratch: &Path, mode: Mode, invocation_dir: &Path, submounts: &[Submount]) -> bool {
+///
+/// The child reports back over a pipe rather than through its exit status:
+/// the status has eight bits, and the reason has a stage and an errno.
+fn probe_mode(
+    scratch: &Path,
+    mode: Mode,
+    invocation_dir: &Path,
+    submounts: &[Submount],
+) -> Result<(), ProbeFailure> {
     let context = scratch.join(match mode {
         Mode::Privileged => ".attest-probe-priv",
         Mode::Userns => ".attest-probe-userns",
     });
     let _ = std::fs::remove_dir_all(&context);
-    let ok = match RootOverlay::build(mode, &context, invocation_dir, submounts) {
-        Ok(plan) => unsafe {
-            let pid = libc::fork();
-            if pid < 0 {
-                false
-            } else if pid == 0 {
-                libc::_exit(i32::from(setup_root(&plan).is_err()));
-            } else {
-                let mut status = 0;
-                libc::waitpid(pid, &mut status, 0);
-                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
-            }
-        },
-        Err(_) => false,
+    let outcome = match RootOverlay::build(mode, &context, invocation_dir, submounts) {
+        Ok(plan) => unsafe { run_probe(&plan) },
+        Err(e) => Err(ProbeFailure::Plan(e.to_string())),
     };
     let _ = std::fs::remove_dir_all(&context);
-    ok
+    outcome
 }
 
-/// Probe how (if at all) per-test roots can be built, with context dirs created
-/// under `scratch_parent` (the same filesystem that will host the real per-test
+/// Fork, run [`setup_root`] in the child, and read `(stage, errno)` — or
+/// nothing, on success — back out of a pipe.
+unsafe fn run_probe(plan: &RootOverlay) -> Result<(), ProbeFailure> {
+    unsafe {
+        let mut fds = [0 as libc::c_int; 2];
+        if libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+            return Err(ProbeFailure::Lost);
+        }
+        let [rd, wr] = fds;
+        let pid = libc::fork();
+        if pid < 0 {
+            libc::close(rd);
+            libc::close(wr);
+            return Err(ProbeFailure::Lost);
+        }
+        if pid == 0 {
+            libc::close(rd);
+            let code = match setup_root(plan) {
+                Ok(()) => 0,
+                Err((stage, errno)) => {
+                    // No allocation: the parent has threads, and one of them
+                    // may hold the allocator's lock at the moment of the fork.
+                    let stage = Stage::ALL.iter().position(|&s| s == stage).unwrap_or(0) as u32;
+                    let mut report = [0u8; 8];
+                    report[..4].copy_from_slice(&stage.to_ne_bytes());
+                    report[4..].copy_from_slice(&errno.to_ne_bytes());
+                    libc::write(wr, report.as_ptr().cast(), report.len());
+                    1
+                }
+            };
+            libc::_exit(code);
+        }
+        libc::close(wr);
+        let mut buf = [0u8; 8];
+        let mut got = 0usize;
+        while got < buf.len() {
+            let n = libc::read(rd, buf[got..].as_mut_ptr().cast(), buf.len() - got);
+            if n <= 0 {
+                break;
+            }
+            got += n as usize;
+        }
+        libc::close(rd);
+        let mut status = 0;
+        libc::waitpid(pid, &mut status, 0);
+        if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+            return Ok(());
+        }
+        if got == buf.len() {
+            let stage = u32::from_ne_bytes(buf[..4].try_into().unwrap()) as usize;
+            let errno = i32::from_ne_bytes(buf[4..].try_into().unwrap());
+            return Err(ProbeFailure::Setup {
+                stage: Stage::ALL[stage.min(Stage::ALL.len() - 1)],
+                errno,
+            });
+        }
+        Err(ProbeFailure::Lost)
+    }
+}
+
+/// Probe how per-test roots can be built, with context dirs created under
+/// `scratch_parent` (the same filesystem that will host the real per-test
 /// contexts). Performed once per run. Prefers the privileged mode so tests keep
-/// their real uid when attest has `CAP_SYS_ADMIN`.
+/// their real uid when attest has `CAP_SYS_ADMIN`. When neither mode works the
+/// error names what each one tripped on, since that is the whole of what the
+/// user has to go on.
 pub fn probe_support(
     scratch_parent: &Path,
     invocation_dir: &Path,
     submounts: &[Submount],
-) -> Option<Mode> {
-    [Mode::Privileged, Mode::Userns]
-        .into_iter()
-        .find(|&mode| probe_mode(scratch_parent, mode, invocation_dir, submounts))
+) -> Result<Mode, Unsupported> {
+    let mut attempts = Vec::new();
+    for mode in [Mode::Privileged, Mode::Userns] {
+        match probe_mode(scratch_parent, mode, invocation_dir, submounts) {
+            Ok(()) => return Ok(mode),
+            Err(failure) => attempts.push((mode, failure)),
+        }
+    }
+    Err(Unsupported { attempts })
 }
 
 /// Remove `path` when it is a symlink, so creating or copying something at that

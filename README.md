@@ -56,16 +56,16 @@ tests:
   runs in its own copy-on-write view of the filesystem: it sees the real
   project files, but writes to the root filesystem, the project tree, `/tmp`,
   and `/var/tmp` are discarded after the run. (Other mounts — `/proc`, `/dev`,
-  network mounts, etc. — stay shared with the host, so writes there persist.
-  `--no-overlay` disables isolation entirely.) Any processes still running
-  when a test ends are killed automatically.
+  network mounts, etc. — stay shared with the host, so writes there persist.)
+  Any processes still running when a test ends are killed automatically.
 
 Isolation is built out of overlayfs, which needs `CAP_SYS_ADMIN` — either
 directly, or through a user namespace, in which case the test also sees itself
 as `root` inside that namespace. attest rehearses the whole setup once per run
-and, where neither route works, falls back to running every test directly in
-the working directory just like `--no-overlay` does, so writes are no longer
-discarded. Nested containers and sandboxes are the usual places this happens.
+and, where neither route works, refuses to run at all rather than run the
+tests against your real files: the error says what each route tripped on.
+Nested containers and sandboxes are the usual places this happens — run as
+root, grant `CAP_SYS_ADMIN`, or enable unprivileged user namespaces.
 
 ### What attest actually runs
 
@@ -610,8 +610,6 @@ there isn't always the same thing:
 - `--strace CMD` — run CMD under strace, saving the log to the test's context
   dir. `CMD` is a command name or a path to one; tests that call it by its base
   name get the traced version
-- `--no-overlay` — skip filesystem isolation and run each test directly in the
-  working directory
 - `--no-cgroups` — don't track per-test CPU, memory and IO usage with cgroups
 - `--update-decorators` — rewrite the `#attest(...)` bounds the run broke
   instead of failing on them; `--add-decorators` — write a block above each
@@ -715,9 +713,11 @@ run `attest` in a container with this recipe:
 docker run --rm -v $(which attest):/bin/attest -v $(pwd):/tests <image name> attest /tests
 ```
 
-Containers usually can't mount overlayfs, so tests run this way tend to land on
-the unisolated fallback described above — writes to the mounted project tree
-reach your real files.
+The container has to be able to mount overlayfs (see above): a plain `docker
+run` usually can't, and attest refuses to run outside an overlay. Pass
+`--privileged` (or `--cap-add SYS_ADMIN --security-opt apparmor=unconfined`,
+and `--security-opt seccomp=unconfined` where the default profile blocks
+`mount`) so it can.
 
 ### Fuzz testing
 

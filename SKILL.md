@@ -32,9 +32,10 @@ methods. Do NOT use syntax from other test frameworks (no `assert_eq`, no
   other mounts (`/proc`, `/dev`, network mounts, …) reach the real system and
   persist
 - That view needs overlayfs support, which some environments (nested
-  containers, sandboxes) don't provide; attest then runs tests unisolated. Keep
-  scratch writes in `$PWD`, which is always a fresh directory, instead of
-  relying on writes elsewhere being thrown away
+  containers, sandboxes) don't provide; attest then refuses to run and says
+  why (run as root, with `CAP_SYS_ADMIN`, or with unprivileged user
+  namespaces enabled). Keep scratch writes in `$PWD`, which is always a fresh
+  directory, all the same
 - Any processes still running when a test ends (background servers, daemons,
   …) are killed automatically — never write `trap` cleanup for them
 

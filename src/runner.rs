@@ -469,8 +469,6 @@ pub struct RunConfig {
     /// Randomly SIGSTOP/SIGCONT individual descendant processes of each test to introduce
     /// timing non-determinism.
     pub fuzz: Option<f64>,
-    /// Disable overlayfs isolation; run each test directly in the working directory.
-    pub no_overlay: bool,
     pub no_cgroups: bool,
     /// A violated `#attest(...)` condition is recorded but does not fail the
     /// test: the run is there to find out what the bounds should be, and
@@ -480,10 +478,13 @@ pub struct RunConfig {
 
 /// Run-wide isolation state shared by every spawned test.
 struct RunEnv {
-    /// Directory attest was invoked from; each test starts here (inside its
-    /// ephemeral root when isolation is active).
+    /// Directory attest was invoked from; each test starts here, inside its
+    /// ephemeral root.
     invocation_dir: PathBuf,
-    overlay_mode: Option<overlay::Mode>,
+    /// How this run mounts its overlays — settled by the probe before the
+    /// first test is spawned. There is no running without one: a test that
+    /// cannot be isolated is not run at all.
+    overlay_mode: overlay::Mode,
     /// How each mount under `/` is re-established inside per-test roots.
     submounts: Vec<overlay::Submount>,
 }
@@ -542,20 +543,18 @@ pub fn run_all_tests<'a>(tests: Vec<TestSpec<'a>>, config: &RunConfig) -> Result
     // and writes land in per-test upper layers. The submount plan (which mounts
     // get their own ephemeral overlay, which are rebound live) is computed once
     // and shared across tests; the probe rehearses the full setup with it.
+    // Where no mode works the run ends here: a test is promised that its
+    // writes are discarded, and running it anyway would break that promise
+    // against whatever the user's filesystem holds.
     let invocation_dir = std::env::current_dir()?;
     let submounts = overlay::compute_submounts(&invocation_dir);
-    let overlay_mode = if config.no_overlay {
-        None
-    } else {
-        overlay::probe_support(tmp.path(), &invocation_dir, &submounts)
-    };
+    let overlay_mode = overlay::probe_support(tmp.path(), &invocation_dir, &submounts)
+        .map_err(|e| anyhow!("cannot isolate tests: {e}"))?;
     match overlay_mode {
-        None if config.no_overlay => debug!("overlay isolation disabled via --no-overlay"),
-        None => warn!("overlayfs unavailable; tests run without filesystem isolation"),
-        Some(overlay::Mode::Userns) => {
+        overlay::Mode::Userns => {
             debug!("using unprivileged overlay; tests run as root inside their namespace")
         }
-        Some(overlay::Mode::Privileged) => debug!("using privileged overlay isolation"),
+        overlay::Mode::Privileged => debug!("using privileged overlay isolation"),
     }
     let env = RunEnv {
         invocation_dir,
@@ -823,21 +822,18 @@ fn spawn_test<'a>(
     std::fs::create_dir_all(&context)?;
 
     // Fresh, empty working directory for the test. It lives in the context dir
-    // (live-bound inside isolated roots), so it works with and without overlay
-    // isolation and is picked up by --save-context.
+    // (live-bound inside the ephemeral root), so it is picked up by
+    // --save-context without being part of any delta.
     std::fs::create_dir_all(cwd_dir(&context))?;
 
-    // When overlay isolation is available, plan the per-test ephemeral root
-    // (this also creates the overlay dirs under the context dir).
-    let root_plan = match env.overlay_mode {
-        Some(mode) => Some(overlay::RootOverlay::build(
-            mode,
-            &context,
-            &env.invocation_dir,
-            &env.submounts,
-        )?),
-        None => None,
-    };
+    // Plan the per-test ephemeral root (this also creates the overlay dirs
+    // under the context dir).
+    let root_plan = overlay::RootOverlay::build(
+        env.overlay_mode,
+        &context,
+        &env.invocation_dir,
+        &env.submounts,
+    )?;
 
     // The test's output goes to log files in its context dir, opened here and
     // handed to the child as its stdout and stderr instead of being redirected
@@ -942,10 +938,7 @@ fn spawn_test<'a>(
 
     // Registered after the cgroup hook so cgroup placement happens in the host
     // namespace before we unshare into a private mount namespace.
-    let isolated = root_plan.is_some();
-    if let Some(plan) = root_plan {
-        overlay::register_root_mount(&mut cmd, plan);
-    }
+    overlay::register_root_mount(&mut cmd, root_plan);
 
     let start = Instant::now();
     let child = cmd.spawn().map_err(|e| {
@@ -960,10 +953,11 @@ fn spawn_test<'a>(
                  more than one argument can hold)",
                 runner_content.len()
             )
-        } else if isolated {
-            " (isolation was active for this test; --no-overlay disables it)".to_string()
         } else {
-            String::new()
+            // The probe passed, so this is a per-test setup failure: the
+            // errno is all that survives `pre_exec`, and it belongs to one of
+            // the mounts the ephemeral root is built from.
+            " (while building the test's ephemeral root)".to_string()
         };
         anyhow!("spawn failed for {display_name}: {e}{note}")
     })?;
@@ -1139,9 +1133,9 @@ fn save_test_context(result: &TestResult, save_dir: &Path, submounts: &[overlay:
         );
         return;
     };
-    // Created up front rather than as a side effect of the first copy: a run
-    // without overlay isolation has no delta to copy at all, and the logs
-    // below still have to land somewhere.
+    // Created up front rather than as a side effect of the first copy: a test
+    // that wrote nothing has no delta to copy at all, and the logs below
+    // still have to land somewhere.
     if let Err(e) = std::fs::create_dir_all(&dst) {
         warn!("failed to save context for {}: {e}", result.name);
         return;
@@ -1491,13 +1485,34 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    /// A RunEnv with isolation disabled, for direct spawn_test tests.
-    fn no_overlay_env(invocation_dir: &Path) -> RunEnv {
-        RunEnv {
+    /// How overlays can be mounted where the tests are running, probed once
+    /// per process — or `None` where they cannot be at all, in which case a
+    /// test that spawns anything returns early: a test is only ever run in an
+    /// overlay, so there is nothing else to run it in.
+    fn overlay_mode() -> Option<overlay::Mode> {
+        static MODE: std::sync::OnceLock<Option<overlay::Mode>> = std::sync::OnceLock::new();
+        *MODE.get_or_init(|| {
+            let scratch = TempDir::new().unwrap();
+            let here = std::env::current_dir().unwrap();
+            let submounts = overlay::compute_submounts(&here);
+            match overlay::probe_support(scratch.path(), &here, &submounts) {
+                Ok(mode) => Some(mode),
+                Err(e) => {
+                    eprintln!("skipping: {e}");
+                    None
+                }
+            }
+        })
+    }
+
+    /// A RunEnv with real isolation, invoked from `invocation_dir`, or `None`
+    /// where this environment cannot mount overlays (see [`overlay_mode`]).
+    fn overlay_env(invocation_dir: &Path) -> Option<RunEnv> {
+        Some(RunEnv {
             invocation_dir: invocation_dir.to_path_buf(),
-            overlay_mode: None,
-            submounts: Vec::new(),
-        }
+            overlay_mode: overlay_mode()?,
+            submounts: overlay::compute_submounts(invocation_dir),
+        })
     }
 
     /// Write `script` to `dir/t.sh` and parse it. The result carries the path it
@@ -1552,29 +1567,30 @@ mod tests {
         }
     }
 
-    /// Spawn `test_name` out of `script` (written under `srcdir`) and block
-    /// until it finishes.
+    /// Spawn `test_name` out of `script` (written under `srcdir`, which is
+    /// also the invocation dir) in its own ephemeral root and block until it
+    /// finishes. `None` where no overlay can be mounted.
     fn run_script(
         srcdir: &Path,
         script: &str,
         test_name: &str,
         config: &RunConfig,
-        env: &RunEnv,
-    ) -> Finished {
+    ) -> Option<Finished> {
+        let env = overlay_env(srcdir)?;
         let tf = parse_script(srcdir, script);
         let ctx = private_temp_dir().unwrap();
         let mut pending = spawn_test(
             &spec(&tf, test_name, test_name),
             ctx.path().to_path_buf(),
             config,
-            env,
+            &env,
         )
         .unwrap();
         let status = reap_blocking(&mut pending);
-        Finished {
+        Some(Finished {
             result: build_result(pending, status, config),
             _context: ctx,
-        }
+        })
     }
 
     /// `run_all_tests` input running every test in `tf` under its own name.
@@ -1598,16 +1614,11 @@ mod tests {
         }
     }
 
-    /// Run `test_name` from `script` without isolation or extra configuration.
-    fn run_inline(script: &str, test_name: &str) -> Finished {
+    /// Run `test_name` from `script` with no extra configuration. `None`
+    /// where no overlay can be mounted.
+    fn run_inline(script: &str, test_name: &str) -> Option<Finished> {
         let tmp = TempDir::new().unwrap();
-        run_script(
-            tmp.path(),
-            script,
-            test_name,
-            &RunConfig::default(),
-            &no_overlay_env(tmp.path()),
-        )
+        run_script(tmp.path(), script, test_name, &RunConfig::default())
     }
 
     /// `wall` needs no cgroup, so it is the decorator a unit test can count
@@ -1615,7 +1626,9 @@ mod tests {
     #[test]
     fn a_decorator_the_run_breaks_fails_the_test() {
         let script = "#attest(wall < 1us)\ntest_x() {\n  true\n}\n";
-        let r = run_inline(script, "test_x");
+        let Some(r) = run_inline(script, "test_x") else {
+            return;
+        };
         assert_eq!(r.outcome, Outcome::Fail);
         assert_eq!(r.violations.len(), 1, "{:?}", r.violations);
         let v = &r.violations[0];
@@ -1629,7 +1642,9 @@ mod tests {
     #[test]
     fn a_decorator_the_run_meets_leaves_the_test_passing() {
         let script = "# attest(\n#   wall < 60s,\n# )\ntest_x() {\n  true\n}\n";
-        let r = run_inline(script, "test_x");
+        let Some(r) = run_inline(script, "test_x") else {
+            return;
+        };
         assert_eq!(r.outcome, Outcome::Pass);
         assert!(r.violations.is_empty());
     }
@@ -1642,13 +1657,9 @@ mod tests {
             update_decorators: true,
             ..Default::default()
         };
-        let r = run_script(
-            tmp.path(),
-            script,
-            "test_x",
-            &config,
-            &no_overlay_env(tmp.path()),
-        );
+        let Some(r) = run_script(tmp.path(), script, "test_x", &config) else {
+            return;
+        };
         assert_eq!(r.outcome, Outcome::Pass);
         assert_eq!(r.violations.len(), 1);
         assert_eq!(r.test, "test_x");
@@ -1664,7 +1675,9 @@ mod tests {
         // only verdict is the command's — and the report stays the command's
         // too.
         let script = "#attest(wall < 1us)\ntest_x() {\n  false\n}\n";
-        let r = run_inline(script, "test_x");
+        let Some(r) = run_inline(script, "test_x") else {
+            return;
+        };
         assert_eq!(r.outcome, Outcome::Fail);
         assert!(r.violations.is_empty());
         assert!(!r.commands_succeeded());
@@ -1727,6 +1740,9 @@ mod tests {
     /// `--save-context` write outside the directory it was given.
     #[test]
     fn traversing_test_name_cannot_escape_the_save_dir() {
+        if overlay_mode().is_none() {
+            return;
+        }
         let tmp = TempDir::new().unwrap();
         let tf = parse_script(tmp.path(), "test_escape() {\n  echo hi > marker\n}\n");
 
@@ -1821,7 +1837,7 @@ mod tests {
     fn a_test_does_not_inherit_the_runs_blocked_sigchld() {
         let _waiter = ChildWaiter::new();
         assert!(sigchld_blocked(), "SIGCHLD was not blocked for the run");
-        let result = run_inline(
+        let Some(result) = run_inline(
             r#"test_mask() {
   blocked=
   while read -r key value rest; do
@@ -1831,7 +1847,9 @@ mod tests {
 }
 "#,
             "test_mask",
-        );
+        ) else {
+            return;
+        };
         assert!(
             result.outcome.passed(),
             "the test ran with a signal blocked"
@@ -1839,14 +1857,24 @@ mod tests {
     }
 
     /// A stand-in shell under `dir`, named so that discovery recognizes it,
-    /// which records that it was the one exec'd and then exits successfully.
-    /// Returns `(the shell, its marker file)`.
-    fn shell_shim(dir: &Path) -> (PathBuf, PathBuf) {
+    /// which announces on stdout that it was the one exec'd (`<dir name>
+    /// ran`) and then exits successfully. Said rather than written to a
+    /// marker file: the test runs in an ephemeral root, where a file the
+    /// shim wrote would be discarded with the rest of the delta, while its
+    /// stdout lands in the context's live-bound `stdout.log`.
+    fn shell_shim(dir: &Path) -> PathBuf {
         fs::create_dir_all(dir).unwrap();
-        let (shell, marker) = (dir.join("bash"), dir.join("ran"));
-        fs::write(&shell, format!("#!/bin/sh\n: > {}\n", sh_quote(&marker))).unwrap();
+        let shell = dir.join("bash");
+        fs::write(
+            &shell,
+            format!(
+                "#!/bin/sh\necho {} ran\n",
+                dir.file_name().unwrap().to_str().unwrap()
+            ),
+        )
+        .unwrap();
         fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
-        (shell, marker)
+        shell
     }
 
     /// A script defining `test_x` and asking to be run under `shell`.
@@ -1865,8 +1893,11 @@ mod tests {
     #[test]
     fn a_spawn_execs_the_shell_its_file_was_parsed_with() {
         let tmp = TempDir::new().unwrap();
-        let (parsed, parsed_ran) = shell_shim(&tmp.path().join("parsed"));
-        let (edited, edited_ran) = shell_shim(&tmp.path().join("edited"));
+        let Some(env) = overlay_env(tmp.path()) else {
+            return;
+        };
+        let parsed = shell_shim(&tmp.path().join("parsed"));
+        let edited = shell_shim(&tmp.path().join("edited"));
 
         let tf = parse_script(tmp.path(), &script_with_shebang(&parsed));
         assert_eq!(Path::new(&tf.shell), parsed);
@@ -1879,13 +1910,16 @@ mod tests {
             &spec(&tf, "test_x", "test_x"),
             ctx.path().to_path_buf(),
             &RunConfig::default(),
-            &no_overlay_env(tmp.path()),
+            &env,
         )
         .unwrap();
         assert!(reap_blocking(&mut pending).success());
 
-        assert!(parsed_ran.exists(), "the parsed shell did not run the test");
-        assert!(!edited_ran.exists(), "the spawn re-read the file's shebang");
+        let stdout = fs::read_to_string(ctx.path().join("stdout.log")).unwrap();
+        assert_eq!(
+            stdout, "parsed ran\n",
+            "the spawn did not exec the shell the file was parsed with"
+        );
     }
 
     /// A stand-in for the shell issue #93 is about: one with no `.`, no
@@ -1920,17 +1954,17 @@ mod tests {
     fn a_shell_without_a_dot_command_still_runs_its_tests() {
         let tmp = TempDir::new().unwrap();
         let shebang = format!("#!{}\n", no_dot_shell(tmp.path()).display());
-        let env = no_overlay_env(tmp.path());
 
-        let r = run_script(
+        let Some(r) = run_script(
             tmp.path(),
             &format!(
                 "{shebang}helper() {{\n  echo 42\n}}\ntest_x() {{\n  [ \"$(helper)\" = 42 ]\n}}\n"
             ),
             "test_x",
             &RunConfig::default(),
-            &env,
-        );
+        ) else {
+            return;
+        };
         assert!(
             r.outcome.passed(),
             "a shell without `.` could not run the test: {}",
@@ -1944,8 +1978,8 @@ mod tests {
             &format!("{shebang}test_dot() {{\n  . /dev/null\n}}\n"),
             "test_dot",
             &RunConfig::default(),
-            &env,
-        );
+        )
+        .unwrap();
         assert!(
             !sourcing.outcome.passed(),
             "the stand-in shell still has a `.` command"
@@ -1969,15 +2003,15 @@ mod tests {
         let shell = tmp.path().join("bash");
         fs::write(&shell, "#!/bin/sh\necho 'bad syntax' >&2\nexit 2\n").unwrap();
         fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let env = no_overlay_env(tmp.path());
 
-        let r = run_script(
+        let Some(r) = run_script(
             tmp.path(),
             &format!("#!{}\ntest_x() {{\n  :\n}}\n", shell.display()),
             "test_x",
             &RunConfig::default(),
-            &env,
-        );
+        ) else {
+            return;
+        };
         assert!(!r.outcome.passed(), "the shell exited 2");
         assert_eq!(
             fs::read_to_string(r.context.join("xtrace.log")).unwrap(),
@@ -2017,7 +2051,9 @@ mod tests {
 
     #[test]
     fn execute_passing_test() {
-        let r = run_inline("test_pass() {\n  true\n}\n", "test_pass");
+        let Some(r) = run_inline("test_pass() {\n  true\n}\n", "test_pass") else {
+            return;
+        };
         assert_eq!(r.outcome, Outcome::Pass);
     }
 
@@ -2025,35 +2061,43 @@ mod tests {
     fn execute_failing_test() {
         // A command that exits nonzero fails the test, and does so as a
         // failure rather than as a timeout.
-        let r = run_inline("test_fail() {\n  false\n}\n", "test_fail");
+        let Some(r) = run_inline("test_fail() {\n  false\n}\n", "test_fail") else {
+            return;
+        };
         assert_eq!(r.outcome, Outcome::Fail);
     }
 
     #[test]
     fn execute_test_with_helper() {
-        let r = run_inline(
+        let Some(r) = run_inline(
             "get_value() {\n  echo 42\n}\ntest_helper() {\n  val=$(get_value)\n  test \"$val\" = \"42\"\n}\n",
             "test_helper",
-        );
+        ) else {
+            return;
+        };
         assert_eq!(r.outcome, Outcome::Pass);
     }
 
     #[test]
     fn test_starts_in_clean_cwd() {
-        let r = run_inline(
+        let Some(r) = run_inline(
             "test_cwd() {\n  test -z \"$(ls -A .)\"\n  echo data > f.txt\n}\n",
             "test_cwd",
-        );
+        ) else {
+            return;
+        };
         assert!(r.outcome.passed());
         assert!(cwd_dir(&r.context).join("f.txt").exists());
     }
 
     #[test]
     fn background_process_killed_after_normal_exit() {
-        let r = run_inline(
+        let Some(r) = run_inline(
             "test_bg() {\n  sleep 300 &\n  echo $! > pid\n}\n",
             "test_bg",
-        );
+        ) else {
+            return;
+        };
         assert!(r.outcome.passed());
         let pid: u32 = fs::read_to_string(cwd_dir(&r.context).join("pid"))
             .unwrap()
@@ -2099,6 +2143,9 @@ mod tests {
         // hands back an exit status, the straggler is already gone. Reaping
         // first leaves it running until the context is dropped.
         let tmp = TempDir::new().unwrap();
+        let Some(env) = overlay_env(tmp.path()) else {
+            return;
+        };
         let tf = parse_script(
             tmp.path(),
             "test_bg() {\n  sleep 300 &\n  echo $! > pid\n}\n",
@@ -2109,7 +2156,7 @@ mod tests {
             &spec(&tf, "test_bg", "test_bg"),
             ctx.path().to_path_buf(),
             &config,
-            &no_overlay_env(tmp.path()),
+            &env,
         )
         .unwrap();
 
@@ -2133,7 +2180,9 @@ mod tests {
 
     #[test]
     fn execute_test_stdout_captured() {
-        let r = run_inline("test_echo() {\n  echo captured_output\n}\n", "test_echo");
+        let Some(r) = run_inline("test_echo() {\n  echo captured_output\n}\n", "test_echo") else {
+            return;
+        };
         let stdout = fs::read_to_string(r.context.join("stdout.log")).unwrap();
         assert!(stdout.contains("captured_output"));
     }
@@ -2149,13 +2198,14 @@ mod tests {
             }],
             ..RunConfig::default()
         };
-        let result = run_script(
+        let Some(result) = run_script(
             tmp.path(),
             "test_override() {\n  true\n}\n",
             "test_override",
             &config,
-            &no_overlay_env(tmp.path()),
-        );
+        ) else {
+            return;
+        };
         assert!(result.outcome.passed());
         // bin/true should exist in the context dir
         assert!(result.context.join("bin/true").exists());
@@ -2175,49 +2225,24 @@ mod tests {
             bin_dirs: vec![bin.path().to_path_buf()],
             ..RunConfig::default()
         };
-        let result = run_script(
+        let Some(result) = run_script(
             tmp.path(),
             "test_bin_dir() {\n  out=$(mytool)\n  test \"$out\" = \"mytool_ran\"\n}\n",
             "test_bin_dir",
             &config,
-            &no_overlay_env(tmp.path()),
-        );
+        ) else {
+            return;
+        };
         assert!(result.outcome.passed());
         // The tool is referenced in place, not copied into the context bin/.
         assert!(!result.context.join("bin/mytool").exists());
-    }
-
-    /// A RunEnv with real isolation, or `None` when this environment cannot
-    /// mount overlays (the test should then be skipped).
-    fn overlay_env(scratch: &Path, invocation_dir: &Path) -> Option<RunEnv> {
-        let submounts = overlay::compute_submounts(invocation_dir);
-        let mode = overlay::probe_support(scratch, invocation_dir, &submounts)?;
-        Some(RunEnv {
-            invocation_dir: invocation_dir.to_path_buf(),
-            overlay_mode: Some(mode),
-            submounts,
-        })
-    }
-
-    /// Run one test function with full isolation; skip (None) when unsupported.
-    fn run_isolated(script: &str, test_name: &str) -> Option<Finished> {
-        let tmp = TempDir::new().unwrap();
-        let srcdir = TempDir::new().unwrap();
-        let env = overlay_env(tmp.path(), srcdir.path())?;
-        Some(run_script(
-            srcdir.path(),
-            script,
-            test_name,
-            &RunConfig::default(),
-            &env,
-        ))
     }
 
     #[test]
     fn overlay_isolates_root_writes() {
         // The test sees the real root (reads /usr) but its write to a system path
         // must land in the ephemeral upper layer, not on the host filesystem.
-        let Some(result) = run_isolated(
+        let Some(result) = run_inline(
             "test_o() {\n  test -d /usr\n  echo made > /attest_root_marker.txt\n}\n",
             "test_o",
         ) else {
@@ -2239,7 +2264,7 @@ mod tests {
         // own ephemeral overlay (when /tmp is a separate mount).
         let marker = "attest_unit_tmp_marker";
         let _ = fs::remove_file(Path::new("/tmp").join(marker));
-        let Some(result) = run_isolated(
+        let Some(result) = run_inline(
             &format!("test_t() {{\n  echo made > /tmp/{marker}\n}}\n"),
             "test_t",
         ) else {
@@ -2591,6 +2616,9 @@ mod tests {
 
     #[test]
     fn run_all_tests_serial() {
+        if overlay_mode().is_none() {
+            return;
+        }
         let tmp = TempDir::new().unwrap();
         let tf = parse_script(tmp.path(), "test_a() {\n  true\n}\ntest_b() {\n  true\n}\n");
         let config = RunConfig {
@@ -2605,6 +2633,9 @@ mod tests {
 
     #[test]
     fn bail_stops_after_first_failure() {
+        if overlay_mode().is_none() {
+            return;
+        }
         let tmp = TempDir::new().unwrap();
         // test_fail comes first alphabetically, test_pass second
         let tf = parse_script(
@@ -2625,6 +2656,9 @@ mod tests {
 
     #[test]
     fn run_all_tests_parallel() {
+        if overlay_mode().is_none() {
+            return;
+        }
         let tmp = TempDir::new().unwrap();
         let tf = parse_script(
             tmp.path(),
@@ -2643,6 +2677,9 @@ mod tests {
 
     #[test]
     fn timeout_kills_slow_test() {
+        if overlay_mode().is_none() {
+            return;
+        }
         let tmp = TempDir::new().unwrap();
         let tf = parse_script(tmp.path(), "test_slow() {\n  sleep 60\n}\n");
         let config = RunConfig {
@@ -2826,7 +2863,9 @@ mod tests {
         // definitions at the head of the runner script, at the line numbers
         // they have in the file, the xtrace PS4 must report `+7:`.
         let source = "helper() {\n  echo setup\n}\n\ntest_foo() {\n  echo a\n  false\n}\n";
-        let r = run_inline(source, "test_foo");
+        let Some(r) = run_inline(source, "test_foo") else {
+            return;
+        };
         assert!(!r.outcome.passed());
 
         let xtrace = fs::read_to_string(r.context.join("xtrace.log")).unwrap();
