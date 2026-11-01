@@ -422,10 +422,7 @@ impl StatusDisplay {
             let bar = ProgressBar::new(total as u64);
             bar.set_style(
                 ProgressStyle::default_bar()
-                    .template(&format!(
-                        "{}Testing{} {{pos}}/{{len}} {{msg}}",
-                        palette.heading, palette.reset
-                    ))
+                    .template("{pos}/{len} {msg}")
                     .unwrap(),
             );
             bar.enable_steady_tick(Duration::from_millis(250));

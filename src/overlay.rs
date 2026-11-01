@@ -1539,11 +1539,20 @@ mod tests {
         // inside the ephemeral root. Copied out verbatim it would be a
         // set-user-ID binary in the user's tree, owned by whoever ran attest.
         std::fs::write(src.path().join("suid"), "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(
+        // Some sandboxes (Nix's build sandbox, hardened container runtimes)
+        // refuse a chmod to a set-user-ID/set-group-ID mode outright with
+        // `EPERM`. There is no setid file to copy out there, so nothing for
+        // this test to check.
+        match std::fs::set_permissions(
             src.path().join("suid"),
             std::fs::Permissions::from_mode(0o6755),
-        )
-        .unwrap();
+        ) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping: setid modes are refused here: {e}");
+                return;
+            }
+            r => r.unwrap(),
+        }
         std::fs::create_dir(src.path().join("sub")).unwrap();
         std::fs::write(src.path().join("sub/plain"), "data").unwrap();
         std::fs::set_permissions(
