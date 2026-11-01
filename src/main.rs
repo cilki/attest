@@ -7,6 +7,8 @@ mod output;
 mod overlay;
 mod parser;
 mod runner;
+mod seccomp;
+mod spawn;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};

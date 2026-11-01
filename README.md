@@ -177,6 +177,48 @@ Conditions are only checked for a test whose commands all succeeded. A test
 that failed on its own, or was killed by `--timeout`, is reported for that —
 the numbers belong to a run that never reached its end.
 
+#### Syscalls and writes
+
+Two more conditions assert on *what* the run did rather than how much:
+
+```sh
+# attest(syscalls not in {socket, connect}, writes in {/tmp, ./build})
+testOffline() {
+	echo hello | md5sum
+}
+```
+
+`syscalls not in {…}` fails the test if any process in its tree made one of
+the named system calls; `syscalls in {…}` fails it if any process made one
+*not* named. The names are those of this machine's architecture (`socket`,
+`connect`, `execve`, …), and a name that isn't one is a parse error. The
+report says what was made — `made socket, connect` — and `--json` carries the
+full count of every watched syscall under `syscalls`. Nothing is blocked:
+the test runs exactly as it would have, and is judged afterwards.
+
+The watching is done with seccomp user notification, which needs Linux 5.5;
+on an older kernel these conditions go unchecked, with a warning like an
+unmeasured `cpu`. Only the syscalls a condition names (or, for an allow-list,
+everything it doesn't) cost anything — each one is a round trip through
+attest — and a test with no `syscalls` condition is not watched at all. The
+shell's own startup is in the count, the way its CPU time is: an allow-list
+has to admit `execve`, `brk`, `mmap` and the rest of what bash does before
+your first command, which makes `not in` the practical form.
+
+`writes in {…}` fails the test if it created, modified or deleted anything
+outside the paths listed. Each path is absolute, or starts with `./` to mean
+"under the directory attest was invoked from" (`./build`). The check reads
+the test's filesystem delta after the run — the same thing `--save-context`
+copies out — so it costs nothing while the test runs, and sees exactly what
+isolation discards: writes to the root filesystem, the project tree, `/tmp`
+and `/var/tmp`. The test's own working directory is never in the delta, and
+neither are the mounts that stay live (`/proc`, `/dev`, `/sys`). A directory
+the test created counts as one write, whatever it put inside; the report
+names each offending path, `wrote /etc/motd (+3 more)` with the full list
+beneath the snippet.
+
+`hosts in {…}` parses but is not enforced yet, and is rejected as such.
+
 A decorator that isn't directly above a test function (a blank line between
 the two, or a helper underneath it), a condition that doesn't parse, or a
 `#attest(` whose continuation lines lack their `#` (the shell would read them
@@ -206,7 +248,9 @@ one alone, even if it bounds only some of them. `--update-decorators` turns a
 violated condition from a failure into an edit: the test passes, and the one
 number that was wrong is replaced in place, so `cpu < 10ms, pids <= 3` with
 `cpu` measured at 12.2ms becomes `cpu < 16ms, pids <= 3`. Bounds that held
-are never touched, and neither is anything but the number.
+are never touched, and neither is anything but the number. A `syscalls` or
+`writes` condition has no number: which calls or paths a test may use is a
+decision, so a violated one is reported with a warning and left as written.
 
 A new bound is the measurement plus headroom — ×1.25 for an upper bound,
 ×0.8 for a lower one, rounded outwards to two significant figures — so the
@@ -687,6 +731,9 @@ Every object carries the same keys:
   command's base name (`--strace /usr/bin/curl` appears as `curl`); `{}`
   without `--strace`
 - `resources` — cgroup usage, or `null` when it isn't available
+- `syscalls` — for a test with a `syscalls` condition, an object counting
+  each watched system call the test's tree made (`{"socket": 1, "connect":
+  1}`, by name); `null` when nothing was watched
 - `violations` — the test's [decorator](#decorators) conditions that didn't
   hold; `[]` when every one held or none was written
 
@@ -697,7 +744,9 @@ described below, in microseconds and bytes.
 
 Each entry of `violations` is an object with `line` (the 1-based line of the
 condition in the file), `condition` (its text as written, `cpu < 10ms`) and
-`message` (what was measured instead, `cpu was 12.2ms`). A test with any is
+`message` (what was measured instead, `cpu was 12.2ms`). A `syscalls` or
+`writes` violation also carries `offenders`, the full list of what the
+message names only the first few of. A test with any is
 `fail`: a decorator failure is a failure of the ordinary kind — except under
 `--update-decorators`, where it is `pass` and the entry says what was
 rewritten. The list of edits then goes to stderr, so stdout stays JSONL.

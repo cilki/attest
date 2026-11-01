@@ -123,6 +123,17 @@ pub fn print_violations(result: &TestResult, file: &TestFile) {
                 out_palette().is_colored(),
             )
         );
+        // A set violation's label spells its first few offenders; the rest
+        // follow the snippet, one per line, so a test that wrote to twenty
+        // places is told all twenty.
+        if let crate::decorator::Detail::Set { offenders } = &violation.detail
+            && offenders.len() > crate::decorator::SHOWN_OFFENDERS
+        {
+            for offender in offenders {
+                outln!("  {offender}");
+            }
+            outln!("");
+        }
     }
 }
 

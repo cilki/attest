@@ -688,9 +688,24 @@ impl serde::Serialize for TestResultJson<'_> {
         map.serialize_entry("xtrace", &LogField(result.context.join("xtrace.log")))?;
         map.serialize_entry("strace", &strace_logs(&result.context))?;
         map.serialize_entry("resources", &resource_stats_json(result.resources.as_ref()))?;
+        map.serialize_entry("syscalls", &syscalls_json(result.syscalls.as_ref()))?;
         map.serialize_entry("violations", &violations_json(&result.violations))?;
         map.end()
     }
+}
+
+/// What the seccomp listener heard, as `{"<syscall>": <count>}` — only the
+/// syscalls the test's conditions had the run watching for — or `null` for a
+/// test that was not watched.
+fn syscalls_json(log: Option<&crate::decorator::SyscallLog>) -> Value {
+    let Some(log) = log else {
+        return Value::Null;
+    };
+    log.counts
+        .iter()
+        .map(|(nr, count)| (nr.name().to_owned(), Value::from(*count)))
+        .collect::<serde_json::Map<String, Value>>()
+        .into()
 }
 
 /// The `#attest(...)` conditions a test failed, as `--json` reports them:
@@ -699,11 +714,15 @@ fn violations_json(violations: &[crate::decorator::Violation]) -> Value {
     violations
         .iter()
         .map(|v| {
-            serde_json::json!({
+            let mut entry = serde_json::json!({
                 "line": v.line,
                 "condition": v.condition,
                 "message": v.message,
-            })
+            });
+            if let crate::decorator::Detail::Set { offenders } = &v.detail {
+                entry["offenders"] = offenders.iter().map(|o| Value::from(o.as_str())).collect();
+            }
+            entry
         })
         .collect()
 }
@@ -937,6 +956,7 @@ mod tests {
             context: context.to_path_buf(),
             source_path: PathBuf::from("/repo/a b.test"),
             resources: None,
+            syscalls: None,
             violations: Vec::new(),
         }
     }
@@ -1076,6 +1096,7 @@ mod tests {
             json!({ "curl": "execve(\"/bin/curl\")\n" })
         );
         assert_eq!(parsed["resources"], Value::Null);
+        assert_eq!(parsed["syscalls"], Value::Null);
     }
 
     #[test]
@@ -1100,19 +1121,21 @@ mod tests {
             span: 8..18,
             condition: "cpu < 10ms".into(),
             message: "cpu was 12.2ms".into(),
-            metric: crate::decorator::Metric::Cpu,
-            measured: 12_200,
-            broken: crate::decorator::Broken {
-                bound: crate::decorator::Bound {
-                    value: 10_000,
-                    inclusive: false,
-                    literal: crate::decorator::Literal {
-                        line: 3,
-                        span: 14..18,
-                        text: "10ms".into(),
+            detail: crate::decorator::Detail::Quantity {
+                metric: crate::decorator::Metric::Cpu,
+                measured: 12_200,
+                broken: crate::decorator::Broken {
+                    bound: crate::decorator::Bound {
+                        value: 10_000,
+                        inclusive: false,
+                        literal: crate::decorator::Literal {
+                            line: 3,
+                            span: 14..18,
+                            text: "10ms".into(),
+                        },
                     },
+                    upper: true,
                 },
-                upper: true,
             },
         }];
         let parsed = test_result_json(&result);
@@ -1123,6 +1146,28 @@ mod tests {
             parsed["violations"],
             json!([{ "line": 3, "condition": "cpu < 10ms", "message": "cpu was 12.2ms" }])
         );
+
+        // A set condition's message spells only the first few offenders;
+        // the entry carries them all.
+        result.violations = vec![crate::decorator::Violation {
+            line: 4,
+            span: 8..40,
+            condition: "syscalls not in {socket}".into(),
+            message: "made socket".into(),
+            detail: crate::decorator::Detail::Set {
+                offenders: vec!["socket".into()],
+            },
+        }];
+        let mut log = crate::decorator::SyscallLog::default();
+        log.record(crate::decorator::Sysno::socket);
+        log.record(crate::decorator::Sysno::socket);
+        result.syscalls = Some(log);
+        let parsed = test_result_json(&result);
+        assert_eq!(
+            parsed["violations"],
+            json!([{ "line": 4, "condition": "syscalls not in {socket}", "message": "made socket", "offenders": ["socket"] }])
+        );
+        assert_eq!(parsed["syscalls"], json!({ "socket": 2 }));
     }
 
     #[test]

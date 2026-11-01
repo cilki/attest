@@ -18,10 +18,10 @@
 //! With `--repeat`, the samples of one condition are folded first — an upper
 //! bound from the largest, a lower from the smallest.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use crate::decorator::{Bound, Metric, Sample, Unit};
+use crate::decorator::{Bound, Detail, Metric, Sample, Unit};
 use crate::output::{errln, outln};
 use crate::parser::TestFile;
 use crate::runner::TestResult;
@@ -125,34 +125,61 @@ struct LiteralKey {
 pub fn plan_updates(results: &[TestResult]) -> Vec<Edit> {
     struct Broken<'a> {
         violation: &'a crate::decorator::Violation,
+        metric: crate::decorator::Metric,
+        bound: &'a crate::decorator::Bound,
+        upper: bool,
         samples: Vec<u64>,
     }
     let mut by_literal: BTreeMap<LiteralKey, Broken> = BTreeMap::new();
+    let mut unwritable: BTreeSet<(PathBuf, usize, String)> = BTreeSet::new();
     for result in results {
         for v in &result.violations {
+            // A set condition has no number to loosen: which syscalls or
+            // paths a test may use is a decision, not a measurement, so the
+            // violation is reported and the condition left as written.
+            let Detail::Quantity {
+                metric,
+                measured,
+                broken,
+            } = &v.detail
+            else {
+                unwritable.insert((result.source_path.clone(), v.line, v.condition.clone()));
+                continue;
+            };
             let key = LiteralKey {
                 path: result.source_path.clone(),
-                line: v.broken.bound.literal.line,
-                start: v.broken.bound.literal.span.start,
+                line: broken.bound.literal.line,
+                start: broken.bound.literal.span.start,
             };
             by_literal
                 .entry(key)
                 .or_insert_with(|| Broken {
                     violation: v,
+                    metric: *metric,
+                    bound: &broken.bound,
+                    upper: broken.upper,
                     samples: Vec::new(),
                 })
                 .samples
-                .push(v.measured);
+                .push(*measured);
         }
+    }
+    for (path, line, condition) in unwritable {
+        errln!(
+            "warning: {}:{}: `{}` did not hold, and has no number to update",
+            path.display(),
+            line,
+            condition.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
     }
 
     by_literal
         .into_iter()
         .filter_map(|(key, broken)| {
             let v = broken.violation;
-            let bound = &v.broken.bound;
-            let unit = v.metric.unit();
-            let Some(new_value) = bound_for(unit, v.broken.upper, bound.inclusive, &broken.samples)
+            let bound = broken.bound;
+            let unit = broken.metric.unit();
+            let Some(new_value) = bound_for(unit, broken.upper, bound.inclusive, &broken.samples)
             else {
                 errln!(
                     "warning: {}:{}: no value satisfies `{}` for what was measured; not updated",
@@ -207,9 +234,14 @@ pub fn plan_additions(results: &[TestResult], files: &HashMap<PathBuf, &TestFile
             entry.complete = false;
             continue;
         }
+        // Only the quantities are generated, so the sample carries nothing
+        // else.
         let sample = Sample {
             wall: result.duration,
             resources: result.resources.as_ref(),
+            syscalls: None,
+            writes: None,
+            project: Path::new("/"),
         };
         for (i, metric) in Metric::GENERATED.iter().enumerate() {
             if let Some(value) = metric.measure(&sample) {
@@ -561,19 +593,21 @@ mod tests {
             span: col..col + condition.len(),
             condition: condition.to_string(),
             message: String::new(),
-            metric: Metric::Cpu,
-            measured,
-            broken: Broken {
-                bound: Bound {
-                    value,
-                    inclusive: condition.contains("<=") || condition.contains(">="),
-                    literal: Literal {
-                        line,
-                        span: lit_start..lit_start + lit.len(),
-                        text: lit.to_string(),
+            detail: Detail::Quantity {
+                metric: Metric::Cpu,
+                measured,
+                broken: Broken {
+                    bound: Bound {
+                        value,
+                        inclusive: condition.contains("<=") || condition.contains(">="),
+                        literal: Literal {
+                            line,
+                            span: lit_start..lit_start + lit.len(),
+                            text: lit.to_string(),
+                        },
                     },
+                    upper,
                 },
-                upper,
             },
         });
         r
@@ -588,6 +622,7 @@ mod tests {
             context: PathBuf::from("/nonexistent"),
             source_path: PathBuf::from(path),
             resources: None,
+            syscalls: None,
             violations: Vec::new(),
         }
     }

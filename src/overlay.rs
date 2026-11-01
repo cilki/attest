@@ -24,7 +24,7 @@
 //! the error names the step each mode tripped on and the errno it got
 //! ([`Unsupported`]). After a successful probe, a per-test setup failure
 //! aborts that test's spawn loudly ([`setup_root`] reports the failing step's
-//! errno through `pre_exec`) instead of silently running the test against the
+//! errno through the spawn hook) instead of silently running the test against the
 //! real filesystem.
 //!
 //! Mounting overlayfs needs `CAP_SYS_ADMIN`. When attest already has it
@@ -37,11 +37,11 @@
 
 use std::ffi::{CStr, CString, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::anyhow;
+
+use crate::spawn::Spawn;
 
 /// How a per-test overlay can be mounted in this environment.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -144,7 +144,7 @@ unsafe fn write_proc(path: &CStr, data: &[u8]) -> bool {
 /// Enter the namespace(s) required for `mode`: a mount namespace for the
 /// overlay, plus a UTS namespace so hostname changes made by a (root) test
 /// stay private to it. Returns `true` on success. Only async-signal-safe libc
-/// calls are used so this is safe after `fork`/in `pre_exec`.
+/// calls are used so this is safe after `fork`, in a spawn hook.
 unsafe fn enter_namespace(mode: Mode, uid_map: &CStr, gid_map: &CStr) -> bool {
     unsafe {
         match mode {
@@ -191,7 +191,7 @@ unsafe fn mount_overlay(merged: &CStr, opts: &CStr) -> bool {
 }
 
 /// uid/gid map contents (`0 <id> 1`) that map the caller to root inside a new
-/// user namespace. Built in the parent so the `pre_exec` closure never allocates.
+/// user namespace. Built in the parent so the spawn hook never allocates.
 fn id_maps() -> (CString, CString) {
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
     (
@@ -376,6 +376,92 @@ fn submount_work_dir(context: &Path, i: usize) -> PathBuf {
     context.join(format!("sub{i}-work"))
 }
 
+/// Every upper layer a finished test's writes landed in, as `(the layer, the
+/// absolute path it stands for)`, shallowest-first: the root overlay's at
+/// `/`, then each ephemeral submount's at its mount point.
+///
+/// The one listing of what a delta is made of — `--save-context` copies
+/// these out and a `writes` condition walks them — so the two cannot cover
+/// different layers.
+pub fn delta_dirs(context: &Path, submounts: &[Submount]) -> Vec<(PathBuf, PathBuf)> {
+    let mut dirs = vec![(upper_dir(context), PathBuf::from("/"))];
+    dirs.extend(submounts.iter().filter_map(|sm| {
+        Some((
+            submount_upper_dir(context, sm.ephemeral_upper?),
+            sm.source.clone(),
+        ))
+    }));
+    dirs
+}
+
+/// Every path a finished test created, modified or deleted, as the absolute
+/// path it has inside the test's root.
+///
+/// Read out of the upper layers ([`delta_dirs`]): an entry there is a write
+/// unless it is a directory overlayfs copied up only to hold one — which is
+/// what a directory that also exists in the lower layer and is not opaque
+/// is. A directory of the test's own (absent below, or opaque because the
+/// test removed and recreated it) is one write, and nothing under it is
+/// listed separately: whatever rule admits the directory admits its
+/// contents. Everything else — a file, a symlink, the character device
+/// overlayfs leaves as a whiteout for a deletion — is listed by name.
+pub fn delta_paths(context: &Path, submounts: &[Submount]) -> std::io::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for (upper, root) in delta_dirs(context, submounts) {
+        if !is_real_dir(&upper) {
+            continue;
+        }
+        collect_delta(&upper, &root, &mut paths)?;
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn collect_delta(upper: &Path, at: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(upper)? {
+        let entry = entry?;
+        let here = entry.path();
+        let abs = at.join(entry.file_name());
+        let meta = entry.metadata()?; // DirEntry::metadata does not follow symlinks
+        if !meta.is_dir() {
+            out.push(abs);
+            continue;
+        }
+        let in_lower = std::fs::symlink_metadata(&abs).is_ok_and(|m| m.is_dir());
+        if !in_lower || is_opaque(&here) {
+            out.push(abs);
+            continue;
+        }
+        collect_delta(&here, &abs, out)?;
+    }
+    Ok(())
+}
+
+/// Has overlayfs marked `dir` opaque — a directory whose lower contents are
+/// hidden because the test removed it and made a new one at the name?
+/// `trusted.overlay.opaque` for a privileged mount, `user.overlay.opaque`
+/// under `userxattr`; reading the `trusted.` one needs `CAP_SYS_ADMIN`, which
+/// is exactly what mounted it.
+fn is_opaque(dir: &Path) -> bool {
+    let Ok(path) = cstr(dir) else {
+        return false;
+    };
+    [c"trusted.overlay.opaque", c"user.overlay.opaque"]
+        .iter()
+        .any(|name| {
+            let mut value = [0u8; 1];
+            let n = unsafe {
+                libc::lgetxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    value.as_mut_ptr().cast(),
+                    value.len(),
+                )
+            };
+            n == 1 && value[0] == b'y'
+        })
+}
+
 /// One mount action performed inside the child, in order.
 enum MountStep {
     /// Ephemeral overlay mounted at `target`.
@@ -390,7 +476,7 @@ enum MountStep {
 
 /// A precomputed plan for building one test's ephemeral root. Everything is
 /// prepared (and all directories created) in the parent so the post-fork
-/// `pre_exec` closure ([`setup_root`]) only makes async-signal-safe libc calls
+/// spawn hook ([`setup_root`]) only makes async-signal-safe libc calls
 /// with no allocation.
 pub struct RootOverlay {
     mode: Mode,
@@ -466,20 +552,18 @@ impl RootOverlay {
     }
 }
 
-/// Register a `pre_exec` hook on `cmd` that builds the per-test ephemeral root.
-/// A setup failure aborts the exec and surfaces as a spawn error (carrying the
-/// failing step's errno), so a test never silently runs against the real
-/// filesystem believing it is isolated.
-pub fn register_root_mount(cmd: &mut Command, plan: RootOverlay) {
-    unsafe {
-        cmd.pre_exec(move || {
-            setup_root(&plan).map_err(|(_, errno)| std::io::Error::from_raw_os_error(errno))
-        });
-    }
+/// Register a hook on `spawn` that builds the per-test ephemeral root in the
+/// child. A setup failure aborts the exec and surfaces as a spawn error
+/// (carrying the failing step's errno), so a test never silently runs
+/// against the real filesystem believing it is isolated.
+pub fn register_root_mount(spawn: &mut Spawn, plan: RootOverlay) {
+    spawn.hook(move || unsafe {
+        setup_root(&plan).map_err(|(_, errno)| std::io::Error::from_raw_os_error(errno))
+    });
 }
 
 /// The step of [`setup_root`] that failed. Only the probe gets to see it (the
-/// `pre_exec` pipe carries an errno and nothing else), and it is what turns
+/// spawn hook's pipe carries an errno and nothing else), and it is what turns
 /// "cannot isolate tests" into something the user can act on: `unshare`
 /// failing with `EPERM` is user namespaces being disabled, the root overlay
 /// failing with `EPERM` is overlayfs refusing an unprivileged mount.
@@ -524,7 +608,10 @@ impl Stage {
 /// step and its errno.
 unsafe fn setup_root(p: &RootOverlay) -> Result<(), (Stage, i32)> {
     fn fail(stage: Stage) -> Result<(), (Stage, i32)> {
-        Err((stage, std::io::Error::last_os_error().raw_os_error().unwrap_or(0)))
+        Err((
+            stage,
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+        ))
     }
     unsafe {
         // Namespaces (mount ns; + user ns when unprivileged) and stop propagation.
@@ -631,7 +718,10 @@ pub struct Unsupported {
 
 impl std::fmt::Display for Unsupported {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "every test runs in an overlay of /, and none can be mounted here:")?;
+        write!(
+            f,
+            "every test runs in an overlay of /, and none can be mounted here:"
+        )?;
         for (mode, failure) in &self.attempts {
             let name = match mode {
                 Mode::Privileged => "with CAP_SYS_ADMIN",
@@ -932,6 +1022,52 @@ pub fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A delta lists what the test wrote and not the directories overlayfs
+    /// copied up on the way to it, so a `writes` condition can be judged on
+    /// the paths the test chose rather than on their ancestors.
+    #[test]
+    fn delta_paths_list_writes_and_not_copied_up_ancestors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // The "host" the layer sits over, standing in for a submount's lower.
+        let lower = tmp.path().join("lower");
+        std::fs::create_dir_all(lower.join("etc/sub")).unwrap();
+        std::fs::write(lower.join("etc/motd"), "old").unwrap();
+        // What the test left in its upper layer.
+        let context = tmp.path().join("ctx");
+        let upper = submount_upper_dir(&context, 0);
+        std::fs::create_dir_all(upper.join("etc/sub")).unwrap();
+        std::fs::create_dir_all(upper.join("etc/newdir/deep")).unwrap();
+        std::fs::write(upper.join("etc/motd"), "new").unwrap(); // modified
+        std::fs::write(upper.join("etc/sub/x"), "").unwrap(); // created under a copied-up dir
+        std::fs::write(upper.join("etc/newdir/deep/y"), "").unwrap(); // under a new dir
+        std::os::unix::fs::symlink("/nowhere", upper.join("link")).unwrap();
+        let submounts = [Submount {
+            source: lower.clone(),
+            is_dir: true,
+            ephemeral_upper: Some(0),
+        }];
+
+        let paths = delta_paths(&context, &submounts).unwrap();
+        assert_eq!(
+            paths,
+            [
+                lower.join("etc/motd"),
+                lower.join("etc/newdir"),
+                lower.join("etc/sub/x"),
+                lower.join("link"),
+            ]
+        );
+        // The root layer is absent here, which is a test that wrote nothing
+        // to it; `delta_dirs` still lists it first.
+        assert_eq!(
+            delta_dirs(&context, &submounts)
+                .into_iter()
+                .map(|(_, at)| at)
+                .collect::<Vec<_>>(),
+            [PathBuf::from("/"), lower]
+        );
+    }
 
     /// Split an option string the way the kernel's `ovl_next_opt` does: on
     /// commas that are not preceded by a backslash.

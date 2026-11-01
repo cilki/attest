@@ -52,9 +52,13 @@
 //! grammar but not enforced yet, and so are rejected the same way
 //! ([`Decorator::check_supported`]) rather than being quietly ignored.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+pub use syscalls::Sysno;
 
 use crate::cgroup::ResourceStats;
 
@@ -163,11 +167,80 @@ impl Metric {
     }
 }
 
-/// What the numbers of a run are and where they came from: the inputs every
-/// quantity condition is checked against.
+/// What a run measured: the inputs every condition is checked against.
+///
+/// Each half is `None` where the run has no number for it, and a condition
+/// on that half comes out [`Verdict::Unmeasured`] rather than as a pass: the
+/// cgroup may not have been creatable, the syscall listener may not be
+/// supported by the kernel, and the delta is only walked for a test with a
+/// `writes` condition.
 pub struct Sample<'a> {
     pub wall: Duration,
     pub resources: Option<&'a ResourceStats>,
+    /// Every syscall the test's process tree made that the run watched for.
+    pub syscalls: Option<&'a SyscallLog>,
+    /// Every absolute path the test created, modified or deleted in its
+    /// ephemeral root (see `overlay::delta_paths`).
+    pub writes: Option<&'a [PathBuf]>,
+    /// The invocation dir, which a `writes` item spelled `./x` is relative
+    /// to.
+    pub project: &'a Path,
+}
+
+/// The syscalls a run was watched for and made: each number with how many
+/// times it was seen. Only the syscalls the test's conditions name (or, for
+/// an allow-list, everything they do not) are ever counted — nothing watches
+/// a test that has no `syscalls` condition.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct SyscallLog {
+    pub counts: BTreeMap<Sysno, u64>,
+}
+
+impl SyscallLog {
+    pub fn record(&mut self, nr: Sysno) {
+        *self.counts.entry(nr).or_insert(0) += 1;
+    }
+}
+
+/// Where a condition's measurement comes from, for the "could not be
+/// measured" warning: the quantity metrics each from their own counter, and
+/// the set forms from the listener or the delta walk.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Measure {
+    Metric(Metric),
+    Syscalls,
+    Writes,
+}
+
+impl Measure {
+    /// Every measure, in a fixed order: the index of one in here is its slot
+    /// wherever something is kept per measure.
+    pub const ALL: [Measure; Metric::ALL.len() + 2] = [
+        Measure::Metric(Metric::Cpu),
+        Measure::Metric(Metric::Wall),
+        Measure::Metric(Metric::Mem),
+        Measure::Metric(Metric::IoRead),
+        Measure::Metric(Metric::IoWrite),
+        Measure::Metric(Metric::Pids),
+        Measure::Syscalls,
+        Measure::Writes,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Measure::Metric(m) => m.name(),
+            Measure::Syscalls => "syscalls",
+            Measure::Writes => "writes",
+        }
+    }
+
+    pub fn source(self) -> &'static str {
+        match self {
+            Measure::Metric(m) => m.source(),
+            Measure::Syscalls => "the seccomp listener",
+            Measure::Writes => "the overlay delta",
+        }
+    }
 }
 
 /// A family of units. Each has one base unit that values are stored in.
@@ -332,11 +405,13 @@ impl Bounds {
 pub enum Kind {
     /// A metric of the run falls within a range.
     Quantity { metric: Metric, bounds: Bounds },
-    /// The set of system calls the test may (`allow`) or may not make.
-    Syscalls { allow: bool, set: Vec<String> },
+    /// The set of system calls the test may (`allow`) or may not make. Every
+    /// name was checked against this architecture's table at parse time.
+    Syscalls { allow: bool, set: Vec<Sysno> },
     /// The hosts the test may contact.
     Hosts(Vec<String>),
-    /// The paths the test may write under.
+    /// The paths the test may write under: each `/absolute` or `./relative`
+    /// to the invocation dir, as written.
     Writes(Vec<String>),
 }
 
@@ -348,6 +423,56 @@ impl Kind {
             Kind::Hosts(_) => "hosts",
             Kind::Writes(_) => "writes",
         }
+    }
+
+    /// The syscalls a run has to be watched for to check this condition:
+    /// the set itself for a deny-list, and everything else for an allow-list.
+    /// Empty for a condition that is not about syscalls.
+    pub fn watched_syscalls(&self) -> Vec<Sysno> {
+        let Kind::Syscalls { allow, set } = self else {
+            return Vec::new();
+        };
+        if *allow {
+            Sysno::iter().filter(|nr| !set.contains(nr)).collect()
+        } else {
+            set.clone()
+        }
+    }
+}
+
+/// How many of a set violation's offenders its message spells out; the rest
+/// are counted, and the report lists them all below the snippet.
+pub const SHOWN_OFFENDERS: usize = 3;
+
+/// Spell the first [`SHOWN_OFFENDERS`] of `items` and count the rest:
+/// `a, b, c (+4 more)`.
+fn list_some(items: &[String]) -> String {
+    let mut text = items
+        .iter()
+        .take(SHOWN_OFFENDERS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if items.len() > SHOWN_OFFENDERS {
+        text.push_str(&format!(" (+{} more)", items.len() - SHOWN_OFFENDERS));
+    }
+    text
+}
+
+/// Does `path` lie under `root` — or at it?
+fn under(path: &Path, root: &Path) -> bool {
+    path.starts_with(root)
+}
+
+/// The absolute path a `writes` item stands for: `./x` is `x` under the
+/// invocation dir, anything else is already absolute (the parse admits no
+/// other spelling).
+fn write_root(item: &str, project: &Path) -> PathBuf {
+    let item = item.trim_end_matches('/');
+    match item.strip_prefix("./") {
+        Some(rel) => project.join(rel),
+        None if item == "." => project.to_path_buf(),
+        None => PathBuf::from(if item.is_empty() { "/" } else { item }),
     }
 }
 
@@ -369,35 +494,89 @@ pub struct Condition {
 pub enum Verdict {
     Ok,
     Violated(Violation),
-    /// The run did not measure the metric, so the condition was not checked.
-    Unmeasured(Metric),
+    /// The run did not measure what the condition is about, so it was not
+    /// checked.
+    Unmeasured(Measure),
 }
 
 impl Condition {
     pub fn check(&self, sample: &Sample) -> Verdict {
+        let violated = |message: String, detail: Detail| {
+            Verdict::Violated(Violation {
+                line: self.line,
+                span: self.span.clone(),
+                condition: self.text.clone(),
+                message,
+                detail,
+            })
+        };
         match &self.kind {
             Kind::Quantity { metric, bounds } => {
                 let Some(value) = metric.measure(sample) else {
-                    return Verdict::Unmeasured(*metric);
+                    return Verdict::Unmeasured(Measure::Metric(*metric));
                 };
                 match bounds.broken_by(value) {
                     None => Verdict::Ok,
-                    Some((bound, upper)) => Verdict::Violated(Violation {
-                        line: self.line,
-                        span: self.span.clone(),
-                        condition: self.text.clone(),
-                        message: format!("{} was {}", metric.name(), metric.unit().format(value)),
-                        metric: *metric,
-                        measured: value,
-                        broken: Broken {
-                            bound: bound.clone(),
-                            upper,
+                    Some((bound, upper)) => violated(
+                        format!("{} was {}", metric.name(), metric.unit().format(value)),
+                        Detail::Quantity {
+                            metric: *metric,
+                            measured: value,
+                            broken: Broken {
+                                bound: bound.clone(),
+                                upper,
+                            },
                         },
-                    }),
+                    ),
                 }
             }
+            Kind::Syscalls { allow, set } => {
+                let Some(log) = sample.syscalls else {
+                    return Verdict::Unmeasured(Measure::Syscalls);
+                };
+                // The log only ever holds what the run was watching for,
+                // which is exactly what this condition forbids — but under a
+                // block with several `syscalls` conditions it holds the union
+                // of their watch sets, so each one still filters for its own.
+                let offenders: Vec<String> = log
+                    .counts
+                    .keys()
+                    .filter(|nr| set.contains(nr) != *allow)
+                    .map(|nr| nr.name().to_string())
+                    .collect();
+                if offenders.is_empty() {
+                    return Verdict::Ok;
+                }
+                let message = if *allow {
+                    format!("also made {}", list_some(&offenders))
+                } else {
+                    format!("made {}", list_some(&offenders))
+                };
+                violated(message, Detail::Set { offenders })
+            }
+            Kind::Writes(items) => {
+                let Some(writes) = sample.writes else {
+                    return Verdict::Unmeasured(Measure::Writes);
+                };
+                let roots: Vec<PathBuf> = items
+                    .iter()
+                    .map(|item| write_root(item, sample.project))
+                    .collect();
+                let offenders: Vec<String> = writes
+                    .iter()
+                    .filter(|path| !roots.iter().any(|root| under(path, root)))
+                    .map(|path| path.display().to_string())
+                    .collect();
+                if offenders.is_empty() {
+                    return Verdict::Ok;
+                }
+                violated(
+                    format!("wrote {}", list_some(&offenders)),
+                    Detail::Set { offenders },
+                )
+            }
             // Not enforced yet; `check_supported` keeps these out of a parse.
-            Kind::Syscalls { .. } | Kind::Hosts(_) | Kind::Writes(_) => Verdict::Ok,
+            Kind::Hosts(_) => Verdict::Ok,
         }
     }
 }
@@ -411,14 +590,27 @@ pub struct Violation {
     pub span: Range<usize>,
     /// The condition's text, as written.
     pub condition: String,
-    /// What was measured instead: `cpu was 12.2ms`.
+    /// What was measured instead: `cpu was 12.2ms`, `made socket, connect`,
+    /// `wrote /etc/motd`.
     pub message: String,
-    pub metric: Metric,
-    /// The measurement, in the metric's base unit.
-    pub measured: u64,
-    /// The end of the range the measurement fell outside of — what
-    /// `--update-decorators` rewrites.
-    pub broken: Broken,
+    pub detail: Detail,
+}
+
+/// What a violation has to say beyond its message: the number a quantity
+/// condition was broken by, or the members that broke a set condition.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Detail {
+    Quantity {
+        metric: Metric,
+        /// The measurement, in the metric's base unit.
+        measured: u64,
+        /// The end of the range the measurement fell outside of — what
+        /// `--update-decorators` rewrites.
+        broken: Broken,
+    },
+    /// Every syscall made or path written that the set did not admit, in
+    /// full; the message spells only the first few.
+    Set { offenders: Vec<String> },
 }
 
 /// The bound a measurement broke, and which end of its range it is.
@@ -451,7 +643,7 @@ impl Decorator {
     /// thing a decorator must not be.
     pub fn check_supported(&self) -> Result<(), Error> {
         for c in &self.conditions {
-            if !matches!(c.kind, Kind::Quantity { .. }) {
+            if matches!(c.kind, Kind::Hosts(_)) {
                 return Err(Error {
                     line: c.line,
                     message: format!(
@@ -690,7 +882,17 @@ fn parse_condition(text: &str) -> Result<Kind, String> {
         };
         let rest = strip_word(rest, "in")
             .ok_or_else(|| "expected `in` or `not in` after `syscalls`".to_string())?;
-        let set = parse_set(rest)?;
+        let set = parse_set(rest)?
+            .iter()
+            .map(|name| {
+                name.parse::<Sysno>().map_err(|_| {
+                    format!(
+                        "`{name}` is not a system call on {}",
+                        std::env::consts::ARCH
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         return Ok(Kind::Syscalls { allow, set });
     }
     if let Some(rest) = strip_word(text, "hosts") {
@@ -701,7 +903,25 @@ fn parse_condition(text: &str) -> Result<Kind, String> {
     if let Some(rest) = strip_word(text, "writes") {
         let rest =
             strip_word(rest, "in").ok_or_else(|| "expected `in` after `writes`".to_string())?;
-        return Ok(Kind::Writes(parse_set(rest)?));
+        let items = parse_set(rest)?;
+        // A path is either absolute or explicitly relative to the project:
+        // a bare `build` would read as one or the other depending on who is
+        // asked, and `../x` would name something outside the tree the test
+        // file is in.
+        for item in &items {
+            if !(item.starts_with('/') || item == "." || item.starts_with("./")) {
+                return Err(format!(
+                    "`{item}` must be an absolute path or start with `./` (relative to the invocation dir)"
+                ));
+            }
+            if Path::new(item)
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+            {
+                return Err(format!("`{item}` must not contain `..`"));
+            }
+        }
+        return Ok(Kind::Writes(items));
     }
     parse_quantity_condition(text)
 }
@@ -983,6 +1203,17 @@ mod tests {
         let mut blocks = scan(source).unwrap();
         assert_eq!(blocks.len(), 1, "{blocks:?}");
         blocks.pop().unwrap()
+    }
+
+    /// A sample with the quantities given and nothing watched.
+    fn sample_of(wall: Duration, resources: Option<&ResourceStats>) -> Sample<'_> {
+        Sample {
+            wall,
+            resources,
+            syscalls: None,
+            writes: None,
+            project: Path::new("/proj"),
+        }
     }
 
     /// A range as `(lower, upper)`, each `(value, inclusive)`: what the
@@ -1322,7 +1553,7 @@ testX() {
             d.conditions[0].kind,
             Kind::Syscalls {
                 allow: false,
-                set: vec!["socket".into(), "connect".into()]
+                set: vec![Sysno::socket, Sysno::connect]
             }
         );
         assert_eq!(d.conditions[1].kind, Kind::Hosts(vec![]));
@@ -1335,8 +1566,24 @@ testX() {
             d.conditions[0].kind,
             Kind::Syscalls {
                 allow: true,
-                set: vec!["read".into(), "write".into()]
+                set: vec![Sysno::read, Sysno::write]
             }
+        );
+        // A syscall is a name in this architecture's table, and a write
+        // root is a path that says where it is relative to.
+        for (text, word) in [
+            ("syscalls in {read, frobnicate}", "frobnicate"),
+            ("writes in {build}", "build"),
+            ("writes in {../x}", "../x"),
+            ("writes in {./a/../b}", "`..`"),
+        ] {
+            let err = scan(&format!("#attest({text})\n")).unwrap_err();
+            assert!(err.message.contains(word), "{text}: {err}");
+        }
+        let d = one("#attest(writes in {., ./, /, /tmp/})");
+        assert_eq!(
+            d.conditions[0].kind,
+            Kind::Writes(vec![".".into(), "./".into(), "/".into(), "/tmp/".into()])
         );
         // Items may hold what a host or a path holds.
         let d = one("#attest(hosts in {api.example.com, 10.0.0.0/8, [::1]:443})");
@@ -1380,12 +1627,99 @@ testX() {
                 .check_supported()
                 .is_ok()
         );
-        for text in ["syscalls in {}", "hosts in {}", "writes in {}"] {
+        for text in ["syscalls in {}", "writes in {}"] {
             let d = one(&format!("#attest(cpu < 1ms,\n# {text})"));
-            let err = d.check_supported().unwrap_err();
-            assert_eq!(err.line, 2, "{text}");
-            assert!(err.message.contains("not supported yet"), "{text}: {err}");
+            assert!(d.check_supported().is_ok(), "{text}");
         }
+        let d = one("#attest(cpu < 1ms,\n# hosts in {})");
+        let err = d.check_supported().unwrap_err();
+        assert_eq!(err.line, 2);
+        assert!(err.message.contains("not supported yet"), "{err}");
+    }
+
+    #[test]
+    fn syscalls_condition_is_checked_against_the_log() {
+        let mut log = SyscallLog::default();
+        for nr in [Sysno::read, Sysno::read, Sysno::socket, Sysno::connect] {
+            log.record(nr);
+        }
+        let mut s = sample_of(Duration::ZERO, None);
+        s.syscalls = Some(&log);
+
+        let d = one(
+            "#attest(syscalls not in {socket, connect}, syscalls not in {execve}, syscalls in {read, write})",
+        );
+        let Verdict::Violated(v) = d.conditions[0].check(&s) else {
+            panic!("expected a violation");
+        };
+        assert_eq!(v.message, "made socket, connect");
+        assert_eq!(
+            v.detail,
+            Detail::Set {
+                offenders: vec!["socket".into(), "connect".into()]
+            }
+        );
+        assert!(matches!(d.conditions[1].check(&s), Verdict::Ok));
+        let Verdict::Violated(v) = d.conditions[2].check(&s) else {
+            panic!("expected a violation");
+        };
+        assert_eq!(v.message, "also made socket, connect");
+
+        // Nothing watched: nothing to say.
+        assert!(matches!(
+            d.conditions[0].check(&sample_of(Duration::ZERO, None)),
+            Verdict::Unmeasured(Measure::Syscalls)
+        ));
+    }
+
+    #[test]
+    fn watched_syscalls_are_the_set_or_its_complement() {
+        let d = one("#attest(syscalls not in {socket}, syscalls in {read}, cpu < 1s)");
+        assert_eq!(d.conditions[0].kind.watched_syscalls(), vec![Sysno::socket]);
+        let watched = d.conditions[1].kind.watched_syscalls();
+        assert!(!watched.contains(&Sysno::read));
+        assert!(watched.contains(&Sysno::socket));
+        assert!(d.conditions[2].kind.watched_syscalls().is_empty());
+    }
+
+    #[test]
+    fn writes_condition_is_checked_against_the_delta() {
+        let writes = [
+            PathBuf::from("/proj/build/out"),
+            PathBuf::from("/tmp/scratch"),
+            PathBuf::from("/etc/motd"),
+            PathBuf::from("/proj/src/x"),
+        ];
+        let mut s = sample_of(Duration::ZERO, None);
+        s.writes = Some(&writes);
+
+        let d = one("#attest(writes in {./build, /tmp/}, writes in {/, ./}, writes in {.})");
+        let Verdict::Violated(v) = d.conditions[0].check(&s) else {
+            panic!("expected a violation");
+        };
+        assert_eq!(v.message, "wrote /etc/motd, /proj/src/x");
+        assert!(matches!(d.conditions[1].check(&s), Verdict::Ok));
+        let Verdict::Violated(v) = d.conditions[2].check(&s) else {
+            panic!("expected a violation");
+        };
+        assert_eq!(v.message, "wrote /tmp/scratch, /etc/motd");
+
+        // A prefix is a path prefix, not a string prefix.
+        let writes = [PathBuf::from("/tmpfoo")];
+        s.writes = Some(&writes);
+        assert!(matches!(d.conditions[0].check(&s), Verdict::Violated(_)));
+
+        assert!(matches!(
+            d.conditions[0].check(&sample_of(Duration::ZERO, None)),
+            Verdict::Unmeasured(Measure::Writes)
+        ));
+    }
+
+    #[test]
+    fn a_long_list_of_offenders_is_cut_short() {
+        let items: Vec<String> = (1..=5).map(|i| format!("p{i}")).collect();
+        assert_eq!(list_some(&items), "p1, p2, p3 (+2 more)");
+        assert_eq!(list_some(&items[..3]), "p1, p2, p3");
     }
 
     #[test]
@@ -1398,10 +1732,7 @@ testX() {
             io_write_bytes: Some(20),
             pids_peak: Some(5),
         };
-        let sample = Sample {
-            wall: Duration::from_millis(1500),
-            resources: Some(&stats),
-        };
+        let sample = sample_of(Duration::from_millis(1500), Some(&stats));
         let d = one(
             "#attest(cpu < 10ms, wall < 1s, mem < 4MiB, io_read < 5B, io_write < 25B, pids <= 5)",
         );
@@ -1429,14 +1760,11 @@ testX() {
 
     #[test]
     fn check_reports_what_it_could_not_measure() {
-        let sample = Sample {
-            wall: Duration::from_millis(1),
-            resources: None,
-        };
+        let sample = sample_of(Duration::from_millis(1), None);
         let d = one("#attest(cpu < 10ms, wall < 1s)");
         assert!(matches!(
             d.conditions[0].check(&sample),
-            Verdict::Unmeasured(Metric::Cpu)
+            Verdict::Unmeasured(Measure::Metric(Metric::Cpu))
         ));
         assert!(matches!(d.conditions[1].check(&sample), Verdict::Ok));
 
@@ -1445,13 +1773,10 @@ testX() {
             pids_peak: Some(1),
             ..Default::default()
         };
-        let sample = Sample {
-            wall: Duration::from_millis(1),
-            resources: Some(&stats),
-        };
+        let sample = sample_of(Duration::from_millis(1), Some(&stats));
         assert!(matches!(
             d.conditions[0].check(&sample),
-            Verdict::Unmeasured(Metric::Cpu)
+            Verdict::Unmeasured(Measure::Metric(Metric::Cpu))
         ));
     }
 
@@ -1462,10 +1787,7 @@ testX() {
             cpu_system_usec: Some(50),
             ..Default::default()
         };
-        let sample = Sample {
-            wall: Duration::ZERO,
-            resources: Some(&stats),
-        };
+        let sample = sample_of(Duration::ZERO, Some(&stats));
         let d = one("#attest(\n#  1ms < cpu < 2ms,\n#)");
         let Verdict::Violated(v) = d.conditions[0].check(&sample) else {
             panic!("expected a violation");
@@ -1484,27 +1806,35 @@ testX() {
             pids_peak: Some(9),
             ..Default::default()
         };
-        let sample = Sample {
-            wall: Duration::ZERO,
-            resources: Some(&stats),
-        };
+        let sample = sample_of(Duration::ZERO, Some(&stats));
         let line = "#attest(1ms < cpu < 2ms, pids <= 3)";
         let d = one(line);
         let Verdict::Violated(v) = d.conditions[0].check(&sample) else {
             panic!("expected a violation");
         };
-        assert_eq!((v.metric, v.measured), (Metric::Cpu, 150));
+        let Detail::Quantity {
+            metric,
+            measured,
+            broken,
+        } = v.detail
+        else {
+            panic!("expected a quantity");
+        };
+        assert_eq!((metric, measured), (Metric::Cpu, 150));
         // 150us is below the lower bound, so that is the one to rewrite.
-        assert!(!v.broken.upper);
-        assert_eq!(v.broken.bound.value, 1_000);
-        assert_eq!(&line[v.broken.bound.literal.span.clone()], "1ms");
+        assert!(!broken.upper);
+        assert_eq!(broken.bound.value, 1_000);
+        assert_eq!(&line[broken.bound.literal.span.clone()], "1ms");
 
         let Verdict::Violated(v) = d.conditions[1].check(&sample) else {
             panic!("expected a violation");
         };
-        assert!(v.broken.upper);
-        assert_eq!(v.broken.bound.literal.line, 1);
-        assert_eq!(&line[v.broken.bound.literal.span.clone()], "3");
+        let Detail::Quantity { broken, .. } = v.detail else {
+            panic!("expected a quantity");
+        };
+        assert!(broken.upper);
+        assert_eq!(broken.bound.literal.line, 1);
+        assert_eq!(&line[broken.bound.literal.span.clone()], "3");
     }
 
     #[test]

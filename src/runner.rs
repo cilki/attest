@@ -1,9 +1,9 @@
 use anyhow::{Result, anyhow};
 use std::io::{Read, Seek, SeekFrom};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus};
+use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
@@ -12,6 +12,8 @@ use crate::decorator;
 use crate::output;
 use crate::output::errln;
 use crate::overlay;
+use crate::seccomp;
+use crate::spawn::{Child, Spawn};
 
 /// Set by the SIGINT/SIGTERM handler. Tests run in their own sessions (see the
 /// `setsid` hook in `spawn_test`), so the terminal no longer delivers ^C to
@@ -35,8 +37,16 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// millisecond was still only noticed — and its successor only spawned — on the
 /// next tick, so a suite of fast tests cost 50ms per test per worker on top of
 /// what the tests themselves took. With the signal blocked, an exiting child
-/// leaves a `SIGCHLD` pending and [`ChildWaiter::wait`] returns as soon as it
-/// does; the timeout stays so the clock-driven work above keeps its cadence.
+/// leaves a `SIGCHLD` pending, a `signalfd` for it becomes readable, and
+/// [`ChildWaiter::wait`] returns as soon as it does; the timeout stays so the
+/// clock-driven work above keeps its cadence.
+///
+/// A `signalfd` rather than `sigtimedwait` because the wait has other
+/// descriptors to watch in the same call: every running test with a
+/// `syscalls` condition has a seccomp listener, and a syscall the test is
+/// blocked in until its notification is answered must not wait for the next
+/// tick either. So the wait is one `poll` over the signal and the listeners,
+/// answering notifications as they come and returning on a child's exit.
 ///
 /// Blocking is per-thread and inherited by threads started afterwards, so this
 /// has to be armed before the run starts anything else — the status bar's
@@ -45,14 +55,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// discards it; that only costs the early wakeup, since the wait still ends on
 /// its timeout, but it would cost it for the whole run.
 struct ChildWaiter {
-    /// The signal set waited on: `SIGCHLD` alone.
-    set: libc::sigset_t,
     /// The mask to put back when the run is over.
     previous: libc::sigset_t,
-    /// Whether `SIGCHLD` really is blocked. If it is not, waiting for it would
-    /// race with its delivery, so [`Self::wait`] just sleeps the interval out —
-    /// exactly what the loop did before.
-    armed: bool,
+    /// Readable whenever a `SIGCHLD` is pending. `None` when the signal could
+    /// not be blocked (or the descriptor not made), in which case waiting for
+    /// it would race with its delivery and [`Self::wait`] polls the listeners
+    /// alone, on the timer — exactly what the loop did before.
+    sigfd: Option<std::os::fd::OwnedFd>,
 }
 
 impl ChildWaiter {
@@ -66,45 +75,93 @@ impl ChildWaiter {
             libc::sigaddset(&mut set, libc::SIGCHLD);
             libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut previous) == 0
         };
-        if !armed {
-            debug!("could not block SIGCHLD; the poll loop will wait on its timer alone");
+        let sigfd = if armed {
+            let fd = unsafe { libc::signalfd(-1, &set, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK) };
+            if fd < 0 {
+                // Put the mask back: a blocked signal nobody waits for is
+                // worse than the race.
+                unsafe {
+                    libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut())
+                };
+                None
+            } else {
+                Some(unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) })
+            }
+        } else {
+            None
+        };
+        if sigfd.is_none() {
+            debug!("could not wait on SIGCHLD; the poll loop will wait on its timer alone");
         }
-        Self {
-            set,
-            previous,
-            armed,
-        }
+        Self { previous, sigfd }
+    }
+
+    /// Whether `SIGCHLD` is blocked and waited on.
+    #[cfg(test)]
+    fn armed(&self) -> bool {
+        self.sigfd.is_some()
     }
 
     /// Wait until a test child exits or `timeout` elapses, whichever happens
-    /// first.
-    fn wait(&self, timeout: Duration) {
-        if !self.armed {
-            std::thread::sleep(timeout);
-            return;
-        }
-        let ts = libc::timespec {
-            tv_sec: timeout.as_secs() as libc::time_t,
-            tv_nsec: timeout.subsec_nanos() as libc::c_long,
-        };
-        if unsafe { libc::sigtimedwait(&self.set, std::ptr::null_mut(), &ts) } >= 0 {
-            return; // a child exited
-        }
-        match std::io::Error::last_os_error().raw_os_error() {
-            // Nothing finished within the interval — the ordinary case while
-            // tests are running — or a handled signal (^C) cut the wait short.
-            // Either way the loop goes round and looks for itself.
-            Some(libc::EAGAIN) | Some(libc::EINTR) => {}
-            // `sigtimedwait` is not doing what we take it for. Sleep the
-            // interval out rather than spinning the poll loop at full speed.
-            _ => std::thread::sleep(timeout),
+    /// first, answering the `listeners` meanwhile.
+    fn wait(&self, timeout: Duration, listeners: &mut [&mut seccomp::Listener]) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let mut fds: Vec<libc::pollfd> = Vec::with_capacity(listeners.len() + 1);
+            // The signal first, so its slot is known.
+            fds.push(libc::pollfd {
+                fd: self.sigfd.as_ref().map_or(-1, |fd| fd.as_raw_fd()),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            fds.extend(listeners.iter().map(|l| libc::pollfd {
+                // A dead listener polls as `-1`, which `poll` ignores.
+                fd: l.poll_fd().unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            }));
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            let n = unsafe {
+                libc::poll(
+                    fds.as_mut_ptr(),
+                    fds.len() as libc::nfds_t,
+                    left.as_millis().clamp(1, i32::MAX as u128) as i32,
+                )
+            };
+            if n <= 0 {
+                // Nothing within the interval — the ordinary case while
+                // tests are running — or a handled signal (^C) cut the wait
+                // short. Either way the loop goes round and looks for itself.
+                return;
+            }
+            for (pfd, listener) in fds[1..].iter().zip(listeners.iter_mut()) {
+                if pfd.revents != 0 {
+                    listener.service();
+                }
+            }
+            if fds[0].revents != 0 {
+                // A child exited. Take the signal so the descriptor is quiet
+                // again; nothing in it is needed, the reap finds out which.
+                let mut info: libc::signalfd_siginfo = unsafe { std::mem::zeroed() };
+                unsafe {
+                    libc::read(
+                        fds[0].fd,
+                        (&mut info as *mut libc::signalfd_siginfo).cast(),
+                        std::mem::size_of::<libc::signalfd_siginfo>(),
+                    )
+                };
+                return;
+            }
         }
     }
 }
 
 impl Drop for ChildWaiter {
     fn drop(&mut self) {
-        if self.armed {
+        if self.sigfd.is_some() {
             unsafe {
                 libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut())
             };
@@ -272,6 +329,10 @@ pub struct TestResult {
     pub context: PathBuf,
     pub source_path: PathBuf,
     pub resources: Option<crate::cgroup::ResourceStats>,
+    /// The syscalls the run watched the test for, and how often each was
+    /// made. `None` for a test with no `syscalls` condition — nothing is
+    /// watched that nothing asks about — or where the kernel cannot watch.
+    pub syscalls: Option<crate::decorator::SyscallLog>,
     /// The test's `#attest(...)` conditions that did not hold. Only a test
     /// whose script succeeded has its conditions checked, so a non-empty list
     /// is the whole reason the outcome is [`Outcome::Fail`] — the commands
@@ -316,6 +377,10 @@ struct PendingTest<'a> {
     /// may be qualified and numbered).
     test: &'a str,
     cgroup: Option<crate::cgroup::TestCgroup>,
+    /// Where the test's syscalls are heard, for a test with a `syscalls`
+    /// condition on a kernel with seccomp user notification. Serviced by
+    /// the poll loop ([`ChildWaiter::wait`]) for as long as the test runs.
+    listener: Option<seccomp::Listener>,
 }
 
 impl PendingTest<'_> {
@@ -487,6 +552,10 @@ struct RunEnv {
     overlay_mode: overlay::Mode,
     /// How each mount under `/` is re-established inside per-test roots.
     submounts: Vec<overlay::Submount>,
+    /// Whether this kernel answers seccomp user notifications
+    /// (`seccomp::probe`), and so whether a `syscalls` condition can be
+    /// watched at all.
+    seccomp: bool,
 }
 
 /// One test to run: the name it is reported under, the shell function to
@@ -556,10 +625,18 @@ pub fn run_all_tests<'a>(tests: Vec<TestSpec<'a>>, config: &RunConfig) -> Result
         }
         overlay::Mode::Privileged => debug!("using privileged overlay isolation"),
     }
+    let seccomp = match seccomp::probe() {
+        Ok(()) => true,
+        Err(why) => {
+            debug!("seccomp user notification unavailable: {why}");
+            false
+        }
+    };
     let env = RunEnv {
         invocation_dir,
         overlay_mode,
         submounts,
+        seccomp,
     };
 
     // Contexts always live in the temp dir; `--save-context` copies each test's
@@ -650,7 +727,7 @@ pub fn run_all_tests<'a>(tests: Vec<TestSpec<'a>>, config: &RunConfig) -> Result
                 continue; // Drop kills + cleans up
             }
             let file = pending.file;
-            let result = build_result(pending, exit_status, config);
+            let result = build_result(pending, exit_status, config, &env);
             if let Some(ref save_dir) = config.save_context {
                 save_test_context(&result, save_dir, &env.submounts);
             }
@@ -729,7 +806,11 @@ pub fn run_all_tests<'a>(tests: Vec<TestSpec<'a>>, config: &RunConfig) -> Result
             .collect();
         status.update(&running);
 
-        waiter.wait(POLL_INTERVAL);
+        let mut listeners: Vec<&mut seccomp::Listener> = pending_list
+            .iter_mut()
+            .filter_map(|p| p.listener.as_mut())
+            .collect();
+        waiter.wait(POLL_INTERVAL, &mut listeners);
     }
 
     status.finish();
@@ -895,10 +976,12 @@ fn spawn_test<'a>(
     // <shell> -c <script> <source_path>: passing source_path as argv[0]
     // makes $0 inside the test functions refer to the original script.
     let source_str = source_path_owned.to_str().unwrap_or("bash").to_string();
-    let mut cmd = Command::new(shell);
-    cmd.args(["-c", &runner_content, &source_str])
-        .stdout(stdout_log)
-        .stderr(xtrace_log);
+    let mut spawn = Spawn::new(
+        shell,
+        &[shell, "-c", &runner_content, &source_str],
+        stdout_log,
+        xtrace_log,
+    )?;
 
     // Detach into a fresh session/process group so timeouts and cleanup can
     // kill the whole test tree with one kill(-pgid).
@@ -907,19 +990,17 @@ fn spawn_test<'a>(
     // the parent (see `ChildWaiter`) and a mask survives both fork and exec, so
     // a test's shell would otherwise start with SIGCHLD blocked — and a shell
     // that cannot take SIGCHLD does not notice its own background jobs
-    // finishing, which is `wait` in a test hanging. `std` happens to reset the
-    // mask before exec as well, but that is not something it promises, and the
-    // promise is one tests depend on. Nothing here allocates, as the hook
-    // requires.
-    unsafe {
-        cmd.pre_exec(|| {
+    // finishing, which is `wait` in a test hanging. Nothing here allocates,
+    // as the hook requires.
+    spawn.hook(|| {
+        unsafe {
             libc::setsid();
             let mut empty: libc::sigset_t = std::mem::zeroed();
             libc::sigemptyset(&mut empty);
             libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
-            Ok(())
-        });
-    }
+        }
+        Ok(())
+    });
 
     // Place the child into its cgroup after fork, before exec. The parent has
     // live threads (status-bar ticker), so the hook must not allocate:
@@ -928,39 +1009,73 @@ fn spawn_test<'a>(
     if let Some(ref cg) = cgroup
         && let Some(procs) = cg.procs_cstring()
     {
-        unsafe {
-            cmd.pre_exec(move || {
-                crate::cgroup::add_self_to(&procs);
-                Ok(())
-            });
-        }
+        spawn.hook(move || {
+            unsafe { crate::cgroup::add_self_to(&procs) };
+            Ok(())
+        });
     }
 
     // Registered after the cgroup hook so cgroup placement happens in the host
     // namespace before we unshare into a private mount namespace.
-    overlay::register_root_mount(&mut cmd, root_plan);
+    overlay::register_root_mount(&mut spawn, root_plan);
+
+    // Last of all, so that attest's own mounts are not in the count: the
+    // seccomp filter for a test that asserts on its syscalls, where this
+    // kernel can answer one. The listener comes back over a socketpair
+    // before the exec, which is why the spawn is then waited for with the
+    // listener in hand — the exec itself may be the first syscall notified.
+    let watched = watched_syscalls(spec.file.conditions_of(spec.name));
+    let filter = env
+        .seccomp
+        .then(|| seccomp::Filter::watching(&watched))
+        .flatten();
+    let listener_sock = match filter {
+        Some(filter) => {
+            let (parent_end, child_end) = seccomp::socketpair()?;
+            let child_fd = child_end.as_raw_fd();
+            spawn.hook(move || {
+                let _keep = &child_end; // closed by the exec, or at _exit
+                unsafe { filter.install_and_send(child_fd) }
+            });
+            Some(parent_end)
+        }
+        None => None,
+    };
 
     let start = Instant::now();
-    let child = cmd.spawn().map_err(|e| {
-        // The script rides in the argument vector, and Linux caps how long a
-        // single argument may be — 32 pages classically, a slice of the stack
-        // limit on newer kernels, so half a megabyte of shell either way. Only
-        // a file with more function definitions in it than that can hit this,
-        // and `E2BIG` on its own names neither the argument nor its size.
-        let note = if e.raw_os_error() == Some(libc::E2BIG) {
-            format!(
-                " (the script carrying this file's function definitions is {} bytes, \
-                 more than one argument can hold)",
-                runner_content.len()
-            )
-        } else {
-            // The probe passed, so this is a per-test setup failure: the
-            // errno is all that survives `pre_exec`, and it belongs to one of
-            // the mounts the ephemeral root is built from.
-            " (while building the test's ephemeral root)".to_string()
-        };
-        anyhow!("spawn failed for {display_name}: {e}{note}")
-    })?;
+    let spawning = spawn.start()?;
+    let mut listener = match &listener_sock {
+        Some(sock) => seccomp::receive(sock)?,
+        None => None,
+    };
+    let fds: Vec<RawFd> = listener.iter().filter_map(|l| l.poll_fd()).collect();
+    let child = spawning
+        .wait_exec(&fds, |_| {
+            if let Some(l) = listener.as_mut() {
+                l.service();
+            }
+        })
+        .map_err(|e| {
+            // The script rides in the argument vector, and Linux caps how long a
+            // single argument may be — 32 pages classically, a slice of the stack
+            // limit on newer kernels, so half a megabyte of shell either way. Only
+            // a file with more function definitions in it than that can hit this,
+            // and `E2BIG` on its own names neither the argument nor its size.
+            let note = if e.raw_os_error() == Some(libc::E2BIG) {
+                format!(
+                    " (the script carrying this file's function definitions is {} bytes, \
+                     more than one argument can hold)",
+                    runner_content.len()
+                )
+            } else {
+                // The probe passed, so this is a per-test setup failure: the
+                // errno is all that survives the hook, and it belongs to one
+                // of the mounts the ephemeral root is built from — or to the
+                // seccomp filter installed after them.
+                " (while building the test's ephemeral root)".to_string()
+            };
+            anyhow!("spawn failed for {display_name}: {e}{note}")
+        })?;
 
     Ok(PendingTest {
         child,
@@ -973,12 +1088,30 @@ fn spawn_test<'a>(
         file: spec.file,
         test: spec.name,
         cgroup,
+        listener,
     })
+}
+
+/// Every syscall the run has to watch for the given conditions: the union
+/// of what each `syscalls` condition is about.
+fn watched_syscalls<'a>(
+    conditions: impl Iterator<Item = &'a decorator::Condition>,
+) -> Vec<decorator::Sysno> {
+    let mut watched: Vec<decorator::Sysno> =
+        conditions.flat_map(|c| c.kind.watched_syscalls()).collect();
+    watched.sort_unstable();
+    watched.dedup();
+    watched
 }
 
 /// Build a `TestResult` from a `PendingTest` whose child has already exited
 /// with the given status.
-fn build_result(mut pending: PendingTest, status: ExitStatus, config: &RunConfig) -> TestResult {
+fn build_result(
+    mut pending: PendingTest,
+    status: ExitStatus,
+    config: &RunConfig,
+    env: &RunEnv,
+) -> TestResult {
     let duration = pending.start.elapsed();
     let mut outcome = if pending.timed_out {
         Outcome::Timeout
@@ -991,20 +1124,45 @@ fn build_result(mut pending: PendingTest, status: ExitStatus, config: &RunConfig
     // Read stats before dropping cgroup (which removes the directory).
     let resources = pending.cgroup.as_ref().map(|cg| cg.read_stats());
 
+    // Whatever was heard, pending answers included: the test is over.
+    let syscalls = pending.listener.take().map(|l| l.into_log());
+
     // A decorator is a condition on a run of the test, and a run that failed
     // on its own — or was killed on the clock — is not one it says anything
     // about: the numbers are those of a test that never got to the end.
     let mut violations = Vec::new();
     if outcome == Outcome::Pass {
+        let conditions: Vec<&decorator::Condition> =
+            pending.file.conditions_of(pending.test).collect();
+        // The delta is only walked for a test that asserts on it: it is as
+        // big as the test made it, and almost no test says anything about it.
+        let writes = if conditions
+            .iter()
+            .any(|c| matches!(c.kind, decorator::Kind::Writes(_)))
+        {
+            let context = pending.context.as_deref().unwrap();
+            match overlay::delta_paths(context, &env.submounts) {
+                Ok(paths) => Some(paths),
+                Err(e) => {
+                    debug!(test = %pending.name, "could not read the delta: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let sample = decorator::Sample {
             wall: duration,
             resources: resources.as_ref(),
+            syscalls: syscalls.as_ref(),
+            writes: writes.as_deref(),
+            project: &env.invocation_dir,
         };
-        for condition in pending.file.conditions_of(pending.test) {
+        for condition in conditions {
             match condition.check(&sample) {
                 decorator::Verdict::Ok => {}
                 decorator::Verdict::Violated(v) => violations.push(v),
-                decorator::Verdict::Unmeasured(metric) => warn_unmeasured(metric),
+                decorator::Verdict::Unmeasured(measure) => warn_unmeasured(measure),
             }
         }
         // A run that exists to find the right bounds is not failed by the
@@ -1022,6 +1180,7 @@ fn build_result(mut pending: PendingTest, status: ExitStatus, config: &RunConfig
         context: pending.context.take().unwrap(),
         source_path: pending.source_path.clone(),
         resources,
+        syscalls,
         violations,
     }
     // pending drops here: reaped=true skips kill/wait, tmp_dir=None skips
@@ -1034,25 +1193,28 @@ fn build_result(mut pending: PendingTest, status: ExitStatus, config: &RunConfig
 /// down and not checked changes what the run covers, so it has to show up
 /// whatever the log level is — but once, since every test's `cpu` condition
 /// is unmeasured for the same reason.
-fn warn_unmeasured(metric: decorator::Metric) {
-    static WARNED: [AtomicBool; decorator::Metric::ALL.len()] =
-        [const { AtomicBool::new(false) }; decorator::Metric::ALL.len()];
-    let slot = decorator::Metric::ALL
+fn warn_unmeasured(measure: decorator::Measure) {
+    use decorator::{Measure, Metric};
+    static WARNED: [AtomicBool; Measure::ALL.len()] =
+        [const { AtomicBool::new(false) }; Measure::ALL.len()];
+    let slot = Measure::ALL
         .iter()
-        .position(|&m| m == metric)
-        .expect("every metric is in ALL");
+        .position(|&m| m == measure)
+        .expect("every measure is in ALL");
     if WARNED[slot].swap(true, Ordering::Relaxed) {
         return;
     }
-    let hint = match metric {
-        decorator::Metric::Wall => String::new(),
-        _ => " (cgroup v2 unavailable, --no-cgroups, or the controller is not enabled; -d says which)"
-            .to_string(),
+    let hint = match measure {
+        Measure::Metric(Metric::Wall) | Measure::Writes => "",
+        Measure::Metric(_) => {
+            " (cgroup v2 unavailable, --no-cgroups, or the controller is not enabled; -d says which)"
+        }
+        Measure::Syscalls => " (seccomp user notification needs Linux 5.5 or later; -d says why)",
     };
     errln!(
         "warning: `{}` conditions are not checked: {} did not report it{hint}",
-        metric.name(),
-        metric.source()
+        measure.name(),
+        measure.source()
     );
 }
 
@@ -1086,19 +1248,18 @@ fn saved_dirs(
     submounts: &[overlay::Submount],
 ) -> Vec<(String, PathBuf, PathBuf)> {
     let context = &result.context;
-    let mut dirs = vec![(
-        "the filesystem delta".to_string(),
-        overlay::upper_dir(context),
-        PathBuf::new(),
-    )];
-    dirs.extend(submounts.iter().filter_map(|sm| {
-        let source = &sm.source;
-        Some((
-            format!("the {} delta", source.display()),
-            overlay::submount_upper_dir(context, sm.ephemeral_upper?),
-            source.strip_prefix("/").unwrap_or(source).to_path_buf(),
-        ))
-    }));
+    let mut dirs: Vec<(String, PathBuf, PathBuf)> = overlay::delta_dirs(context, submounts)
+        .into_iter()
+        .map(|(upper, at)| {
+            let what = if at == Path::new("/") {
+                "the filesystem delta".to_string()
+            } else {
+                format!("the {} delta", at.display())
+            };
+            let rel = at.strip_prefix("/").unwrap_or(&at).to_path_buf();
+            (what, upper, rel)
+        })
+        .collect();
     dirs.push((
         "the working directory".to_string(),
         cwd_dir(context),
@@ -1483,6 +1644,7 @@ fn create_strace_wrappers(working_dir: &Path, commands: &[String]) -> Result<()>
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command;
     use tempfile::TempDir;
 
     /// How overlays can be mounted where the tests are running, probed once
@@ -1512,6 +1674,7 @@ mod tests {
             invocation_dir: invocation_dir.to_path_buf(),
             overlay_mode: overlay_mode()?,
             submounts: overlay::compute_submounts(invocation_dir),
+            seccomp: seccomp::probe().is_ok(),
         })
     }
 
@@ -1588,7 +1751,7 @@ mod tests {
         .unwrap();
         let status = reap_blocking(&mut pending);
         Some(Finished {
-            result: build_result(pending, status, config),
+            result: build_result(pending, status, config, &env),
             _context: ctx,
         })
     }
@@ -1610,6 +1773,7 @@ mod tests {
             context,
             source_path: PathBuf::from("t.sh"),
             resources: None,
+            syscalls: None,
             violations: Vec::new(),
         }
     }
@@ -1664,7 +1828,10 @@ mod tests {
         assert_eq!(r.violations.len(), 1);
         assert_eq!(r.test, "test_x");
         // The literal to rewrite is where the file has it.
-        let lit = &r.violations[0].broken.bound.literal;
+        let decorator::Detail::Quantity { broken, .. } = &r.violations[0].detail else {
+            panic!("expected a quantity");
+        };
+        let lit = &broken.bound.literal;
         assert_eq!(lit.line, 1);
         assert_eq!(&script.lines().next().unwrap()[lit.span.clone()], "1us");
     }
@@ -1681,6 +1848,102 @@ mod tests {
         assert_eq!(r.outcome, Outcome::Fail);
         assert!(r.violations.is_empty());
         assert!(!r.commands_succeeded());
+    }
+
+    /// A `syscalls` condition is checked against what the seccomp listener
+    /// heard from the whole tree, the shell included: the runner script's own
+    /// `cd` is a `chdir` the shell makes, so forbidding it is a violation
+    /// every run commits, and `mknod` is one no shell makes.
+    #[test]
+    fn a_syscalls_condition_is_checked_against_what_was_heard() {
+        if !seccomp::probe().is_ok() {
+            eprintln!("skipping: seccomp user notification unavailable");
+            return;
+        }
+        let Some(r) = run_inline(
+            "#attest(syscalls not in {chdir, mknod})\ntest_x() {\n  true\n}\n",
+            "test_x",
+        ) else {
+            return;
+        };
+        assert_eq!(r.outcome, Outcome::Fail);
+        assert_eq!(r.violations.len(), 1, "{:?}", r.violations);
+        assert_eq!(r.violations[0].message, "made chdir");
+        let log = r.syscalls.as_ref().expect("the test was watched");
+        assert!(
+            log.counts
+                .get(&decorator::Sysno::chdir)
+                .is_some_and(|&n| n >= 1)
+        );
+        assert!(!log.counts.contains_key(&decorator::Sysno::mknod));
+
+        let Some(r) = run_inline(
+            "#attest(syscalls not in {mknod})\ntest_x() {\n  true\n}\n",
+            "test_x",
+        ) else {
+            return;
+        };
+        assert_eq!(r.outcome, Outcome::Pass, "{:?}", r.violations);
+        assert_eq!(r.syscalls.as_ref().unwrap().counts.len(), 0);
+
+        // The exec of the shell is itself a watched syscall here, and the
+        // spawn must not wait for it in a way that stops it being answered.
+        let Some(r) = run_inline(
+            "#attest(syscalls in {read})\ntest_x() {\n  true\n}\n",
+            "test_x",
+        ) else {
+            return;
+        };
+        assert_eq!(r.outcome, Outcome::Fail);
+        assert!(
+            r.violations[0].message.starts_with("also made "),
+            "{}",
+            r.violations[0].message
+        );
+        assert!(
+            r.syscalls
+                .as_ref()
+                .unwrap()
+                .counts
+                .contains_key(&decorator::Sysno::execve)
+        );
+    }
+
+    /// A test with no `syscalls` condition is not watched at all.
+    #[test]
+    fn a_test_without_a_syscalls_condition_is_not_watched() {
+        let Some(r) = run_inline("#attest(wall < 60s)\ntest_x() {\n  true\n}\n", "test_x") else {
+            return;
+        };
+        assert_eq!(r.outcome, Outcome::Pass);
+        assert!(r.syscalls.is_none());
+    }
+
+    /// A `writes` condition is checked against the delta: a write under an
+    /// admitted root passes, one anywhere else names the path.
+    #[test]
+    fn a_writes_condition_is_checked_against_the_delta() {
+        let Some(r) = run_inline(
+            "#attest(writes in {/tmp})\ntest_x() {\n  echo x > /tmp/attest_writes_ok\n  echo y > ./in_cwd\n}\n",
+            "test_x",
+        ) else {
+            return;
+        };
+        assert_eq!(r.outcome, Outcome::Pass, "{:?}", r.violations);
+        assert!(!Path::new("/tmp/attest_writes_ok").exists());
+
+        let Some(r) = run_inline(
+            "#attest(writes in {/tmp})\ntest_x() {\n  echo x > /attest_writes_marker\n  mkdir -p /var/attest_writes_dir/deep\n}\n",
+            "test_x",
+        ) else {
+            return;
+        };
+        assert_eq!(r.outcome, Outcome::Fail);
+        assert_eq!(r.violations.len(), 1, "{:?}", r.violations);
+        assert_eq!(
+            r.violations[0].message,
+            "wrote /attest_writes_marker, /var/attest_writes_dir"
+        );
     }
 
     /// The run's temp dir carries every test's logs, working directory and
@@ -1802,7 +2065,7 @@ mod tests {
         let before = sigchld_blocked();
         {
             let waiter = ChildWaiter::new();
-            assert!(waiter.armed, "SIGCHLD could not be blocked");
+            assert!(waiter.armed(), "SIGCHLD could not be blocked");
             assert!(sigchld_blocked(), "SIGCHLD was not blocked for the run");
         }
         assert_eq!(
@@ -1819,10 +2082,10 @@ mod tests {
     #[test]
     fn child_waiter_returns_at_once_for_a_child_that_has_already_signalled() {
         let waiter = ChildWaiter::new();
-        assert!(waiter.armed, "SIGCHLD could not be blocked");
+        assert!(waiter.armed(), "SIGCHLD could not be blocked");
         unsafe { libc::raise(libc::SIGCHLD) };
         let start = Instant::now();
-        waiter.wait(Duration::from_secs(30));
+        waiter.wait(Duration::from_secs(30), &mut []);
         let waited = start.elapsed();
         assert!(
             waited < Duration::from_secs(5),

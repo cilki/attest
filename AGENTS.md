@@ -139,19 +139,33 @@
   underline exactly it. A condition is `METRIC OP QTY`, `QTY OP METRIC` or
   `QTY OP METRIC OP QTY` (one metric, a chain pointing one way, a non-empty
   range), with the unit family fixed by the metric (`Unit`: durations in
-  microseconds, sizes in bytes, counts bare) — or one of the set forms
-  `syscalls in`/`not in {…}`, `hosts in {…}`, `writes in {…}`, which parse but
-  are refused by `check_supported` until something enforces them. `Condition::
-  check` measures the metric out of a `Sample` (the `wall` duration plus the
-  cgroup's `ResourceStats`; `cpu` is user+system, the number the resource line
-  shows) and yields `Ok`, a `Violation` (line, span, condition text, `cpu was
-  12.2ms`, plus the metric, the measurement and the `Bound` it broke) or
-  `Unmeasured` when the run has no number for it. Each `Bound` carries its
-  `Literal` — the number token's line, byte span and text — recorded in
-  `parse_operand` as an offset into the condition and mapped onto the file's
-  lines in `parse_conditions`; a chain written across lines has its two
-  literals on two lines, which is why the position is per bound. That literal
-  is the whole of what `--update-decorators` rewrites.
+  microseconds, sizes in bytes, counts bare) — or one of the set forms:
+  `syscalls in`/`not in {…}` (each name resolved against this architecture's
+  table through the `syscalls` crate at parse time, so a typo is a parse
+  error and `Kind::Syscalls` holds `Sysno`s; `watched_syscalls` is the set
+  the run has to listen for, the set itself for `not in` and its complement
+  for `in`), `writes in {…}` (each item `/absolute` or `./relative`, no
+  `..` — a bare `build` would mean one thing or the other depending on who
+  is asked), and `hosts in {…}`, which parses but is refused by
+  `check_supported` until something enforces it. `Condition::check` judges
+  a condition against a `Sample`: the `wall` duration, the cgroup's
+  `ResourceStats` (`cpu` is user+system, the number the resource line
+  shows), the `SyscallLog` the seccomp listener built, the delta's paths and
+  the invocation dir a `./` item is relative to — each half `None` where the
+  run has no such number, which makes a condition on it `Unmeasured` rather
+  than passed. The outcome is `Ok`, that, or a `Violation`: line, span,
+  condition text, a message (`cpu was 12.2ms`, `made socket, connect`,
+  `wrote /etc/motd (+3 more)`) and a `Detail` — for a quantity the metric,
+  the measurement and the `Bound` it broke; for a set the full list of
+  offenders, since the message spells only `SHOWN_OFFENDERS` of them. Each
+  `Bound` carries its `Literal` — the number token's line, byte span and
+  text — recorded in `parse_operand` as an offset into the condition and
+  mapped onto the file's lines in `parse_conditions`; a chain written across
+  lines has its two literals on two lines, which is why the position is per
+  bound. That literal is the whole of what `--update-decorators` rewrites.
+  `Measure` is the per-measure identity behind `warn_unmeasured`: the six
+  metrics plus `Syscalls` and `Writes`, each with the source that failed to
+  report it.
 - `src/decorate.rs` - `--update-decorators` and `--add-decorators`: planned
   from the `TestResult`s a finished run returns, applied once after it, never
   reached by an interrupted run. `bound_for` is the one rule for a new number:
@@ -163,7 +177,10 @@
   one bound nothing satisfies (`> x` under a sample of 0) is `None` and
   skipped with a warning. `plan_updates` groups violations by the literal's
   `(path, line, column)` and emits a `Replace` of that token only; a bound
-  that held is never touched, and nothing but the number is. `plan_additions`
+  that held is never touched, and nothing but the number is. A set violation
+  (`Detail::Set`) has no number to loosen — which syscalls or paths a test
+  may use is a decision — so it is named in a warning and left as written.
+  `plan_additions`
   writes an `Insert` of `# attest(cpu < …, mem < …, pids <= …)` (the
   `Metric::GENERATED` subset the run measured — `wall` is scheduler noise and
   `io_*` rarely the point) directly above the definition line
@@ -178,8 +195,9 @@
   right-to-left so no edit moves another, and `fs::write`s in place so the
   inode and the `+x` bit survive. The summary lists each edit with the file
   relative to the cwd, on stdout, or on stderr under `--json`.
-- `src/runner.rs` - For each test: forks a child that execs `<shell> -c` (the
-  shell the file's own parse settled on) with the original
+- `src/runner.rs` - For each test: forks a child (through `spawn::Spawn`,
+  not `std::process::Command` — see `src/spawn.rs`) that execs `<shell> -c`
+  (the shell the file's own parse settled on) with the original
   script path as `argv[0]` so `$0` still works. The script it is given is all
   the file's extracted functions (test + helper) followed by `set -e`, a `cd`
   into the test's clean working directory and only then `set -x` before the
@@ -203,12 +221,23 @@
   and, when cgroups are active, `cgroup.kill`). Parallel by default via
   `fork(2)` with configurable parallelism (`--parallel`). The poll loop that
   reaps the children and spawns their replacements waits on `SIGCHLD`
-  (`ChildWaiter`, blocking it for the length of the run) with the 50ms poll
-  interval only as a timeout, so a finished test is noticed and replaced at
-  once instead of on the next tick — that interval used to be a floor under
-  every test's duration. The mask is emptied again in the child's `pre_exec`,
-  since a shell that inherited a blocked `SIGCHLD` would not see its own
-  background jobs finish. Supports `--timeout`,
+  (`ChildWaiter`, blocking it for the length of the run and reading it
+  through a `signalfd`) with the 50ms poll interval only as a timeout, so a
+  finished test is noticed and replaced at once instead of on the next tick
+  — that interval used to be a floor under every test's duration. The wait
+  is one `poll` over that descriptor and every running test's seccomp
+  listener (`PendingTest::listener`, see `src/seccomp.rs`), answering
+  notifications as they arrive: a test blocked in a watched syscall must not
+  wait for the next tick either. The mask is emptied again in the child's
+  first hook, since a shell that inherited a blocked `SIGCHLD` would not see
+  its own background jobs finish. The hooks run in the child in this order:
+  session and mask, cgroup placement (in the host namespace, before any
+  unshare), the ephemeral root, and last the seccomp filter for a test with
+  a `syscalls` condition — after the mounts, so attest's own are not in the
+  count. `watched_syscalls` is the union over the test's conditions; the
+  listener comes back over a socketpair before the exec, and the spawn then
+  waits for the exec with that listener in hand (`Spawning::wait_exec`),
+  since the exec may itself be the first syscall notified. Supports `--timeout`,
   `--bail`, `--override`, `--bin-dir`, and `--strace`. With `--save-context`,
   copies each test's filesystem delta plus logs to the output dir. Display
   names (and thus context dirs) are unique per test: a test name defined in
@@ -219,10 +248,14 @@
   (a failed or timed-out run's numbers are those of a test that never got to
   its end), a violated condition turns `Pass` into `Fail` and goes on
   `TestResult::violations`, and a metric the run has no number for —
-  `--no-cgroups`, no cgroup v2, a controller not enabled — is reported once
-  per run per metric on stderr (`warn_unmeasured`) and leaves the outcome
-  alone, since a condition on a number nobody has is not one the test can
-  fail. `commands_succeeded` is what the report loop reads: a violation-only
+  `--no-cgroups`, no cgroup v2, a controller not enabled, seccomp
+  notification unsupported — is reported once per run per `Measure` on
+  stderr (`warn_unmeasured`) and leaves the outcome alone, since a condition
+  on a number nobody has is not one the test can fail. The delta
+  (`overlay::delta_paths`) is only walked for a test with a `writes`
+  condition, and the syscall log is whatever the listener heard, taken off
+  it here (`TestResult::syscalls`, which `--json` reports) whatever the
+  outcome. `commands_succeeded` is what the report loop reads: a violation-only
   failure gets `diagnostics::print_violations` and no xtrace replay, because
   there is no failed command in the trace to replay or to blame. Under
   `RunConfig::update_decorators` a violation is recorded but the outcome
@@ -262,7 +295,7 @@
   follow the same rule: `overlay_env`/`run_script` return `None` where no
   overlay can be mounted and the test returns early, since there is nothing
   else to run a test in. All
-  mounts happen in the forked child's private mount namespace via `pre_exec`,
+  mounts happen in the forked child's private mount namespace via a spawn hook,
   so they are torn down automatically on exit and never pollute the host.
   The test's own context dir is bind-mounted back in **live** (the logs are
   written and the working directory lives there), so a running test can rewrite
@@ -284,6 +317,46 @@
   binary anyone with access to the saved context can run. The mode is set on
   the descriptor before any content is written, and set explicitly rather than
   left to `O_CREAT`, so a name an earlier run left setuid is corrected.
+  `delta_dirs` is the one listing of the upper layers a test's writes landed
+  in (the root's at `/`, each ephemeral submount's at its mount point), read
+  by both `--save-context` and `delta_paths`, so the two cannot cover
+  different layers. `delta_paths` turns the layers into the absolute paths a
+  `writes` condition is judged on: every non-directory entry (files,
+  symlinks, the whiteout device a deletion leaves) is a write, and a
+  directory is one only when it is the test's own — absent from the lower
+  layer at that path, or marked opaque (`is_opaque`, the `trusted.`/`user.
+  overlay.opaque` xattr) because the test replaced it — in which case it is
+  listed once and not walked. A directory that exists below and is not
+  opaque is one overlayfs copied up to hold a write further down, and only
+  what is further down counts.
+- `src/seccomp.rs` - Watching a test's syscalls with seccomp user
+  notification. `Filter::watching` builds the classic-BPF program: allow any
+  other ABI unseen (`NATIVE_ARCH` is the audit arch the numbers were resolved
+  against), then one compare-and-return per watched number so no jump
+  reaches further than the next instruction (a jump offset is a byte, and an
+  allow-list's complement has hundreds of entries), `USER_NOTIF` for a hit
+  and `ALLOW` otherwise. `install_and_send` runs in the child's last hook:
+  `seccomp(SET_MODE_FILTER, NEW_LISTENER)` — with `CAP_SYS_ADMIN`, which
+  the overlay already needed, or after `PR_SET_NO_NEW_PRIVS` where that is
+  refused — and `SCM_RIGHTS` the listener over the socketpair, stack buffers
+  only. `Listener::service` answers every pending notification (`NOTIF_RECV`,
+  record the number, `NOTIF_SEND` with `FLAG_CONTINUE`, so the syscall runs
+  exactly as it would have) and only ever reads while `poll` says the
+  descriptor is readable, since `NOTIF_RECV` blocks otherwise; `POLLHUP`
+  marks it dead, which is nobody left behind the filter. `probe` rehearses
+  the whole round trip once per run (`getppid` through a filter in a forked
+  child), and where it fails the run installs nothing and the condition is
+  `Unmeasured`.
+- `src/spawn.rs` - Fork-and-exec with the parent kept awake. `std::process::
+  Command` blocks in `spawn` until the child's `execve` returns — and under
+  a filter watching `execve` that return waits on the parent answering the
+  notification, so each would wait on the other. `Spawn` does what `std`
+  does (hooks in order in the child, a close-on-exec pipe carrying a failing
+  hook's errno, EOF meaning the exec went through) but `Spawning::wait_exec`
+  polls that pipe together with whatever descriptors the caller hands it,
+  servicing them until the outcome arrives. `Child` is the pid plus whether
+  it has been reaped, with the `kill`/`try_wait`/`wait` the runner used from
+  `std`.
 - `src/diagnostics.rs` - On failure, parses `xtrace.log` to find the last
   executed command (skipping `++` subshell traces, so a failure inside
   `$(...)` is attributed to the statement around it), maps it back to the
@@ -401,6 +474,8 @@
 - `brush-parser` - Tokenizes and parses shell scripts into an AST
 - `clap` - CLI argument parsing
 - `tempfile` - Per-test temporary directories
+- `syscalls` - This architecture's syscall table (`Sysno`), for resolving
+  the names in a `syscalls` condition and naming what the listener heard
 
 ## Test file format
 
@@ -433,10 +508,14 @@ against a value with `<`, `<=`, `>`, `>=`, or brackets it (`2ms < cpu <
 10ms`). The block may span several `#` lines and take a trailing comma; blanks
 are allowed around `attest`; `##` never opens one. A violated condition fails
 the test once its commands have all succeeded (see `examples/md5sum.test`,
-and the README's "Decorators"). The set forms `syscalls in`/`not in {…}`,
-`hosts in {…}` and `writes in {…}` parse but are rejected until enforced.
+and the README's "Decorators"). `syscalls in`/`not in {…}` asserts on the
+system calls the test's whole tree made (watched through seccomp user
+notification, the shell's startup included), `writes in {…}` on the paths
+its filesystem delta touched (`/absolute` or `./relative` to the invocation
+dir); `hosts in {…}` parses but is rejected until enforced.
 `--add-decorators` writes such a block, and `--update-decorators` rewrites
-a bound's number when the run breaks it.
+a bound's number when the run breaks it (a set condition has none, and is
+left alone with a warning).
 
 ## CLI options
 

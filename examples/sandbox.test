@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+
+## A test that never opens a socket: the condition is on the whole process
+## tree, md5sum included, and on the shell's own startup — which makes no
+## sockets either.
+# attest(syscalls not in {socket, connect})
+testOffline() {
+	echo hello | md5sum
+}
+
+## Writes are judged from the filesystem delta after the run: the file
+## under /tmp is admitted, and nothing else was written anywhere. (The
+## working directory is not part of the delta, so writes there never count.)
+# attest(writes in {/tmp})
+testScratchOnly() {
+	echo scratch > /tmp/attest-sandbox-example
+	[ -f /tmp/attest-sandbox-example ]
+}
+
+## A path spelled `./x` is relative to the directory attest was invoked
+## from — run this one from the repository root. `$0` is the test file.
+# attest(writes in {./examples/build})
+testBuildDir() {
+	mkdir -p "$(dirname "$0")/build"
+	echo artifact > "$(dirname "$0")/build/out"
+}
