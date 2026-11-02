@@ -205,9 +205,44 @@ impl Child {
         self.pid as u32
     }
 
+    /// Has the child been reaped? From then on its pid is not ours to signal.
+    pub fn reaped(&self) -> bool {
+        self.status.is_some()
+    }
+
+    /// Has the child exited? `waitid` with `WNOWAIT` answers that without
+    /// consuming the zombie, so the pid — and a process group named after
+    /// it — stays reserved until [`Self::try_wait`] or [`Self::wait`] reaps
+    /// it.
+    pub fn has_exited(&self) -> io::Result<bool> {
+        if self.reaped() {
+            return Ok(true);
+        }
+        // Zeroed up front because `waitid` leaves the struct untouched when
+        // `WNOHANG` finds nothing, and `si_pid == 0` is how that is reported.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let ret = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if ret == -1 {
+            let err = io::Error::last_os_error();
+            // A signal cut the call short; the caller asks again.
+            if err.kind() == io::ErrorKind::Interrupted {
+                return Ok(false);
+            }
+            return Err(err);
+        }
+        Ok(unsafe { info.si_pid() } != 0)
+    }
+
     /// `SIGKILL` the child. Nothing happens to one already reaped.
     pub fn kill(&mut self) -> io::Result<()> {
-        if self.status.is_some() {
+        if self.reaped() {
             return Ok(());
         }
         if unsafe { libc::kill(self.pid, libc::SIGKILL) } != 0 {
@@ -305,6 +340,25 @@ mod tests {
         let spawn = Spawn::new("/nonexistent/prog", &["prog"], out, err).unwrap();
         let err = spawn.start().unwrap().wait_exec(&[], |_| {}).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+    }
+
+    /// `has_exited` sees the exit without reaping: the pid stays the child's
+    /// until `try_wait` consumes the zombie, and only then is it `reaped`.
+    #[test]
+    fn has_exited_leaves_the_zombie_for_try_wait() {
+        let (_tmp, out, err) = logs();
+        let spawn = Spawn::new("/bin/sh", &["sh", "-c", "exit 3"], out, err).unwrap();
+        let mut child = spawn.start().unwrap().wait_exec(&[], |_| {}).unwrap();
+        while !child.has_exited().unwrap() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!child.reaped());
+        // Still a zombie of ours: signalling it is not an error.
+        assert_eq!(unsafe { libc::kill(child.id() as i32, 0) }, 0);
+        let status = child.try_wait().unwrap().expect("exited");
+        assert_eq!(status.code(), Some(3));
+        assert!(child.reaped());
+        assert!(child.has_exited().unwrap());
     }
 
     /// Hooks run in the order they were added, in the child.

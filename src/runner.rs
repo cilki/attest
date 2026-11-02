@@ -357,10 +357,6 @@ impl TestResult {
 /// waited on. Dropping this kills the child (if still running) and cleans up.
 struct PendingTest<'a> {
     child: Child,
-    /// Set once the child has been waited on. The kernel is free to hand its
-    /// pid to a new process from that moment, so nothing may be signalled
-    /// through it any more — see [`PendingTest::kill_tree`].
-    reaped: bool,
     /// Set to `true` when the child was killed due to exceeding `--timeout`.
     timed_out: bool,
     name: String,
@@ -393,63 +389,33 @@ impl PendingTest<'_> {
     /// pgid — to an unrelated process, and `kill(-pgid)` would SIGKILL
     /// somebody else's process group. So pid-based signalling stops at that
     /// point and only `cgroup.kill`, which is keyed to a directory and can
-    /// never be misdirected, still runs. (`Child::kill` is no help as a guard:
-    /// it quietly succeeds on an already-waited-for child.)
+    /// never be misdirected, still runs.
     fn kill_tree(&mut self) {
         if let Some(ref cg) = self.cgroup {
             cg.kill_all();
         }
-        if self.reaped {
+        if self.child.reaped() {
             return;
         }
         unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) };
         let _ = self.child.kill();
     }
 
-    /// Has the child exited? `waitid` with `WNOWAIT` answers that without
-    /// consuming the zombie, so [`Child::try_wait`] can still reap it and the
-    /// pid — and the pgid derived from it — stays reserved for as long as
-    /// [`Self::reap`] needs to signal the group.
-    fn has_exited(&self) -> std::io::Result<bool> {
-        // Zeroed up front because `waitid` leaves the struct untouched when
-        // `WNOHANG` finds nothing, and `si_pid == 0` is how that is reported.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let ret = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                self.child.id(),
-                &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
-        if ret == -1 {
-            let err = std::io::Error::last_os_error();
-            // A signal cut the call short; the next poll pass asks again.
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                return Ok(false);
-            }
-            return Err(err);
-        }
-        Ok(unsafe { info.si_pid() } != 0)
-    }
-
     /// Reap the child if it has exited, killing its process tree first.
     /// `None` while it is still running.
     ///
     /// The order matters: the test's pgid is the child's pid, and that number
-    /// stays reserved only until the child is reaped. Killing the group first
-    /// and consuming the zombie second is what makes `kill(-pgid)` provably
-    /// land on this test and nothing else.
+    /// stays reserved only until the child is reaped. [`Child::has_exited`]
+    /// leaves the zombie in place, so killing the group first and consuming
+    /// the zombie second is what makes `kill(-pgid)` provably land on this
+    /// test and nothing else.
     fn reap(&mut self) -> std::io::Result<Option<ExitStatus>> {
-        if !self.reaped {
-            if !self.has_exited()? {
-                return Ok(None);
-            }
-            // Background processes the test left behind outlive the shell;
-            // tests are promised they never have to clean those up themselves.
-            self.kill_tree();
-            self.reaped = true;
+        if !self.child.has_exited()? {
+            return Ok(None);
         }
+        // Background processes the test left behind outlive the shell;
+        // tests are promised they never have to clean those up themselves.
+        self.kill_tree();
         self.child.try_wait()
     }
 }
@@ -1079,7 +1045,6 @@ fn spawn_test<'a>(
 
     Ok(PendingTest {
         child,
-        reaped: false,
         timed_out: false,
         name: display_name.clone(),
         start,
@@ -1183,7 +1148,7 @@ fn build_result(
         syscalls,
         violations,
     }
-    // pending drops here: reaped=true skips kill/wait, tmp_dir=None skips
+    // pending drops here: a reaped child skips kill/wait, context=None skips
     // dir removal, cgroup drops removing the cgroup directory.
 }
 
