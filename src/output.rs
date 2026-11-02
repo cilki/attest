@@ -26,8 +26,6 @@ pub(crate) struct Palette {
     pub(crate) green: &'static str,
     pub(crate) red: &'static str,
     pub(crate) dim: &'static str,
-    /// Bold green, for the progress bar's own heading.
-    pub(crate) heading: &'static str,
     pub(crate) reset: &'static str,
 }
 
@@ -36,7 +34,6 @@ impl Palette {
         green: "\x1b[32m",
         red: "\x1b[31m",
         dim: "\x1b[2m",
-        heading: "\x1b[1;32m",
         reset: "\x1b[0m",
     };
 
@@ -44,7 +41,6 @@ impl Palette {
         green: "",
         red: "",
         dim: "",
-        heading: "",
         reset: "",
     };
 

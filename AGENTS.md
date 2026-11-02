@@ -234,11 +234,11 @@
   session and mask, cgroup placement (in the host namespace, before any
   unshare), the ephemeral root, and last the seccomp filter for a test with
   a `syscalls` condition — after the mounts, so attest's own are not in the
-  count. `watched_syscalls` is the union over the test's conditions; the
-  parent takes the listener out of the child before the exec
-  (`seccomp::Handoff::take`), and the spawn then waits for the exec with
-  that listener in hand (`Spawning::wait_exec`), since the exec may itself
-  be the first syscall notified. Supports `--timeout`,
+  count. The watched set is the union of each condition's `watched_syscalls`
+  (`Filter::watching` sorts and dedups it); the parent takes the listener
+  out of the child before the exec (`seccomp::Handoff::take`), and the spawn
+  then waits for the exec with that listener in hand (`Spawning::wait_exec`),
+  since the exec may itself be the first syscall notified. Supports `--timeout`,
   `--bail`, `--override`, `--bin-dir`, and `--strace`. With `--save-context`,
   copies each test's filesystem delta plus logs to the output dir. Display
   names (and thus context dirs) are unique per test: a test name defined in
@@ -362,8 +362,9 @@
   hook's errno, EOF meaning the exec went through) but `Spawning::wait_exec`
   polls that pipe together with whatever descriptors the caller hands it,
   servicing them until the outcome arrives. `Child` is the pid plus whether
-  it has been reaped, with the `kill`/`try_wait`/`wait` the runner used from
-  `std`.
+  it has been reaped, with the `try_wait`/`wait` the runner used from `std`
+  (no `kill`: the child leads its own process group, so the runner's
+  `kill(-pgid)` already reaches it).
 - `src/diagnostics.rs` - On failure, parses `xtrace.log` to find the last
   executed command (skipping `++` subshell traces, so a failure inside
   `$(...)` is attributed to the statement around it), maps it back to the

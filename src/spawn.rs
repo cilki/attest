@@ -246,17 +246,6 @@ impl Child {
         Ok(unsafe { info.si_pid() } != 0)
     }
 
-    /// `SIGKILL` the child. Nothing happens to one already reaped.
-    pub fn kill(&mut self) -> io::Result<()> {
-        if self.reaped() {
-            return Ok(());
-        }
-        if unsafe { libc::kill(self.pid, libc::SIGKILL) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
     fn waitpid(&mut self, flags: libc::c_int) -> io::Result<Option<ExitStatus>> {
         if let Some(status) = self.status {
             return Ok(Some(status));

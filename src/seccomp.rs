@@ -136,12 +136,6 @@ impl Filter {
         Some(Filter { prog })
     }
 
-    /// The number of instructions, for a test to check the shape.
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.prog.len()
-    }
-
     /// Install this filter on the calling thread and hand the listener the
     /// kernel returns for it to the parent through `end`, returning once the
     /// parent has taken it ([`Handoff::take`]). For the child, between fork
@@ -520,7 +514,7 @@ mod tests {
     fn filter_has_a_compare_and_return_per_watched_syscall() {
         let f = Filter::watching(&[Sysno::socket, Sysno::connect, Sysno::socket]).unwrap();
         // 4 of preamble, 2 per distinct number, 1 final allow.
-        assert_eq!(f.len(), 4 + 2 * 2 + 1);
+        assert_eq!(f.prog.len(), 4 + 2 * 2 + 1);
         assert!(Filter::watching(&[]).is_none());
     }
 

@@ -96,12 +96,6 @@ impl ChildWaiter {
         Self { previous, sigfd }
     }
 
-    /// Whether `SIGCHLD` is blocked and waited on.
-    #[cfg(test)]
-    fn armed(&self) -> bool {
-        self.sigfd.is_some()
-    }
-
     /// Wait until a test child exits or `timeout` elapses, whichever happens
     /// first, answering the `listeners` meanwhile.
     fn wait(&self, timeout: Duration, listeners: &mut [&mut seccomp::Listener]) {
@@ -397,8 +391,8 @@ impl PendingTest<'_> {
         if self.child.reaped() {
             return;
         }
+        // The group is led by the child itself, so this kills it too.
         unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) };
-        let _ = self.child.kill();
     }
 
     /// Reap the child if it has exited, killing its process tree first.
@@ -991,7 +985,11 @@ fn spawn_test<'a>(
     // syscall, for this side to take the listener out of it (see
     // `seccomp::Handoff`); the spawn is then waited for with the listener in
     // hand, since the exec itself may be the first syscall notified.
-    let watched = watched_syscalls(spec.file.conditions_of(spec.name));
+    let watched: Vec<_> = spec
+        .file
+        .conditions_of(spec.name)
+        .flat_map(|c| c.kind.watched_syscalls())
+        .collect();
     let filter = env
         .seccomp
         .then(|| seccomp::Filter::watching(&watched))
@@ -1064,18 +1062,6 @@ fn spawn_test<'a>(
         cgroup,
         listener,
     })
-}
-
-/// Every syscall the run has to watch for the given conditions: the union
-/// of what each `syscalls` condition is about.
-fn watched_syscalls<'a>(
-    conditions: impl Iterator<Item = &'a decorator::Condition>,
-) -> Vec<decorator::Sysno> {
-    let mut watched: Vec<decorator::Sysno> =
-        conditions.flat_map(|c| c.kind.watched_syscalls()).collect();
-    watched.sort_unstable();
-    watched.dedup();
-    watched
 }
 
 /// Build a `TestResult` from a `PendingTest` whose child has already exited
@@ -1169,14 +1155,13 @@ fn build_result(
 /// is unmeasured for the same reason.
 fn warn_unmeasured(measure: decorator::Measure) {
     use decorator::{Measure, Metric};
-    static WARNED: [AtomicBool; Measure::ALL.len()] =
-        [const { AtomicBool::new(false) }; Measure::ALL.len()];
-    let slot = Measure::ALL
-        .iter()
-        .position(|&m| m == measure)
-        .expect("every measure is in ALL");
-    if WARNED[slot].swap(true, Ordering::Relaxed) {
-        return;
+    static WARNED: std::sync::Mutex<Vec<Measure>> = std::sync::Mutex::new(Vec::new());
+    {
+        let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+        if warned.contains(&measure) {
+            return;
+        }
+        warned.push(measure);
     }
     let hint = match measure {
         Measure::Metric(Metric::Wall) | Measure::Writes => "",
@@ -2046,7 +2031,7 @@ mod tests {
         let before = sigchld_blocked();
         {
             let waiter = ChildWaiter::new();
-            assert!(waiter.armed(), "SIGCHLD could not be blocked");
+            assert!(waiter.sigfd.is_some(), "SIGCHLD could not be blocked");
             assert!(sigchld_blocked(), "SIGCHLD was not blocked for the run");
         }
         assert_eq!(
@@ -2063,7 +2048,7 @@ mod tests {
     #[test]
     fn child_waiter_returns_at_once_for_a_child_that_has_already_signalled() {
         let waiter = ChildWaiter::new();
-        assert!(waiter.armed(), "SIGCHLD could not be blocked");
+        assert!(waiter.sigfd.is_some(), "SIGCHLD could not be blocked");
         unsafe { libc::raise(libc::SIGCHLD) };
         let start = Instant::now();
         waiter.wait(Duration::from_secs(30), &mut []);

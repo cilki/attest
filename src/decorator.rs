@@ -80,17 +80,6 @@ pub enum Metric {
 }
 
 impl Metric {
-    /// Every metric, in a fixed order: the index of a metric in here is its
-    /// slot wherever something is kept per metric.
-    pub const ALL: [Metric; 6] = [
-        Metric::Cpu,
-        Metric::Wall,
-        Metric::Mem,
-        Metric::IoRead,
-        Metric::IoWrite,
-        Metric::Pids,
-    ];
-
     /// The metrics `--add-decorators` writes a condition for, in the order
     /// it writes them. The stable ones: `wall` is whatever the scheduler made
     /// of the run (a 4ms test takes 40ms on a loaded machine), and `io_*` is
@@ -213,19 +202,6 @@ pub enum Measure {
 }
 
 impl Measure {
-    /// Every measure, in a fixed order: the index of one in here is its slot
-    /// wherever something is kept per measure.
-    pub const ALL: [Measure; Metric::ALL.len() + 2] = [
-        Measure::Metric(Metric::Cpu),
-        Measure::Metric(Metric::Wall),
-        Measure::Metric(Metric::Mem),
-        Measure::Metric(Metric::IoRead),
-        Measure::Metric(Metric::IoWrite),
-        Measure::Metric(Metric::Pids),
-        Measure::Syscalls,
-        Measure::Writes,
-    ];
-
     pub fn name(self) -> &'static str {
         match self {
             Measure::Metric(m) => m.name(),
