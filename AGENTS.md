@@ -235,9 +235,10 @@
   unshare), the ephemeral root, and last the seccomp filter for a test with
   a `syscalls` condition — after the mounts, so attest's own are not in the
   count. `watched_syscalls` is the union over the test's conditions; the
-  listener comes back over a socketpair before the exec, and the spawn then
-  waits for the exec with that listener in hand (`Spawning::wait_exec`),
-  since the exec may itself be the first syscall notified. Supports `--timeout`,
+  parent takes the listener out of the child before the exec
+  (`seccomp::Handoff::take`), and the spawn then waits for the exec with
+  that listener in hand (`Spawning::wait_exec`), since the exec may itself
+  be the first syscall notified. Supports `--timeout`,
   `--bail`, `--override`, `--bin-dir`, and `--strace`. With `--save-context`,
   copies each test's filesystem delta plus logs to the output dir. Display
   names (and thus context dirs) are unique per test: a test name defined in
@@ -335,17 +336,23 @@
   against), then one compare-and-return per watched number so no jump
   reaches further than the next instruction (a jump offset is a byte, and an
   allow-list's complement has hundreds of entries), `USER_NOTIF` for a hit
-  and `ALLOW` otherwise. `install_and_send` runs in the child's last hook:
-  `seccomp(SET_MODE_FILTER, NEW_LISTENER)` — with `CAP_SYS_ADMIN`, which
-  the overlay already needed, or after `PR_SET_NO_NEW_PRIVS` where that is
-  refused — and `SCM_RIGHTS` the listener over the socketpair, stack buffers
-  only. `Listener::service` answers every pending notification (`NOTIF_RECV`,
+  and `ALLOW` otherwise. `install_and_hand_off` runs in the child's last
+  hook: `seccomp(SET_MODE_FILTER, NEW_LISTENER)` — with `CAP_SYS_ADMIN`,
+  which the overlay already needed, or after `PR_SET_NO_NEW_PRIVS` where
+  that is refused — then it publishes the listener's descriptor number in a
+  `Handoff`, a `MAP_SHARED` page mapped before the fork, and spins until the
+  parent has copied the descriptor out with `pidfd_getfd`
+  (`Handoff::take`, which polls a pidfd so a child that dies first is not
+  waited on). The listener is never *sent*: after the install any syscall
+  the child makes may be watched (an allow-list watches nearly all), and a
+  watched `sendmsg` carrying the listener would wait on its own answer, so
+  the child makes no syscall between the install and the exec. `Listener::service` answers every pending notification (`NOTIF_RECV`,
   record the number, `NOTIF_SEND` with `FLAG_CONTINUE`, so the syscall runs
   exactly as it would have) and only ever reads while `poll` says the
   descriptor is readable, since `NOTIF_RECV` blocks otherwise; `POLLHUP`
   marks it dead, which is nobody left behind the filter. `probe` rehearses
   the whole round trip once per run (`getppid` through a filter in a forked
-  child), and where it fails the run installs nothing and the condition is
+  child, the listener taken with `pidfd_getfd`), and where it fails the run installs nothing and the condition is
   `Unmeasured`.
 - `src/spawn.rs` - Fork-and-exec with the parent kept awake. `std::process::
   Command` blocks in `spawn` until the child's `execve` returns — and under

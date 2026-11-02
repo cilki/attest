@@ -123,18 +123,26 @@ pub(crate) fn is_shell_interpreter(shebang: &str) -> bool {
     shebang_shell(shebang).is_some()
 }
 
-/// Whether `shell` names something we can exec: an existing path when it
-/// contains a `/`, or a command resolvable on `PATH` otherwise.
-pub(crate) fn shell_exists(shell: &str) -> bool {
+/// The path `shell` execs as: itself when it contains a `/` and exists, its
+/// match on `PATH` when it is a bare name, else `None`.
+fn shell_path(shell: &str) -> Option<String> {
     if shell.contains('/') {
-        Path::new(shell).exists()
+        Path::new(shell).exists().then(|| shell.to_string())
     } else {
-        which::which(shell).is_ok()
+        which::which(shell)
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_string))
     }
 }
 
-/// Resolve a shell name or path to an executable, falling back to `/bin/sh`
-/// when the requested shell is not found.
+/// Resolve a shell name or path to an executable path, falling back to
+/// `/bin/sh` when the requested shell is not found.
+///
+/// The answer is always a path, never a bare name: the runner execs it with
+/// `execv` (see [`crate::spawn`]), which does no `PATH` search, so a bare
+/// `bash` — what `#!/usr/bin/env bash` and a file with no shebang ask for —
+/// would be looked up relative to the working directory and fail with
+/// `ENOENT`.
 ///
 /// Answered once per distinct shell name and remembered. Every file the walk
 /// turns up asks this question, almost always about the same handful of
@@ -163,11 +171,7 @@ pub(crate) fn resolve_shell(shell: &str) -> String {
         return resolved;
     }
 
-    let resolved = if shell_exists(shell) {
-        shell.to_string()
-    } else {
-        "/bin/sh".to_string()
-    };
+    let resolved = shell_path(shell).unwrap_or_else(|| "/bin/sh".to_string());
     cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -409,19 +413,32 @@ mod tests {
     }
 
     #[test]
-    fn shell_exists_detects_real_and_missing_shells() {
+    fn shell_path_detects_real_and_missing_shells() {
         // Absolute path that exists vs. one that doesn't.
-        assert!(shell_exists("/bin/sh"));
-        assert!(!shell_exists("/no/such/shell"));
+        assert_eq!(shell_path("/bin/sh").as_deref(), Some("/bin/sh"));
+        assert_eq!(shell_path("/no/such/shell"), None);
         // Bare name resolved via PATH.
-        assert!(shell_exists("sh"));
-        assert!(!shell_exists("definitely-not-a-real-shell-xyz"));
+        assert!(shell_path("sh").is_some());
+        assert_eq!(shell_path("definitely-not-a-real-shell-xyz"), None);
     }
 
     #[test]
     fn resolve_shell_falls_back_when_missing() {
         assert_eq!(resolve_shell("/bin/sh"), "/bin/sh");
         assert_eq!(resolve_shell("/no/such/shell"), "/bin/sh");
+        assert_eq!(resolve_shell("definitely-not-a-real-shell-xyz"), "/bin/sh");
+    }
+
+    #[test]
+    fn resolve_shell_turns_a_bare_name_into_a_path() {
+        // The runner execs the answer with execv, which searches no PATH: a
+        // bare name (`#!/usr/bin/env bash`, or no shebang at all) has to come
+        // back as the path PATH resolves it to.
+        let sh = resolve_shell("sh");
+        assert!(Path::new(&sh).is_absolute(), "{sh:?}");
+        assert_eq!(Path::new(&sh), which::which("sh").unwrap());
+        let env_sh = script_shell("#!/usr/bin/env sh\necho hi\n");
+        assert!(Path::new(&env_sh).is_absolute(), "{env_sh:?}");
     }
 
     #[test]

@@ -21,12 +21,24 @@
 //! mounted with it — so `no_new_privs` is only set as a fallback, since it
 //! would stop a test from gaining privileges through a setuid binary.
 //!
-//! `CONTINUE` needs Linux 5.5. [`probe`] finds out once per run whether the
-//! whole round trip works; where it does not, no filter is installed and the
-//! condition is reported as unmeasured rather than quietly passed.
+//! The listener is created in the child, by the `seccomp(2)` call that
+//! installs the filter, and attest needs it in the parent. It cannot be
+//! *sent* there: from that call on, any syscall the child makes may be one
+//! the filter watches (an `in` set watches all but a few), and a watched
+//! syscall waits for an answer that only the listener's holder can give — a
+//! `sendmsg` carrying the listener would wait on itself. So the child
+//! publishes the descriptor's number in memory it shares with the parent and
+//! spins, making no syscall at all, while the parent copies the descriptor
+//! out of it with `pidfd_getfd(2)` ([`Handoff`]).
+//!
+//! `CONTINUE` needs Linux 5.5 and `pidfd_getfd` 5.6. [`probe`] finds out once
+//! per run whether the whole round trip works; where it does not, no filter is
+//! installed and the condition is reported as unmeasured rather than quietly
+//! passed.
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use crate::decorator::{SyscallLog, Sysno};
 
@@ -130,14 +142,24 @@ impl Filter {
         self.prog.len()
     }
 
-    /// Install this filter on the calling thread and send the listener the
-    /// kernel returns for it over `sock`. For the child, between fork and
-    /// exec: nothing here allocates.
+    /// Install this filter on the calling thread and hand the listener the
+    /// kernel returns for it to the parent through `end`, returning once the
+    /// parent has taken it ([`Handoff::take`]). For the child, between fork
+    /// and exec: nothing here allocates, and nothing after the install makes
+    /// a syscall — the wait for the parent is a spin on shared memory, since
+    /// any syscall could be one the filter holds until the parent, which does
+    /// not have the listener yet, answers it.
+    ///
+    /// The child's own copy of the listener is close-on-exec (the kernel
+    /// makes it so), so the exec drops it; the parent's copy keeps it alive.
     ///
     /// # Safety
-    /// `sock` must be the writing end of a `SOCK_STREAM` socketpair whose
-    /// other end the parent reads with [`receive`].
-    pub unsafe fn install_and_send(&self, sock: RawFd) -> io::Result<()> {
+    /// `end` must come from a [`Handoff`] created before the fork, whose
+    /// parent side calls [`Handoff::take`] with this process's pid.
+    pub unsafe fn install_and_hand_off(&self, end: HandoffEnd) -> io::Result<()> {
+        // SAFETY: the page was mapped before the fork, and the child keeps its
+        // copy of the mapping until it execs or exits.
+        let page = unsafe { &*end.0 };
         let mut fprog = libc::sock_fprog {
             len: self.prog.len() as libc::c_ushort,
             // Same layout, by construction.
@@ -158,89 +180,158 @@ impl Filter {
             fd = seccomp(&mut fprog);
         }
         if fd < 0 {
-            return Err(io::Error::last_os_error());
+            let err = io::Error::last_os_error();
+            page.slot.store(FAILED, Ordering::Release);
+            return Err(err);
         }
-        let fd = fd as RawFd;
-        let sent = unsafe { send_fd(sock, fd) };
-        unsafe { libc::close(fd) };
-        sent
-    }
-}
-
-/// Send `fd` over the stream socket `sock` as ancillary data, with one byte
-/// of payload for it to ride on. Async-signal-safe: stack buffers only.
-unsafe fn send_fd(sock: RawFd, fd: RawFd) -> io::Result<()> {
-    unsafe {
-        let mut payload = [0u8; 1];
-        let mut iov = libc::iovec {
-            iov_base: payload.as_mut_ptr().cast(),
-            iov_len: 1,
-        };
-        let space = libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) as usize;
-        // Big enough for the one descriptor, aligned like a cmsghdr.
-        let mut control = [0u64; 4];
-        debug_assert!(space <= std::mem::size_of_val(&control));
-        let mut msg: libc::msghdr = std::mem::zeroed();
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = space as _;
-        let cmsg = libc::CMSG_FIRSTHDR(&msg);
-        (*cmsg).cmsg_level = libc::SOL_SOCKET;
-        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
-        std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>(), fd);
-        if libc::sendmsg(sock, &msg, 0) < 0 {
-            return Err(io::Error::last_os_error());
+        page.slot.store(fd as i32, Ordering::Release);
+        while page.taken.load(Ordering::Acquire) == 0 {
+            std::hint::spin_loop();
         }
         Ok(())
     }
 }
 
-/// Receive the descriptor a child sent with [`Filter::install_and_send`]
-/// over the parent's end of the socketpair. `None` when the child closed
-/// its end without sending: it failed before it got that far, which the
-/// exec-status pipe says more about.
-pub fn receive(sock: &OwnedFd) -> io::Result<Option<Listener>> {
-    unsafe {
-        let mut payload = [0u8; 1];
-        let mut iov = libc::iovec {
-            iov_base: payload.as_mut_ptr().cast(),
-            iov_len: 1,
+/// `slot` before the child has installed its filter.
+const PENDING: i32 = -1;
+/// `slot` once the install has failed: there is no listener to take.
+const FAILED: i32 = -2;
+
+/// The page a [`Handoff`] shares between the parent and the child.
+#[repr(C)]
+struct HandoffPage {
+    /// [`PENDING`], [`FAILED`], or the listener's descriptor number in the
+    /// child.
+    slot: AtomicI32,
+    /// Non-zero once the parent holds its own copy of the listener.
+    taken: AtomicU32,
+}
+
+/// How a child's listener reaches its parent: one shared anonymous mapping,
+/// made before the fork so both processes see the same [`HandoffPage`]. The
+/// child publishes the listener's descriptor number there
+/// ([`Filter::install_and_hand_off`]); the parent copies the descriptor out
+/// of the child with `pidfd_getfd(2)` and says so ([`Handoff::take`]). See
+/// the module documentation for why the listener cannot simply be sent.
+pub struct Handoff {
+    page: *mut HandoffPage,
+}
+
+/// The child's side of a [`Handoff`]: a pointer into the shared page, valid
+/// in the child because the fork copied the mapping.
+#[derive(Clone, Copy)]
+pub struct HandoffEnd(*const HandoffPage);
+
+impl Handoff {
+    /// Map the shared page. Call before the fork.
+    pub fn new() -> io::Result<Self> {
+        let page = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                std::mem::size_of::<HandoffPage>(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
         };
-        let mut control = [0u64; 4];
-        let mut msg: libc::msghdr = std::mem::zeroed();
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = std::mem::size_of_val(&control) as _;
-        let n = loop {
-            let n = libc::recvmsg(sock.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC);
-            if n < 0 {
-                let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::Interrupted {
-                    continue;
+        if page == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let page = page.cast::<HandoffPage>();
+        // SAFETY: a fresh mapping, page-aligned and large enough.
+        unsafe {
+            page.write(HandoffPage {
+                slot: AtomicI32::new(PENDING),
+                taken: AtomicU32::new(0),
+            })
+        };
+        Ok(Self { page })
+    }
+
+    /// What the child's hook hands to [`Filter::install_and_hand_off`].
+    pub fn child_end(&self) -> HandoffEnd {
+        HandoffEnd(self.page)
+    }
+
+    fn page(&self) -> &HandoffPage {
+        // SAFETY: mapped by `new` and unmapped only by `drop`.
+        unsafe { &*self.page }
+    }
+
+    /// Take the listener the child `pid` installed: wait for it to publish
+    /// the descriptor, copy it out with `pidfd_getfd(2)`, and release the
+    /// child to go on to its exec.
+    ///
+    /// `None` when the child ends without a listener — an earlier hook
+    /// failed, or the install did — which the exec-status pipe says more
+    /// about. On an error the child, which would spin forever waiting for
+    /// this, is `SIGKILL`ed; the caller still reaps it.
+    pub fn take(&self, pid: libc::pid_t) -> io::Result<Option<Listener>> {
+        let taken = self.take_inner(pid);
+        if taken.is_err() {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        taken
+    }
+
+    fn take_inner(&self, pid: libc::pid_t) -> io::Result<Option<Listener>> {
+        let page = self.page();
+        // A pidfd both names the child for `pidfd_getfd` and, by polling
+        // readable once it exits, says when it ended without publishing.
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if pidfd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as libc::c_int) };
+        loop {
+            match page.slot.load(Ordering::Acquire) {
+                FAILED => return Ok(None),
+                PENDING => {
+                    let mut pfd = libc::pollfd {
+                        fd: pidfd.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    // The install takes microseconds; a millisecond's wait
+                    // keeps this from spinning beside a child that does.
+                    if unsafe { libc::poll(&mut pfd, 1, 1) } < 0 {
+                        let err = io::Error::last_os_error();
+                        if err.kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                    // Exited: unless it published on its way, nothing comes.
+                    if pfd.revents != 0 && page.slot.load(Ordering::Acquire) == PENDING {
+                        return Ok(None);
+                    }
                 }
-                return Err(err);
+                child_fd => {
+                    // The copy is close-on-exec, as `pidfd_getfd` makes it.
+                    let fd = unsafe {
+                        libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), child_fd, 0)
+                    };
+                    if fd < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    page.taken.store(1, Ordering::Release);
+                    return Ok(Some(Listener {
+                        fd: unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) },
+                        log: SyscallLog::default(),
+                        dead: false,
+                    }));
+                }
             }
-            break n;
-        };
-        if n == 0 {
-            return Ok(None);
         }
-        let cmsg = libc::CMSG_FIRSTHDR(&msg);
-        if cmsg.is_null()
-            || (*cmsg).cmsg_level != libc::SOL_SOCKET
-            || (*cmsg).cmsg_type != libc::SCM_RIGHTS
-        {
-            return Err(io::Error::other("no descriptor in the message"));
+    }
+}
+
+impl Drop for Handoff {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.page.cast(), std::mem::size_of::<HandoffPage>());
         }
-        let fd = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>());
-        Ok(Some(Listener {
-            fd: OwnedFd::from_raw_fd(fd),
-            log: SyscallLog::default(),
-            dead: false,
-        }))
     }
 }
 
@@ -335,37 +426,20 @@ impl Listener {
     }
 }
 
-/// A `SOCK_STREAM` socketpair, both ends close-on-exec: the child's end
-/// rides through the fork and is closed by the exec, the parent's end is
-/// read with [`receive`].
-pub fn socketpair() -> io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [0 as libc::c_int; 2];
-    if unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-            0,
-            fds.as_mut_ptr(),
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
-}
-
 /// Does the whole round trip work here — install, notify, `CONTINUE`?
 ///
 /// A child installs a filter watching `getppid`, calls it, and exits 0 only
 /// if the call still returned its parent's pid; the parent answers the one
 /// notification. Anything short of that — `seccomp(2)` refusing the
-/// listener flag, `CONTINUE` refused (Linux before 5.5), the child never
-/// reporting — is the error, which says which.
+/// listener flag, `pidfd_getfd` missing (Linux before 5.6) or refused (a
+/// Yama `ptrace_scope` that bars it), `CONTINUE` refused (Linux before 5.5),
+/// the child never reporting — is the error, which says which.
 pub fn probe() -> Result<(), String> {
     let Some(filter) = Filter::watching(&[Sysno::getppid]) else {
         return Err("no filter for this architecture".to_string());
     };
-    let (parent_end, child_end) = socketpair().map_err(|e| format!("socketpair: {e}"))?;
+    let handoff = Handoff::new().map_err(|e| format!("mapping the handoff page: {e}"))?;
+    let end = handoff.child_end();
     let me = unsafe { libc::getpid() };
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -373,14 +447,13 @@ pub fn probe() -> Result<(), String> {
     }
     if pid == 0 {
         unsafe {
-            let code = match filter.install_and_send(child_end.as_raw_fd()) {
+            let code = match filter.install_and_hand_off(end) {
                 Ok(()) => i32::from(libc::getppid() != me),
                 Err(e) => 100 + e.raw_os_error().unwrap_or(0).clamp(0, 100),
             };
             libc::_exit(code);
         }
     }
-    drop(child_end);
     let exit_code = |status: libc::c_int| -> Result<(), String> {
         if !libc::WIFEXITED(status) {
             return Err("the child was killed".to_string());
@@ -396,13 +469,17 @@ pub fn probe() -> Result<(), String> {
     };
     (|| -> Result<(), String> {
         let mut status = 0;
-        let Some(mut listener) =
-            receive(&parent_end).map_err(|e| format!("receiving the listener: {e}"))?
+        let taken = handoff.take(pid);
+        let Some(mut listener) = taken.map_err(|e| {
+            // `take` killed the child, which is still ours to reap.
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+            format!("taking the listener (pidfd_getfd): {e}")
+        })?
         else {
-            // Nothing sent: the install failed, and the exit code says why.
+            // Nothing published: the install failed, and the exit code says why.
             unsafe { libc::waitpid(pid, &mut status, 0) };
             exit_code(status)?;
-            return Err("the child sent no listener".to_string());
+            return Err("the child installed no listener".to_string());
         };
         // The one `getppid`, then the exit: wait for either.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -457,46 +534,84 @@ mod tests {
         }
     }
 
-    /// The spawn path the runner uses, with `execve` itself watched: the
-    /// child's exec is the first notification, and the parent has to be
-    /// answering while it waits for the exec to go through. Run without an
-    /// overlay so it exercises the deadlock wherever the tests run.
-    #[test]
-    fn an_exec_under_a_filter_watching_execve_goes_through() {
-        if let Err(why) = probe() {
-            eprintln!("skipping: seccomp user notification unavailable: {why}");
-            return;
-        }
+    /// Spawn `sh -c true` the way the runner does, under a filter watching
+    /// `watched`, and return what the listener heard. The parent has to be
+    /// answering while it waits for the exec to go through: the exec may be
+    /// a watched syscall itself.
+    fn exec_under(watched: &[Sysno]) -> SyscallLog {
         let tmp = tempfile::TempDir::new().unwrap();
         let out = std::fs::File::create(tmp.path().join("out")).unwrap();
         let err = std::fs::File::create(tmp.path().join("err")).unwrap();
-        let filter = Filter::watching(&[Sysno::execve, Sysno::getppid]).unwrap();
-        let (parent_end, child_end) = socketpair().unwrap();
-        let child_fd = child_end.as_raw_fd();
+        let filter = Filter::watching(watched).unwrap();
+        let handoff = Handoff::new().unwrap();
+        let end = handoff.child_end();
         let mut spawn =
             crate::spawn::Spawn::new("/bin/sh", &["sh", "-c", "true"], out, err).unwrap();
-        spawn.hook(move || {
-            let _keep = &child_end;
-            unsafe { filter.install_and_send(child_fd) }
-        });
+        spawn.hook(move || unsafe { filter.install_and_hand_off(end) });
         let spawning = spawn.start().unwrap();
-        let mut listener = receive(&parent_end).unwrap().expect("a listener");
+        let mut listener = handoff.take(spawning.pid()).unwrap().expect("a listener");
         let fd = listener.poll_fd().unwrap();
         let mut child = spawning
             .wait_exec(&[fd], |_| listener.service())
             .expect("the exec went through");
         loop {
             listener.service();
-            if child.try_wait().unwrap().is_some() {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "{status:?}");
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        let log = listener.into_log();
+        listener.into_log()
+    }
+
+    /// The spawn path the runner uses, with `execve` itself watched: the
+    /// child's exec is the first notification. Run without an overlay so it
+    /// exercises the deadlock wherever the tests run.
+    #[test]
+    fn an_exec_under_a_filter_watching_execve_goes_through() {
+        if let Err(why) = probe() {
+            eprintln!("skipping: seccomp user notification unavailable: {why}");
+            return;
+        }
+        let log = exec_under(&[Sysno::execve, Sysno::getppid]);
         assert!(
             log.counts.get(&Sysno::execve).is_some_and(|&n| n >= 1),
             "{log:?}"
         );
+    }
+
+    /// Every syscall watched — what an `in` set comes close to: whatever the
+    /// child does between the install and the exec is held for an answer,
+    /// so handing the listener over must not take a syscall. When it was
+    /// sent over a socket, the `sendmsg` carrying it waited on itself.
+    #[test]
+    fn an_exec_under_a_filter_watching_everything_goes_through() {
+        if let Err(why) = probe() {
+            eprintln!("skipping: seccomp user notification unavailable: {why}");
+            return;
+        }
+        let all: Vec<Sysno> = Sysno::iter().collect();
+        let log = exec_under(&all);
+        assert!(
+            log.counts.get(&Sysno::execve).is_some_and(|&n| n >= 1),
+            "{log:?}"
+        );
+    }
+
+    /// A child that ends before installing anything (an earlier hook failed)
+    /// leaves nothing to take, rather than a parent waiting forever.
+    #[test]
+    fn take_returns_none_when_the_child_never_publishes() {
+        let handoff = Handoff::new().unwrap();
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            unsafe { libc::_exit(3) };
+        }
+        assert!(handoff.take(pid).unwrap().is_none());
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 3);
     }
 
     /// The round trip on this kernel, when it has it. The probe is also what
@@ -508,11 +623,12 @@ mod tests {
             return;
         }
         let filter = Filter::watching(&[Sysno::getpid, Sysno::getppid]).unwrap();
-        let (parent_end, child_end) = socketpair().unwrap();
+        let handoff = Handoff::new().unwrap();
+        let end = handoff.child_end();
         let pid = unsafe { libc::fork() };
         if pid == 0 {
             unsafe {
-                if filter.install_and_send(child_end.as_raw_fd()).is_err() {
+                if filter.install_and_hand_off(end).is_err() {
                     libc::_exit(2);
                 }
                 libc::getpid();
@@ -521,8 +637,7 @@ mod tests {
                 libc::_exit(0);
             }
         }
-        drop(child_end);
-        let mut listener = receive(&parent_end).unwrap().unwrap();
+        let mut listener = handoff.take(pid).unwrap().unwrap();
         let mut status = 0;
         loop {
             listener.service();

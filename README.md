@@ -196,7 +196,7 @@ report says what was made — `made socket, connect` — and `--json` carries th
 full count of every watched syscall under `syscalls`. Nothing is blocked:
 the test runs exactly as it would have, and is judged afterwards.
 
-The watching is done with seccomp user notification, which needs Linux 5.5;
+The watching is done with seccomp user notification, which needs Linux 5.6;
 on an older kernel these conditions go unchecked, with a warning like an
 unmeasured `cpu`. Only the syscalls a condition names (or, for an allow-list,
 everything it doesn't) cost anything — each one is a round trip through

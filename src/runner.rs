@@ -987,31 +987,40 @@ fn spawn_test<'a>(
 
     // Last of all, so that attest's own mounts are not in the count: the
     // seccomp filter for a test that asserts on its syscalls, where this
-    // kernel can answer one. The listener comes back over a socketpair
-    // before the exec, which is why the spawn is then waited for with the
-    // listener in hand — the exec itself may be the first syscall notified.
+    // kernel can answer one. The child installs it and waits, without a
+    // syscall, for this side to take the listener out of it (see
+    // `seccomp::Handoff`); the spawn is then waited for with the listener in
+    // hand, since the exec itself may be the first syscall notified.
     let watched = watched_syscalls(spec.file.conditions_of(spec.name));
     let filter = env
         .seccomp
         .then(|| seccomp::Filter::watching(&watched))
         .flatten();
-    let listener_sock = match filter {
+    let handoff = match filter {
         Some(filter) => {
-            let (parent_end, child_end) = seccomp::socketpair()?;
-            let child_fd = child_end.as_raw_fd();
-            spawn.hook(move || {
-                let _keep = &child_end; // closed by the exec, or at _exit
-                unsafe { filter.install_and_send(child_fd) }
-            });
-            Some(parent_end)
+            let handoff = seccomp::Handoff::new()?;
+            let end = handoff.child_end();
+            spawn.hook(move || unsafe { filter.install_and_hand_off(end) });
+            Some(handoff)
         }
         None => None,
     };
 
     let start = Instant::now();
     let spawning = spawn.start()?;
-    let mut listener = match &listener_sock {
-        Some(sock) => seccomp::receive(sock)?,
+    let mut listener = match &handoff {
+        Some(handoff) => match handoff.take(spawning.pid()) {
+            Ok(listener) => listener,
+            Err(e) => {
+                // `take` killed the child, which waited on it; reap it.
+                if let Ok(mut child) = spawning.wait_exec(&[], |_| {}) {
+                    let _ = child.wait();
+                }
+                return Err(anyhow!(
+                    "spawn failed for {display_name}: taking the seccomp listener: {e}"
+                ));
+            }
+        },
         None => None,
     };
     let fds: Vec<RawFd> = listener.iter().filter_map(|l| l.poll_fd()).collect();
@@ -1174,7 +1183,7 @@ fn warn_unmeasured(measure: decorator::Measure) {
         Measure::Metric(_) => {
             " (cgroup v2 unavailable, --no-cgroups, or the controller is not enabled; -d says which)"
         }
-        Measure::Syscalls => " (seccomp user notification needs Linux 5.5 or later; -d says why)",
+        Measure::Syscalls => " (seccomp user notification needs Linux 5.6 or later; -d says why)",
     };
     errln!(
         "warning: `{}` conditions are not checked: {} did not report it{hint}",
@@ -1652,9 +1661,16 @@ mod tests {
     }
 
     /// Block until `pending` finishes, reaping it exactly the way the poll
-    /// loop in `run_all_tests` does so tests exercise that path.
+    /// loop in `run_all_tests` does so tests exercise that path — answering
+    /// its seccomp listener meanwhile, as that loop's `ChildWaiter::wait`
+    /// does: a test with a `syscalls` condition is stopped in its first
+    /// watched syscall until the notification is answered, so without this
+    /// it never exits.
     fn reap_blocking(pending: &mut PendingTest) -> ExitStatus {
         loop {
+            if let Some(listener) = pending.listener.as_mut() {
+                listener.service();
+            }
             if let Some(status) = pending.reap().expect("reap failed") {
                 return status;
             }

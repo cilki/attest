@@ -121,6 +121,12 @@ pub struct Spawning {
 }
 
 impl Spawning {
+    /// The child's pid, for what the parent does with it before the exec
+    /// (taking its seccomp listener). Unreaped until [`Self::wait_exec`].
+    pub fn pid(&self) -> libc::pid_t {
+        self.child.pid
+    }
+
     /// Wait for the child to exec — or to fail before it does, in which case
     /// the child is reaped and its hook's error returned.
     ///
