@@ -1834,7 +1834,7 @@ mod tests {
     /// A `syscalls` condition is checked against what the seccomp listener
     /// heard from the whole tree, the shell included: the runner script's own
     /// `cd` is a `chdir` the shell makes, so forbidding it is a violation
-    /// every run commits, and `mknod` is one no shell makes.
+    /// every run commits, and `mknodat` is one no shell makes.
     #[test]
     fn a_syscalls_condition_is_checked_against_what_was_heard() {
         if !seccomp::probe().is_ok() {
@@ -1842,7 +1842,7 @@ mod tests {
             return;
         }
         let Some(r) = run_inline(
-            "#attest(syscalls not in {chdir, mknod})\ntest_x() {\n  true\n}\n",
+            "#attest(syscalls not in {chdir, mknodat})\ntest_x() {\n  true\n}\n",
             "test_x",
         ) else {
             return;
@@ -1856,10 +1856,10 @@ mod tests {
                 .get(&decorator::Sysno::chdir)
                 .is_some_and(|&n| n >= 1)
         );
-        assert!(!log.counts.contains_key(&decorator::Sysno::mknod));
+        assert!(!log.counts.contains_key(&decorator::Sysno::mknodat));
 
         let Some(r) = run_inline(
-            "#attest(syscalls not in {mknod})\ntest_x() {\n  true\n}\n",
+            "#attest(syscalls not in {mknodat})\ntest_x() {\n  true\n}\n",
             "test_x",
         ) else {
             return;
