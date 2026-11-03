@@ -35,7 +35,8 @@ struct BracketExpr {
 /// them, from the parse rather than reading the file back means they come from
 /// the one text the test actually ran: no second read, no second shell parse
 /// per failure, and no way for the file to have changed in between.
-pub fn print_failure_snippet(result: &TestResult, file: &TestFile) {
+pub fn print_failure_snippet(result: &TestResult) {
+    let file = result.file;
     let Some(failure) = parse_xtrace_failure(&result.context, file) else {
         return;
     };
@@ -87,7 +88,8 @@ pub fn print_failure_snippet(result: &TestResult, file: &TestFile) {
 /// lines, see `parser::build_functions_source`), and the number that broke it,
 /// which is the snippet's label. The window runs from the condition down to
 /// the end of the function it decorates, so the test's name is in view too.
-pub fn print_violations(result: &TestResult, file: &TestFile) {
+pub fn print_violations(result: &TestResult) {
+    let file = result.file;
     let lines: Vec<&str> = file.script.lines().collect();
     for violation in &result.violations {
         let line_idx = violation.line - 1;

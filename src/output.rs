@@ -660,7 +660,7 @@ fn resource_stats_json(stats: Option<&crate::cgroup::ResourceStats>) -> Value {
 /// Serialized straight to the output stream rather than built up as a
 /// [`Value`]: three of its fields are whole logs, and a log is as big as the
 /// test that wrote it chose to make it (see [`LogField`]).
-struct TestResultJson<'a>(&'a TestResult);
+struct TestResultJson<'a>(&'a TestResult<'a>);
 
 impl serde::Serialize for TestResultJson<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -940,10 +940,11 @@ mod tests {
     }
 
     /// A finished test whose logs live in `context`.
-    fn result_in(context: &Path, name: &str) -> TestResult {
+    fn result_in<'a>(context: &Path, name: &'a str) -> TestResult<'a> {
         TestResult {
             name: name.to_string(),
-            test: name.to_string(),
+            test: name,
+            file: crate::parser::TestFile::empty(),
             outcome: Outcome::Timeout,
             duration: Duration::from_millis(1500),
             context: context.to_path_buf(),

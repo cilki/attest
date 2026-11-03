@@ -18,7 +18,7 @@
 //! With `--repeat`, the samples of one condition are folded first — an upper
 //! bound from the largest, a lower from the smallest.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::decorator::{Bound, Detail, Metric, Sample, Unit};
@@ -213,20 +213,21 @@ pub fn plan_updates(results: &[TestResult]) -> Vec<Edit> {
 /// The edits `--add-decorators` makes: a block above every test that has
 /// none, with a condition for each of [`Metric::GENERATED`] the run measured.
 ///
-/// `files` is every parsed file of the run, keyed by the canonical path the
-/// results report. A test is skipped if any run of it failed (its numbers are
+/// A test is skipped if any run of it failed (its numbers are
 /// not those of a complete run), if the parser gave it no line, if it has a
 /// block already, or if nothing was measured.
-pub fn plan_additions(results: &[TestResult], files: &HashMap<PathBuf, &TestFile>) -> Vec<Edit> {
+pub fn plan_additions(results: &[TestResult]) -> Vec<Edit> {
     let mut unmeasured = 0usize;
-    struct Measured {
+    struct Measured<'a> {
+        file: &'a TestFile,
         samples: [Vec<u64>; Metric::GENERATED.len()],
         complete: bool,
     }
-    let mut by_test: BTreeMap<(PathBuf, String), Measured> = BTreeMap::new();
+    let mut by_test: BTreeMap<(PathBuf, &str), Measured> = BTreeMap::new();
     for result in results {
-        let key = (result.source_path.clone(), result.test.clone());
+        let key = (result.source_path.clone(), result.test);
         let entry = by_test.entry(key).or_insert_with(|| Measured {
+            file: result.file,
             samples: Default::default(),
             complete: true,
         });
@@ -255,13 +256,11 @@ pub fn plan_additions(results: &[TestResult], files: &HashMap<PathBuf, &TestFile
         if !measured.complete {
             continue;
         }
-        let Some(file) = files.get(&path) else {
-            continue;
-        };
-        if file.has_decorator(&test) {
+        let file = measured.file;
+        if file.has_decorator(test) {
             continue;
         }
-        let Some(&line) = file.test_lines.get(&test) else {
+        let Some(&line) = file.test_lines.get(test) else {
             continue;
         };
         let conditions: Vec<String> = Metric::GENERATED
@@ -567,7 +566,13 @@ mod tests {
     /// A passed result for `test` in `path` with one violation of `condition`
     /// (`cpu < 10ms` style, the literal being the last token) that measured
     /// `measured`.
-    fn violated(path: &str, test: &str, line: usize, condition: &str, measured: u64) -> TestResult {
+    fn violated<'a>(
+        file: &'a TestFile,
+        test: &'a str,
+        line: usize,
+        condition: &str,
+        measured: u64,
+    ) -> TestResult<'a> {
         let lit = condition.rsplit(' ').next().unwrap();
         let col = 9; // after `# attest(`
         let lit_start = col + condition.len() - lit.len();
@@ -587,7 +592,7 @@ mod tests {
                 _ => unreachable!(),
             })
             .unwrap();
-        let mut r = result(path, test);
+        let mut r = result(file, test);
         r.violations.push(Violation {
             line,
             span: col..col + condition.len(),
@@ -613,14 +618,15 @@ mod tests {
         r
     }
 
-    fn result(path: &str, test: &str) -> TestResult {
+    fn result<'a>(file: &'a TestFile, test: &'a str) -> TestResult<'a> {
         TestResult {
             name: test.to_string(),
-            test: test.to_string(),
+            test,
+            file,
             outcome: Outcome::Pass,
             duration: Duration::from_millis(1),
             context: PathBuf::from("/nonexistent"),
-            source_path: PathBuf::from(path),
+            source_path: file.path.clone(),
             resources: None,
             syscalls: None,
             violations: Vec::new(),
@@ -629,10 +635,14 @@ mod tests {
 
     #[test]
     fn updates_fold_repeats_and_replace_only_the_literal() {
+        let tf = TestFile {
+            path: "a.test".into(),
+            ..Default::default()
+        };
         let results = vec![
-            violated("a.test", "test_x", 3, "cpu < 10ms", 12_200),
-            violated("a.test", "test_x", 3, "cpu < 10ms", 14_000),
-            violated("a.test", "test_x", 3, "cpu < 10ms", 11_000),
+            violated(&tf, "test_x", 3, "cpu < 10ms", 12_200),
+            violated(&tf, "test_x", 3, "cpu < 10ms", 14_000),
+            violated(&tf, "test_x", 3, "cpu < 10ms", 11_000),
         ];
         let edits = plan_updates(&results);
         assert_eq!(edits.len(), 1);
@@ -768,24 +778,20 @@ mod tests {
         assert_eq!(lines, [1, 5, 10]);
     }
 
-    fn parsed(dir: &Path, name: &str, source: &str) -> (PathBuf, TestFile) {
+    fn parsed(dir: &Path, name: &str, source: &str) -> TestFile {
         let path = dir.join(name);
         std::fs::write(&path, source).unwrap();
-        let tf = crate::parser::parse_test_file(&path, &crate::parser::Prescan::default()).unwrap();
-        (path, tf)
+        crate::parser::parse_test_file(&path, &crate::parser::Prescan::default()).unwrap()
     }
 
     #[test]
     fn additions_cover_tests_without_a_block_from_what_was_measured() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let (path, tf) = parsed(
+        let tf = parsed(
             tmp.path(),
             "a.test",
             "#!/bin/sh\n\n# attest(cpu < 10ms)\ntest_has() {\n\ttrue\n}\n\n## documented\ntest_none() {\n\ttrue\n}\n\ntest_failed() {\n\tfalse\n}\n\ntest_unmeasured() {\n\ttrue\n}\n",
         );
-        let files: HashMap<PathBuf, &TestFile> = [(path.clone(), &tf)].into_iter().collect();
-        let p = path.to_str().unwrap();
-
         let stats = ResourceStats {
             cpu_user_usec: Some(8_000),
             cpu_system_usec: Some(4_000),
@@ -793,8 +799,8 @@ mod tests {
             pids_peak: Some(4),
             ..Default::default()
         };
-        let with = |test: &str, pids: u64| {
-            let mut r = result(p, test);
+        let with = |test: &'static str, pids: u64| {
+            let mut r = result(&tf, test);
             r.resources = Some(ResourceStats {
                 pids_peak: Some(pids),
                 ..stats.clone()
@@ -808,9 +814,9 @@ mod tests {
             with("test_none", 4),
             with("test_none", 6),
             failed,
-            result(p, "test_unmeasured"),
+            result(&tf, "test_unmeasured"),
         ];
-        let edits = plan_additions(&results, &files);
+        let edits = plan_additions(&results);
         assert_eq!(edits.len(), 1, "{edits:?}");
         assert_eq!(
             edits[0].kind,
@@ -828,12 +834,11 @@ mod tests {
     #[test]
     fn an_added_block_parses_back_onto_its_test() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let (path, tf) = parsed(
+        let tf = parsed(
             tmp.path(),
             "a.test",
             "#!/bin/sh\n\n## documented\ntest_a() {\n\ttrue\n}\n\nif true; then\n  test_b() {\n    true\n  }\nfi\n",
         );
-        let files: HashMap<PathBuf, &TestFile> = [(path.clone(), &tf)].into_iter().collect();
         let stats = ResourceStats {
             cpu_user_usec: Some(1_000),
             cpu_system_usec: Some(1_000),
@@ -843,12 +848,12 @@ mod tests {
         let results: Vec<TestResult> = ["test_a", "test_b"]
             .into_iter()
             .map(|t| {
-                let mut r = result(path.to_str().unwrap(), t);
+                let mut r = result(&tf, t);
                 r.resources = Some(stats.clone());
                 r
             })
             .collect();
-        let edits = plan_additions(&results, &files);
+        let edits = plan_additions(&results);
         assert_eq!(edits.len(), 2);
         let applied = apply(edits);
         assert_eq!(applied.len(), 2);
@@ -857,13 +862,13 @@ mod tests {
         // rather than over it: the line above a definition is known to be
         // the definition's, while a comment further up may belong to
         // whatever came before.
-        let after = std::fs::read_to_string(&path).unwrap();
+        let after = std::fs::read_to_string(&tf.path).unwrap();
         assert_eq!(
             after,
             "#!/bin/sh\n\n## documented\n# attest(cpu < 2.5ms, pids <= 2)\ntest_a() {\n\ttrue\n}\n\nif true; then\n  # attest(cpu < 2.5ms, pids <= 2)\n  test_b() {\n    true\n  }\nfi\n"
         );
         let reparsed =
-            crate::parser::parse_test_file(&path, &crate::parser::Prescan::default()).unwrap();
+            crate::parser::parse_test_file(&tf.path, &crate::parser::Prescan::default()).unwrap();
         for test in ["test_a", "test_b"] {
             let texts: Vec<&str> = reparsed
                 .conditions_of(test)
@@ -876,14 +881,13 @@ mod tests {
     #[test]
     fn additions_skip_metrics_the_run_did_not_measure() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let (path, tf) = parsed(tmp.path(), "a.test", "test_x() {\n\ttrue\n}\n");
-        let files: HashMap<PathBuf, &TestFile> = [(path.clone(), &tf)].into_iter().collect();
-        let mut r = result(path.to_str().unwrap(), "test_x");
+        let tf = parsed(tmp.path(), "a.test", "test_x() {\n\ttrue\n}\n");
+        let mut r = result(&tf, "test_x");
         r.resources = Some(ResourceStats {
             pids_peak: Some(2),
             ..Default::default()
         });
-        let edits = plan_additions(&[r], &files);
+        let edits = plan_additions(&[r]);
         assert_eq!(edits.len(), 1);
         assert_eq!(
             edits[0].kind,

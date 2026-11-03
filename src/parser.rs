@@ -12,6 +12,7 @@ use tracing::warn;
 use crate::decorator::{self, Decorator};
 
 /// File containing tests.
+#[cfg_attr(test, derive(Default))]
 pub struct TestFile {
     /// The file this was parsed from. Every test in it shares it, so it is kept
     /// here rather than repeated per test.
@@ -62,6 +63,14 @@ pub struct TestFile {
 }
 
 impl TestFile {
+    /// A file with nothing in it, for a unit test that needs a result but not
+    /// the parse behind it.
+    #[cfg(test)]
+    pub fn empty() -> &'static TestFile {
+        static EMPTY: std::sync::LazyLock<TestFile> = std::sync::LazyLock::new(TestFile::default);
+        &EMPTY
+    }
+
     /// Does `test` have an `#attest(...)` block above it?
     pub fn has_decorator(&self, test: &str) -> bool {
         self.decorators.iter().any(|(name, _)| name == test)

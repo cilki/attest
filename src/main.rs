@@ -713,14 +713,7 @@ fn main() -> anyhow::Result<()> {
                     edits.extend(decorate::plan_updates(&results));
                 }
                 if cli.add_decorators {
-                    // Results name files by canonical path (the runner
-                    // resolves them for `$0`), so key the parses the same way.
-                    let files: std::collections::HashMap<PathBuf, &parser::TestFile> = selection
-                        .files
-                        .iter()
-                        .map(|f| (f.path.canonicalize().unwrap_or_else(|_| f.path.clone()), f))
-                        .collect();
-                    edits.extend(decorate::plan_additions(&results, &files));
+                    edits.extend(decorate::plan_additions(&results));
                 }
                 let applied = decorate::apply(edits);
                 decorate::print_summary(&applied, cli.json);

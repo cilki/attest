@@ -313,11 +313,15 @@ impl Outcome {
     }
 }
 
-pub struct TestResult {
+pub struct TestResult<'a> {
     pub name: String,
     /// The shell function's name as written in the file — what `name` is
     /// derived from, and what the file's decorators are keyed by.
-    pub test: String,
+    pub test: &'a str,
+    /// The parse the test was run from: the failure report renders its
+    /// snippet out of the script this holds, and `--add-decorators` finds the
+    /// test's definition line and existing blocks in it.
+    pub file: &'a crate::parser::TestFile,
     pub outcome: Outcome,
     pub duration: Duration,
     pub context: PathBuf,
@@ -337,7 +341,7 @@ pub struct TestResult {
     pub violations: Vec<crate::decorator::Violation>,
 }
 
-impl TestResult {
+impl TestResult<'_> {
     /// Did every command of the test succeed, whatever its decorators said?
     /// Decides whether the failure report replays the trace and blames a
     /// command — both of which would mislead for a test that failed only
@@ -533,7 +537,10 @@ pub struct TestSpec<'a> {
     pub file: &'a crate::parser::TestFile,
 }
 
-pub fn run_all_tests<'a>(tests: Vec<TestSpec<'a>>, config: &RunConfig) -> Result<Vec<TestResult>> {
+pub fn run_all_tests<'a>(
+    tests: Vec<TestSpec<'a>>,
+    config: &RunConfig,
+) -> Result<Vec<TestResult<'a>>> {
     // First thing in the run: the block has to be in place before any thread
     // that could take a `SIGCHLD` delivery instead of leaving it pending — the
     // status bar's ticker, below, is one (see `ChildWaiter`).
@@ -664,9 +671,8 @@ pub fn run_all_tests<'a>(tests: Vec<TestSpec<'a>>, config: &RunConfig) -> Result
 
         // Non-blocking reap: walk the pending list, taking out whatever has
         // finished. `i` only advances past tests that are still running, so a
-        // removal leaves it pointing at the next candidate. Each result keeps
-        // the parse it ran from alongside, for the failure report.
-        let mut completed: Vec<(TestResult, &crate::parser::TestFile)> = Vec::new();
+        // removal leaves it pointing at the next candidate.
+        let mut completed: Vec<TestResult<'a>> = Vec::new();
         let mut i = 0;
         while i < pending_list.len() {
             let exit_status = match pending_list[i].reap() {
@@ -685,12 +691,11 @@ pub fn run_all_tests<'a>(tests: Vec<TestSpec<'a>>, config: &RunConfig) -> Result
                 }
                 continue; // Drop kills + cleans up
             }
-            let file = pending.file;
             let result = build_result(pending, exit_status, config, &env);
             if let Some(ref save_dir) = config.save_context {
                 save_test_context(&result, save_dir, &env.submounts);
             }
-            completed.push((result, file));
+            completed.push(result);
         }
 
         // Print results and start new tests.
@@ -699,11 +704,11 @@ pub fn run_all_tests<'a>(tests: Vec<TestSpec<'a>>, config: &RunConfig) -> Result
         // and the start of its trace are already on the terminal, so the rest
         // of it has to follow them before any other test's trace is dumped.
         let holder = tailed.as_ref().map(|t| t.name.as_str());
-        completed.sort_by(|(a, _), (b, _)| {
+        completed.sort_by(|a, b| {
             (Some(a.name.as_str()) != holder, &a.name)
                 .cmp(&(Some(b.name.as_str()) != holder, &b.name))
         });
-        for (result, file) in completed {
+        for result in completed {
             if config.verbose >= 2 {
                 status.suspend(|| finish_xtrace(&mut tailed, &result.name, &result.context));
             }
@@ -719,13 +724,13 @@ pub fn run_all_tests<'a>(tests: Vec<TestSpec<'a>>, config: &RunConfig) -> Result
                         // Every command ran and returned zero; the trace has
                         // no failure in it to replay, and the last command
                         // is not to blame. The condition is.
-                        status.suspend(|| crate::diagnostics::print_violations(&result, file));
+                        status.suspend(|| crate::diagnostics::print_violations(&result));
                     } else {
                         // At -vv the streamer already showed this test's xtrace.
                         if config.verbose < 2 {
                             status.suspend(|| dump_xtrace_log(&result.name, &result.context));
                         }
-                        status.suspend(|| crate::diagnostics::print_failure_snippet(&result, file));
+                        status.suspend(|| crate::diagnostics::print_failure_snippet(&result));
                     }
                 }
             }
@@ -1064,12 +1069,12 @@ fn spawn_test<'a>(
 
 /// Build a `TestResult` from a `PendingTest` whose child has already exited
 /// with the given status.
-fn build_result(
-    mut pending: PendingTest,
+fn build_result<'a>(
+    mut pending: PendingTest<'a>,
     status: ExitStatus,
     config: &RunConfig,
     env: &RunEnv,
-) -> TestResult {
+) -> TestResult<'a> {
     let duration = pending.start.elapsed();
     let mut outcome = if pending.timed_out {
         Outcome::Timeout
@@ -1132,7 +1137,8 @@ fn build_result(
 
     TestResult {
         name: pending.name.clone(),
-        test: pending.test.to_string(),
+        test: pending.test,
+        file: pending.file,
         outcome,
         duration,
         context: pending.context.take().unwrap(),
@@ -1682,14 +1688,14 @@ mod tests {
     ///
     /// Derefs to the result, so a caller reads `.outcome`/`.context` as before.
     struct Finished {
-        result: TestResult,
+        result: TestResult<'static>,
         _context: TempDir,
     }
 
     impl std::ops::Deref for Finished {
-        type Target = TestResult;
+        type Target = TestResult<'static>;
 
-        fn deref(&self) -> &TestResult {
+        fn deref(&self) -> &TestResult<'static> {
             &self.result
         }
     }
@@ -1704,10 +1710,13 @@ mod tests {
         config: &RunConfig,
     ) -> Option<Finished> {
         let env = overlay_env(srcdir)?;
-        let tf = parse_script(srcdir, script);
+        // Leaked so the result can borrow it past this frame, as a real run's
+        // results borrow the selection's parses.
+        let tf: &'static _ = Box::leak(Box::new(parse_script(srcdir, script)));
+        let test_name: &'static str = Box::leak(test_name.into());
         let ctx = private_temp_dir().unwrap();
         let mut pending = spawn_test(
-            &spec(&tf, test_name, test_name),
+            &spec(tf, test_name, test_name),
             ctx.path().to_path_buf(),
             config,
             &env,
@@ -1728,10 +1737,11 @@ mod tests {
     /// A finished test named `name` whose context dir is `context`. Neither
     /// the outcome nor the source path matters to the code that reads a
     /// context back out, which is what this stands in for.
-    fn result_in(context: PathBuf, name: &str) -> TestResult {
+    fn result_in(context: PathBuf, name: &str) -> TestResult<'_> {
         TestResult {
             name: name.to_string(),
-            test: name.to_string(),
+            test: name,
+            file: crate::parser::TestFile::empty(),
             outcome: Outcome::Fail,
             duration: Duration::from_millis(1),
             context,
@@ -2669,9 +2679,10 @@ mod tests {
             assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0);
         }
 
-        let result = result_in(ctx, "test_wedge");
+        let mut result = result_in(ctx, "test_wedge");
         let srcdir = TempDir::new().unwrap();
         let tf = parse_script(srcdir.path(), "test_wedge() {\n  false\n}\n");
+        result.file = Box::leak(Box::new(tf));
 
         // Every place a finished test's logs are read back, on a deadline: a
         // regression is a hang rather than a failed assertion, so the test has
@@ -2681,7 +2692,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             dump_xtrace_log(&result.name, result.context.as_path());
-            crate::diagnostics::print_failure_snippet(&result, &tf);
+            crate::diagnostics::print_failure_snippet(&result);
             output::print_test_result_json(&result);
             save_test_context(&result, &save_dir, &[]);
             let _ = tx.send(());

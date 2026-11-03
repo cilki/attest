@@ -262,7 +262,10 @@
   `RunConfig::update_decorators` a violation is recorded but the outcome
   stays `Pass` — the run exists to find the right bounds. `TestResult::test`
   is the function's name as written (the display name may be qualified and
-  numbered), which is what `decorate` keys additions by.
+  numbered), which is what `decorate` keys additions by, and
+  `TestResult::file` is the parse it ran from — the failure report renders
+  its snippet out of it and `--add-decorators` finds the definition line in
+  it, so neither has to map a result back to its file by path.
   Every context lives under the run's one temp dir, which
   `private_temp_dir` creates mode `0700`: a context holds the test's working
   directory, every file it wrote in its ephemeral root, and an `xtrace.log`
