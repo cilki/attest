@@ -217,7 +217,7 @@ the test created counts as one write, whatever it put inside; the report
 names each offending path, `wrote /etc/motd (+3 more)` with the full list
 beneath the snippet.
 
-`hosts in {…}` parses but is not enforced yet, and is rejected as such.
+`hosts in {…}` is not enforced yet, and is rejected as such.
 
 A decorator that isn't directly above a test function (a blank line between
 the two, or a helper underneath it), a condition that doesn't parse, or a

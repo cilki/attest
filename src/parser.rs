@@ -502,7 +502,6 @@ fn attach_decorators(
 
     let mut attached = Vec::with_capacity(blocks.len());
     for block in blocks {
-        block.check_supported()?;
         keep.extend(block.lines());
         let mut line = block.last_line + 1;
         let name = loop {

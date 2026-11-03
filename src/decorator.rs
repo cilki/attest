@@ -28,8 +28,7 @@
 //! ```text
 //! condition := METRIC OP QTY | QTY OP METRIC | QTY OP METRIC OP QTY
 //!            | 'syscalls' ('in' | 'not in') set
-//! |          | 'hosts' 'in' set
-//! |          | 'writes' 'in' set
+//!            | 'writes' 'in' set
 //! METRIC    := cpu | wall | mem | io_read | io_write | pids
 //! OP        := '<' | '<=' | '>' | '>='
 //! QTY       := number ('.' number)? UNIT?
@@ -48,9 +47,8 @@
 //! `parser::parse_test_file`). Any mistake in a block is a parse error of the
 //! file, reported the way an unparseable script is: an assertion that
 //! silently did nothing would be worse than one that is loud about being
-//! malformed. The `syscalls`, `hosts` and `writes` forms are accepted by the
-//! grammar but not enforced yet, and so are rejected the same way
-//! ([`Decorator::check_supported`]) rather than being quietly ignored.
+//! malformed. The word `hosts` is reserved for a set form that nothing
+//! enforces yet, and is rejected the same way rather than quietly ignored.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -384,23 +382,12 @@ pub enum Kind {
     /// The set of system calls the test may (`allow`) or may not make. Every
     /// name was checked against this architecture's table at parse time.
     Syscalls { allow: bool, set: Vec<Sysno> },
-    /// The hosts the test may contact.
-    Hosts(Vec<String>),
     /// The paths the test may write under: each `/absolute` or `./relative`
     /// to the invocation dir, as written.
     Writes(Vec<String>),
 }
 
 impl Kind {
-    fn metric_name(&self) -> &'static str {
-        match self {
-            Kind::Quantity { metric, .. } => metric.name(),
-            Kind::Syscalls { .. } => "syscalls",
-            Kind::Hosts(_) => "hosts",
-            Kind::Writes(_) => "writes",
-        }
-    }
-
     /// The syscalls a run has to be watched for to check this condition:
     /// the set itself for a deny-list, and everything else for an allow-list.
     /// Empty for a condition that is not about syscalls.
@@ -551,8 +538,6 @@ impl Condition {
                     Detail::Set { offenders },
                 )
             }
-            // Not enforced yet; `check_supported` keeps these out of a parse.
-            Kind::Hosts(_) => Verdict::Ok,
         }
     }
 }
@@ -612,24 +597,6 @@ impl Decorator {
     /// lets a violation's snippet render them.
     pub fn lines(&self) -> std::ops::RangeInclusive<usize> {
         self.first_line..=self.last_line
-    }
-
-    /// Reject the forms the grammar accepts but no part of a run enforces
-    /// yet. An assertion that is written down and never checked is the one
-    /// thing a decorator must not be.
-    pub fn check_supported(&self) -> Result<(), Error> {
-        for c in &self.conditions {
-            if matches!(c.kind, Kind::Hosts(_)) {
-                return Err(Error {
-                    line: c.line,
-                    message: format!(
-                        "`{}` conditions are not supported yet",
-                        c.kind.metric_name()
-                    ),
-                });
-            }
-        }
-        Ok(())
     }
 }
 
@@ -848,7 +815,7 @@ fn parse_conditions(segments: &[Segment]) -> Result<Vec<Condition>, Error> {
 
 /// Parse one condition's text.
 fn parse_condition(text: &str) -> Result<Kind, String> {
-    // The set forms first: their items are raw text (host names, paths), not
+    // The set forms first: their items are raw text (syscall names, paths), not
     // tokens, so they are read by shape rather than lexed.
     if let Some(rest) = strip_word(text, "syscalls") {
         let (allow, rest) = if let Some(rest) = strip_word(rest, "not") {
@@ -871,10 +838,11 @@ fn parse_condition(text: &str) -> Result<Kind, String> {
             .collect::<Result<Vec<_>, _>>()?;
         return Ok(Kind::Syscalls { allow, set });
     }
-    if let Some(rest) = strip_word(text, "hosts") {
-        let rest =
-            strip_word(rest, "in").ok_or_else(|| "expected `in` after `hosts`".to_string())?;
-        return Ok(Kind::Hosts(parse_set(rest)?));
+    // Reserved for `hosts in {…}`, which nothing enforces yet: refused here,
+    // with the other grammar errors, rather than parsed into a condition no
+    // run would ever check.
+    if strip_word(text, "hosts").is_some() {
+        return Err("`hosts` conditions are not supported yet".to_string());
     }
     if let Some(rest) = strip_word(text, "writes") {
         let rest =
@@ -1523,7 +1491,7 @@ testX() {
     #[test]
     fn set_conditions_parse() {
         let d = one(
-            "#attest(syscalls not in {socket, connect}, hosts in {}, writes in {./build, /tmp,})",
+            "#attest(syscalls not in {socket, connect}, writes in {./build, /tmp,})",
         );
         assert_eq!(
             d.conditions[0].kind,
@@ -1532,9 +1500,8 @@ testX() {
                 set: vec![Sysno::socket, Sysno::connect]
             }
         );
-        assert_eq!(d.conditions[1].kind, Kind::Hosts(vec![]));
         assert_eq!(
-            d.conditions[2].kind,
+            d.conditions[1].kind,
             Kind::Writes(vec!["./build".into(), "/tmp".into()])
         );
         let d = one("#attest(syscalls in {read, write})");
@@ -1561,56 +1528,40 @@ testX() {
             d.conditions[0].kind,
             Kind::Writes(vec![".".into(), "./".into(), "/".into(), "/tmp/".into()])
         );
-        // Items may hold what a host or a path holds.
-        let d = one("#attest(hosts in {api.example.com, 10.0.0.0/8, [::1]:443})");
-        assert_eq!(
-            d.conditions[0].kind,
-            Kind::Hosts(vec![
-                "api.example.com".into(),
-                "10.0.0.0/8".into(),
-                "[::1]:443".into()
-            ])
-        );
         // A set may be spread over lines, and its commas do not split
         // conditions.
         let d = one(
-            "#attest(\n#  hosts in {\n#    a.example,\n#    b.example,\n#  },\n#  cpu < 1s,\n#)",
+            "#attest(\n#  writes in {\n#    ./a,\n#    /tmp/b,\n#  },\n#  cpu < 1s,\n#)",
         );
         assert_eq!(d.conditions.len(), 2);
         assert_eq!(d.conditions[0].line, 2);
         assert_eq!(d.conditions[1].line, 6);
 
         for text in [
-            "hosts in",
-            "hosts in {",
-            "hosts in a.example",
-            "hosts {a}",
-            "hosts not in {a}",
+            "writes in",
+            "writes in {",
+            "writes in /tmp",
+            "writes {/tmp}",
+            "writes not in {/tmp}",
             "syscalls in {a,,b}",
             "syscalls in {,}",
             "syscalls in {{a}}",
-            "hostsx in {}",
+            "writesx in {}",
             "writes in {} extra",
         ] {
             assert!(scan(&format!("#attest({text})\n")).is_err(), "{text}");
         }
     }
 
+    /// `hosts` is reserved for a form nothing enforces yet: refused on the
+    /// condition's own line, however it is spelled.
     #[test]
-    fn unenforced_forms_are_refused_by_check_supported() {
-        assert!(
-            one("#attest(cpu < 1ms, pids < 2)")
-                .check_supported()
-                .is_ok()
-        );
-        for text in ["syscalls in {}", "writes in {}"] {
-            let d = one(&format!("#attest(cpu < 1ms,\n# {text})"));
-            assert!(d.check_supported().is_ok(), "{text}");
+    fn hosts_conditions_are_refused() {
+        for text in ["hosts in {}", "hosts in {api.example.com}", "hosts"] {
+            let err = scan(&format!("#attest(cpu < 1ms,\n# {text})")).unwrap_err();
+            assert_eq!(err.line, 2, "{text}");
+            assert!(err.message.contains("not supported yet"), "{text}: {err}");
         }
-        let d = one("#attest(cpu < 1ms,\n# hosts in {})");
-        let err = d.check_supported().unwrap_err();
-        assert_eq!(err.line, 2);
-        assert!(err.message.contains("not supported yet"), "{err}");
     }
 
     #[test]

@@ -146,8 +146,9 @@
   the run has to listen for, the set itself for `not in` and its complement
   for `in`), `writes in {…}` (each item `/absolute` or `./relative`, no
   `..` — a bare `build` would mean one thing or the other depending on who
-  is asked), and `hosts in {…}`, which parses but is refused by
-  `check_supported` until something enforces it. `Condition::check` judges
+  is asked). A condition starting with the word `hosts` is a parse error
+  ("not supported yet"): the word is reserved for a `hosts in {…}` form,
+  which gets a `Kind` once something enforces it. `Condition::check` judges
   a condition against a `Sample`: the `wall` duration, the cgroup's
   `ResourceStats` (`cpu` is user+system, the number the resource line
   shows), the `SyscallLog` the seccomp listener built, the delta's paths and
@@ -523,7 +524,7 @@ and the README's "Decorators"). `syscalls in`/`not in {…}` asserts on the
 system calls the test's whole tree made (watched through seccomp user
 notification, the shell's startup included), `writes in {…}` on the paths
 its filesystem delta touched (`/absolute` or `./relative` to the invocation
-dir); `hosts in {…}` parses but is rejected until enforced.
+dir); `hosts in {…}` is rejected until enforced.
 `--add-decorators` writes such a block, and `--update-decorators` rewrites
 a bound's number when the run breaks it (a set condition has none, and is
 left alone with a warning).
