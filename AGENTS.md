@@ -249,7 +249,7 @@
   (a failed or timed-out run's numbers are those of a test that never got to
   its end), a violated condition turns `Pass` into `Fail` and goes on
   `TestResult::violations`, and a metric the run has no number for —
-  `--no-cgroups`, no cgroup v2, a controller not enabled, seccomp
+  no cgroup v2, a controller not enabled, seccomp
   notification unsupported — is reported once per run per `Measure` on
   stderr (`warn_unmeasured`) and leaves the outcome alone, since a condition
   on a number nobody has is not one the test can fail. The delta
@@ -574,7 +574,6 @@ left alone with a warning).
   `attest --fuzz <target>` leaves the target alone
 - `--json` — print results as JSONL (one JSON object per test) instead of the
   colored terminal output
-- `--no-cgroups` — disable cgroup resource tracking
 - `--update-decorators` — a violated `#attest(...)` bound does not fail the
   test; after the run the literal is rewritten to admit what was measured,
   with headroom. `--add-decorators` — after the run, a block bounding `cpu`,

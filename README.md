@@ -165,8 +165,8 @@ A value takes the unit of its metric and nothing else — `cpu < 10` is a parse
 error, as is `mem < 10ms`. Decimals are fine (`1.5ms`, `0.5MiB`).
 
 Two things to know about what the numbers mean. Everything but `wall` comes
-from the test's cgroup, so where attest can't create one — `--no-cgroups`, no
-cgroup v2, or no permission — those conditions aren't checked at all: the run
+from the test's cgroup, so where attest can't create one — no cgroup v2, or no
+permission — those conditions aren't checked at all: the run
 says so once on stderr and the test's outcome is whatever its commands made
 it. And the cgroup is joined before the shell starts, so `cpu`, `mem` and
 `pids` include the shell's own startup (a few milliseconds and a couple of
@@ -654,7 +654,6 @@ there isn't always the same thing:
 - `--strace CMD` — run CMD under strace, saving the log to the test's context
   dir. `CMD` is a command name or a path to one; tests that call it by its base
   name get the traced version
-- `--no-cgroups` — don't track per-test CPU, memory and IO usage with cgroups
 - `--update-decorators` — rewrite the `#attest(...)` bounds the run broke
   instead of failing on them; `--add-decorators` — write a block above each
   test that has none (see [Generating and updating
@@ -1034,9 +1033,9 @@ nothing to report are left out.
 
 These numbers come from a cgroup created per test, so the line is absent
 altogether when `attest` can't make one — cgroup v2 not mounted, or no
-permission to create a child cgroup, which `-d` will tell you about — and when
-you pass `--no-cgroups`. A [decorator](#decorators) turns any of them into an
-assertion.
+permission to create a child cgroup, which `-d` will tell you about. The run
+carries on without them either way. A [decorator](#decorators) turns any of
+them into an assertion.
 
 ## Installation
 

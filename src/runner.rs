@@ -494,7 +494,6 @@ pub struct RunConfig {
     /// Randomly SIGSTOP/SIGCONT individual descendant processes of each test to introduce
     /// timing non-determinism.
     pub fuzz: Option<f64>,
-    pub no_cgroups: bool,
     /// A violated `#attest(...)` condition is recorded but does not fail the
     /// test: the run is there to find out what the bounds should be, and
     /// `decorate::plan_updates` rewrites them from the violations afterwards.
@@ -918,11 +917,10 @@ fn spawn_test<'a>(
     // script's shebang nor looks the shell up on PATH again.
     let shell = &spec.file.shell;
 
-    let cgroup = if config.no_cgroups {
-        None
-    } else {
-        crate::cgroup::TestCgroup::try_create(display_name)
-    };
+    // Where no cgroup can be had the test runs without one: resource stats
+    // are absent from its result, and only a decorator that asks for them
+    // says so (`warn_unmeasured`).
+    let cgroup = crate::cgroup::TestCgroup::try_create(display_name);
 
     // The functions are rendered once per file at parse time (see
     // `parser::build_functions_source`); the script around them is per test.
@@ -1166,7 +1164,7 @@ fn warn_unmeasured(measure: decorator::Measure) {
     let hint = match measure {
         Measure::Metric(Metric::Wall) | Measure::Writes => "",
         Measure::Metric(_) => {
-            " (cgroup v2 unavailable, --no-cgroups, or the controller is not enabled; -d says which)"
+            " (cgroup v2 unavailable or the controller is not enabled; -d says which)"
         }
         Measure::Syscalls => " (seccomp user notification needs Linux 5.6 or later; -d says why)",
     };

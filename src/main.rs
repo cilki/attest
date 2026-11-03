@@ -158,10 +158,6 @@ struct Cli {
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
     repeat: u64,
 
-    /// Disable cgroup resource tracking
-    #[arg(long)]
-    no_cgroups: bool,
-
     /// Rewrite each `#attest(...)` bound the run broke so that it admits what
     /// was measured, with headroom, instead of failing the test. Pairs with
     /// --repeat, which folds every run's measurement into one bound
@@ -703,7 +699,6 @@ fn main() -> anyhow::Result<()> {
                 strace: cli.strace,
                 timeout: cli.timeout.map(std::time::Duration::from_secs_f64),
                 fuzz: cli.fuzz,
-                no_cgroups: cli.no_cgroups,
                 update_decorators: cli.update_decorators,
             };
 

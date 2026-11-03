@@ -303,7 +303,7 @@ pub fn plan_additions(results: &[TestResult], files: &HashMap<PathBuf, &TestFile
         // The per-metric "not checked" warning says why in the update case;
         // a test with no block has no condition to be warned about.
         errln!(
-            "warning: no decorator added for {unmeasured} test{}: the run measured none of {} (cgroup v2 unavailable, --no-cgroups, or the controllers are not enabled; -d says which)",
+            "warning: no decorator added for {unmeasured} test{}: the run measured none of {} (cgroup v2 unavailable or the controllers are not enabled; -d says which)",
             plural(unmeasured),
             Metric::GENERATED
                 .iter()

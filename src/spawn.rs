@@ -37,8 +37,11 @@ pub struct Spawn {
 }
 
 impl Spawn {
-    /// `argv[0]` is given separately from `program`: the runner execs a
-    /// shell under the test file's own name so `$0` works.
+    /// `argv` is the whole vector, `argv[0]` included, given separately from
+    /// `program`. The runner passes the shell's own path as `argv[0]` and
+    /// sets `$0` to the test file through the operand after `-c`'s script:
+    /// a multi-call binary such as busybox picks what to run from `argv[0]`,
+    /// so a shell exec'd under any other name may not be a shell at all.
     pub fn new(program: &str, argv: &[&str], stdout: File, stderr: File) -> io::Result<Self> {
         let cstring = |s: &str| {
             CString::new(s)
@@ -294,12 +297,16 @@ mod tests {
         (tmp, out, err)
     }
 
+    /// `$0` is set the way the runner sets it, through the operand after
+    /// `-c`'s script, rather than through `argv[0]`: a multi-call `/bin/sh`
+    /// (busybox, which is what Nix's build sandbox provides) picks its applet
+    /// from `argv[0]` and refuses to run under any other name.
     #[test]
     fn runs_the_program_with_its_argv_and_logs() {
         let (tmp, out, err) = logs();
         let spawn = Spawn::new(
             "/bin/sh",
-            &["custom0", "-c", "echo $0; echo oops >&2"],
+            &["sh", "-c", "echo $0 $1; echo oops >&2", "custom0", "arg1"],
             out,
             err,
         )
@@ -311,7 +318,7 @@ mod tests {
             .unwrap()
             .read_to_string(&mut s)
             .unwrap();
-        assert_eq!(s, "custom0\n");
+        assert_eq!(s, "custom0 arg1\n");
         s.clear();
         File::open(tmp.path().join("err"))
             .unwrap()
