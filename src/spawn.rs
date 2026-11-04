@@ -12,15 +12,17 @@
 //! So the fork is done here, the same way `std` does it — hooks run in the
 //! child in order, a close-on-exec pipe carries a failing hook's errno back,
 //! and EOF on it means the exec went through — but the parent waits on that
-//! pipe with [`Spawning::wait_exec`], which takes something else to service
-//! in the meantime.
+//! pipe with [`Spawning::wait_exec`], which answers the child's seccomp
+//! listener in the meantime.
 
 use std::ffi::CString;
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
+
+use crate::seccomp::Listener;
 
 /// Something run in the child between `fork` and `exec`. Only
 /// async-signal-safe calls, no allocation: the parent has other threads, and
@@ -133,22 +135,18 @@ impl Spawning {
     /// Wait for the child to exec — or to fail before it does, in which case
     /// the child is reaped and its hook's error returned.
     ///
-    /// `service` is called with the descriptors in `also` that are readable
-    /// while this waits, so the parent can keep answering whatever the child
-    /// is blocked on; `also` may be empty.
-    pub fn wait_exec(
-        mut self,
-        also: &[RawFd],
-        mut service: impl FnMut(RawFd),
-    ) -> io::Result<Child> {
-        let mut fds: Vec<libc::pollfd> = std::iter::once(self.status_rd.as_raw_fd())
-            .chain(also.iter().copied())
-            .map(|fd| libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            })
-            .collect();
+    /// The child's seccomp `listener`, when it has one, is serviced while
+    /// this waits: the exec may itself be a watched syscall, held until the
+    /// parent answers it.
+    pub fn wait_exec(mut self, mut listener: Option<&mut Listener>) -> io::Result<Child> {
+        let pollfd = |fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // A negative descriptor is one `poll` ignores.
+        let listener_fd = listener.as_ref().and_then(|l| l.poll_fd()).unwrap_or(-1);
+        let mut fds = [pollfd(self.status_rd.as_raw_fd()), pollfd(listener_fd)];
         loop {
             let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
             if n < 0 {
@@ -158,10 +156,12 @@ impl Spawning {
                 }
                 return Err(err);
             }
-            for pfd in &fds[1..] {
-                if pfd.revents != 0 {
-                    service(pfd.fd);
-                }
+            if fds[1].revents != 0
+                && let Some(l) = listener.as_deref_mut()
+            {
+                l.service();
+                // A listener with nobody left behind it stays in `POLLHUP`.
+                fds[1].fd = l.poll_fd().unwrap_or(-1);
             }
             if fds[0].revents == 0 {
                 continue;
@@ -311,7 +311,7 @@ mod tests {
             err,
         )
         .unwrap();
-        let mut child = spawn.start().unwrap().wait_exec(&[], |_| {}).unwrap();
+        let mut child = spawn.start().unwrap().wait_exec(None).unwrap();
         assert!(child.wait().unwrap().success());
         let mut s = String::new();
         File::open(tmp.path().join("out"))
@@ -332,7 +332,7 @@ mod tests {
         let (_tmp, out, err) = logs();
         let mut spawn = Spawn::new("/bin/sh", &["sh", "-c", "true"], out, err).unwrap();
         spawn.hook(|| Err(io::Error::from_raw_os_error(libc::EPERM)));
-        let err = spawn.start().unwrap().wait_exec(&[], |_| {}).unwrap_err();
+        let err = spawn.start().unwrap().wait_exec(None).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EPERM));
     }
 
@@ -340,7 +340,7 @@ mod tests {
     fn a_missing_program_is_an_exec_error() {
         let (_tmp, out, err) = logs();
         let spawn = Spawn::new("/nonexistent/prog", &["prog"], out, err).unwrap();
-        let err = spawn.start().unwrap().wait_exec(&[], |_| {}).unwrap_err();
+        let err = spawn.start().unwrap().wait_exec(None).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
     }
 
@@ -350,7 +350,7 @@ mod tests {
     fn has_exited_leaves_the_zombie_for_try_wait() {
         let (_tmp, out, err) = logs();
         let spawn = Spawn::new("/bin/sh", &["sh", "-c", "exit 3"], out, err).unwrap();
-        let mut child = spawn.start().unwrap().wait_exec(&[], |_| {}).unwrap();
+        let mut child = spawn.start().unwrap().wait_exec(None).unwrap();
         while !child.has_exited().unwrap() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -385,41 +385,7 @@ mod tests {
             unsafe { libc::close(fd) };
             Ok(())
         });
-        let mut child = spawn.start().unwrap().wait_exec(&[], |_| {}).unwrap();
+        let mut child = spawn.start().unwrap().wait_exec(None).unwrap();
         assert!(child.wait().unwrap().success());
-    }
-
-    /// `wait_exec` keeps servicing the extra descriptors while the child is
-    /// on its way to exec.
-    #[test]
-    fn wait_exec_services_other_descriptors_meanwhile() {
-        let (_tmp, out, err) = logs();
-        let mut fds = [0; 2];
-        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
-        let [rd, wr] = fds;
-        let mut spawn = Spawn::new("/bin/sh", &["sh", "-c", "true"], out, err).unwrap();
-        spawn.hook(move || {
-            // Say something the parent has to read before the exec: it is
-            // written in the child, so the parent's end is only readable
-            // while the child is between fork and exec.
-            unsafe { libc::write(wr, b"x".as_ptr().cast(), 1) };
-            Ok(())
-        });
-        let mut seen = Vec::new();
-        let mut child = spawn
-            .start()
-            .unwrap()
-            .wait_exec(&[rd], |fd| {
-                let mut b = [0u8; 1];
-                unsafe { libc::read(fd, b.as_mut_ptr().cast(), 1) };
-                seen.push((fd, b[0]));
-            })
-            .unwrap();
-        assert!(child.wait().unwrap().success());
-        assert_eq!(seen, [(rd, b'x')]);
-        unsafe {
-            libc::close(rd);
-            libc::close(wr);
-        }
     }
 }

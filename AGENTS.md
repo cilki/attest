@@ -365,8 +365,8 @@
   notification, so each would wait on the other. `Spawn` does what `std`
   does (hooks in order in the child, a close-on-exec pipe carrying a failing
   hook's errno, EOF meaning the exec went through) but `Spawning::wait_exec`
-  polls that pipe together with whatever descriptors the caller hands it,
-  servicing them until the outcome arrives. `Child` is the pid plus whether
+  polls that pipe together with the child's seccomp listener, if it has
+  one, answering it until the outcome arrives. `Child` is the pid plus whether
   it has been reaped, with the `try_wait`/`wait` the runner used from `std`
   (no `kill`: the child leads its own process group, so the runner's
   `kill(-pgid)` already reaches it).

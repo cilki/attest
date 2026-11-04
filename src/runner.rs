@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use std::io::{Read, Seek, SeekFrom};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -1016,7 +1016,7 @@ fn spawn_test<'a>(
             Ok(listener) => listener,
             Err(e) => {
                 // `take` killed the child, which waited on it; reap it.
-                if let Ok(mut child) = spawning.wait_exec(&[], |_| {}) {
+                if let Ok(mut child) = spawning.wait_exec(None) {
                     let _ = child.wait();
                 }
                 return Err(anyhow!(
@@ -1026,34 +1026,27 @@ fn spawn_test<'a>(
         },
         None => None,
     };
-    let fds: Vec<RawFd> = listener.iter().filter_map(|l| l.poll_fd()).collect();
-    let child = spawning
-        .wait_exec(&fds, |_| {
-            if let Some(l) = listener.as_mut() {
-                l.service();
-            }
-        })
-        .map_err(|e| {
-            // The script rides in the argument vector, and Linux caps how long a
-            // single argument may be — 32 pages classically, a slice of the stack
-            // limit on newer kernels, so half a megabyte of shell either way. Only
-            // a file with more function definitions in it than that can hit this,
-            // and `E2BIG` on its own names neither the argument nor its size.
-            let note = if e.raw_os_error() == Some(libc::E2BIG) {
-                format!(
-                    " (the script carrying this file's function definitions is {} bytes, \
+    let child = spawning.wait_exec(listener.as_mut()).map_err(|e| {
+        // The script rides in the argument vector, and Linux caps how long a
+        // single argument may be — 32 pages classically, a slice of the stack
+        // limit on newer kernels, so half a megabyte of shell either way. Only
+        // a file with more function definitions in it than that can hit this,
+        // and `E2BIG` on its own names neither the argument nor its size.
+        let note = if e.raw_os_error() == Some(libc::E2BIG) {
+            format!(
+                " (the script carrying this file's function definitions is {} bytes, \
                      more than one argument can hold)",
-                    runner_content.len()
-                )
-            } else {
-                // The probe passed, so this is a per-test setup failure: the
-                // errno is all that survives the hook, and it belongs to one
-                // of the mounts the ephemeral root is built from — or to the
-                // seccomp filter installed after them.
-                " (while building the test's ephemeral root)".to_string()
-            };
-            anyhow!("spawn failed for {display_name}: {e}{note}")
-        })?;
+                runner_content.len()
+            )
+        } else {
+            // The probe passed, so this is a per-test setup failure: the
+            // errno is all that survives the hook, and it belongs to one
+            // of the mounts the ephemeral root is built from — or to the
+            // seccomp filter installed after them.
+            " (while building the test's ephemeral root)".to_string()
+        };
+        anyhow!("spawn failed for {display_name}: {e}{note}")
+    })?;
 
     Ok(PendingTest {
         child,

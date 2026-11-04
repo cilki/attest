@@ -544,9 +544,8 @@ mod tests {
         spawn.hook(move || unsafe { filter.install_and_hand_off(end) });
         let spawning = spawn.start().unwrap();
         let mut listener = handoff.take(spawning.pid()).unwrap().expect("a listener");
-        let fd = listener.poll_fd().unwrap();
         let mut child = spawning
-            .wait_exec(&[fd], |_| listener.service())
+            .wait_exec(Some(&mut listener))
             .expect("the exec went through");
         loop {
             listener.service();
