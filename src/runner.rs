@@ -334,7 +334,6 @@ pub struct TestResult<'a> {
     pub outcome: Outcome,
     pub duration: Duration,
     pub context: PathBuf,
-    pub source_path: PathBuf,
     pub resources: Option<crate::cgroup::ResourceStats>,
     /// The syscalls the run watched the test for, and how often each was
     /// made. `None` for a test with no `syscalls` condition — nothing is
@@ -370,7 +369,6 @@ struct PendingTest<'a> {
     start: Instant,
     /// `None` after the path has been transferred to `TestResult`.
     context: Option<PathBuf>,
-    source_path: PathBuf,
     /// The parse the test was run from: the failure report renders its
     /// snippet out of the script this holds (see
     /// [`crate::diagnostics::print_failure_snippet`]), and the function's
@@ -922,11 +920,6 @@ fn spawn_test<'a>(
         create_strace_wrappers(&context, &config.strace)?;
     }
 
-    let source_path_owned = spec
-        .file
-        .path
-        .canonicalize()
-        .unwrap_or_else(|_| spec.file.path.clone());
     // Settled once per file at parse time, so a spawn neither re-reads the
     // script's shebang nor looks the shell up on PATH again.
     let shell = &spec.file.shell;
@@ -945,12 +938,12 @@ fn spawn_test<'a>(
         &config.bin_dirs,
         &config.strace,
     );
-    // <shell> -c <script> <source_path>: passing source_path as argv[0]
-    // makes $0 inside the test functions refer to the original script.
-    let source_str = source_path_owned.to_str().unwrap_or("bash").to_string();
+    // <shell> -c <script> <path>: the operand after the script is $0, so
+    // inside the test functions it names the original file.
+    let source = spec.file.canonical_path.to_str().unwrap_or("bash");
     let mut spawn = Spawn::new(
         shell,
-        &[shell, "-c", &runner_content, &source_str],
+        &[shell, "-c", &runner_content, source],
         stdout_log,
         xtrace_log,
     )?;
@@ -1068,7 +1061,6 @@ fn spawn_test<'a>(
         name: display_name.clone(),
         start,
         context: Some(context),
-        source_path: source_path_owned,
         file: spec.file,
         test: spec.name,
         cgroup,
@@ -1151,7 +1143,6 @@ fn build_result<'a>(
         outcome,
         duration,
         context: pending.context.take().unwrap(),
-        source_path: pending.source_path.clone(),
         resources,
         syscalls,
         violations,
@@ -1320,7 +1311,7 @@ fn sh_quote(path: &Path) -> String {
 }
 
 /// Build the shell script content that defines the test's functions and runs
-/// the named one. Used with `<shell> -c <content> <source_path>` so that `$0`
+/// the named one. Used with `<shell> -c <content> <path>` so that `$0`
 /// inside test functions refers to the original script.
 ///
 /// The definitions are carried in the script itself rather than sourced out of
@@ -1762,7 +1753,6 @@ mod tests {
             outcome: Outcome::Fail,
             duration: Duration::from_millis(1),
             context,
-            source_path: PathBuf::from("t.sh"),
             resources: None,
             syscalls: None,
             violations: Vec::new(),

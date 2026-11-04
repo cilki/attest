@@ -143,11 +143,15 @@ pub fn plan_updates(results: &[TestResult]) -> Vec<Edit> {
                 broken,
             } = &v.detail
             else {
-                unwritable.insert((result.source_path.clone(), v.line, v.condition.clone()));
+                unwritable.insert((
+                    result.file.canonical_path.clone(),
+                    v.line,
+                    v.condition.clone(),
+                ));
                 continue;
             };
             let key = LiteralKey {
-                path: result.source_path.clone(),
+                path: result.file.canonical_path.clone(),
                 line: broken.bound.literal.line,
                 start: broken.bound.literal.span.start,
             };
@@ -225,7 +229,7 @@ pub fn plan_additions(results: &[TestResult]) -> Vec<Edit> {
     }
     let mut by_test: BTreeMap<(PathBuf, &str), Measured> = BTreeMap::new();
     for result in results {
-        let key = (result.source_path.clone(), result.test);
+        let key = (result.file.canonical_path.clone(), result.test);
         let entry = by_test.entry(key).or_insert_with(|| Measured {
             file: result.file,
             samples: Default::default(),
@@ -626,7 +630,6 @@ mod tests {
             outcome: Outcome::Pass,
             duration: Duration::from_millis(1),
             context: PathBuf::from("/nonexistent"),
-            source_path: file.path.clone(),
             resources: None,
             syscalls: None,
             violations: Vec::new(),

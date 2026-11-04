@@ -63,7 +63,7 @@ pub fn print_failure_snippet(result: &TestResult) {
         "{}",
         render_snippet(
             title,
-            &result.source_path,
+            &result.file.canonical_path,
             &lines,
             Highlight::line(line_idx),
             func_start_line,
@@ -113,7 +113,7 @@ pub fn print_violations(result: &TestResult) {
             "{}",
             render_snippet(
                 "assertion on the run failed",
-                &result.source_path,
+                &result.file.canonical_path,
                 &lines,
                 Highlight {
                     line: line_idx,
@@ -742,12 +742,12 @@ mod tests {
     fn test_file(script: &str, functions: Vec<(usize, usize)>) -> TestFile {
         TestFile {
             path: "x.test".into(),
+            canonical_path: "/x.test".into(),
             tests: vec!["test_x".into()],
             script: script.into(),
             functions,
             shell: "bash".into(),
-            decorators: Vec::new(),
-            test_lines: Default::default(),
+            ..Default::default()
         }
     }
 

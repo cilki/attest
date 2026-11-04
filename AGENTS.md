@@ -63,15 +63,16 @@
   shebang. It takes the text and not the path because by then the file has
   been read whole and parsed anyway; the runner used to reopen and re-read it
   for the first line on every spawn, once more for every `--repeat`.
-  `resolve_shell` remembers what each shell name resolved to: every file the
-  walk turns up asks the same question about the same handful of shells, and
-  a bare name costs a `which` — a stat per `PATH` entry, which on a tree of
-  scripts holding no tests was most of what the walk spent.
+  `resolve_shell` remembers what each shell name resolved to: every file that
+  may define a test asks the same question about the same handful of shells,
+  and a bare name costs a `which` — a stat per `PATH` entry. A file the
+  `Prescan` rules out never asks at all.
 - `src/parser.rs` - Parses shell scripts with `brush_parser::Parser`, walks the
   AST to extract all `FunctionDefinition` nodes. Test functions start with
   `test`. A `TestFile` keeps the names of its tests, the definitions the runner
-  puts at the head of the script it runs (`build_functions_source`) and the
-  shell that runs it (`discovery::script_shell`), not the nodes: all of those
+  puts at the head of the script it runs (`build_functions_source`), the
+  shell that runs it (`discovery::script_shell`) and its canonical path (the
+  `$0` the test sees and the `file` `--json` reports), not the nodes: all of those
   are the same for every test in the file, and rendering the script walks each
   function's AST for its source span — which cost more than reading the file it
   is built from, and a file holding 25 tests paid it 25 times over, once more
@@ -81,8 +82,8 @@
   the shape of a selectable definition in its text: the shell parse
   costs about a microsecond per line, the walk hands it every script in the
   tree, and almost none of them define a test. A file that fails that scan
-  gets an empty `tests` and an empty `script` — nothing can source a script
-  none of whose tests can be selected. The scan may only ever err towards the
+  gets nothing but its `path` — no tests, no script, no shell, no canonical
+  path: nothing runs or reports a file none of whose tests can be selected. The scan may only ever err towards the
   parse: a false positive costs what would have been paid anyway, while a
   false negative loses a test. A `Prescan` is the whole of what a selection
   rules out before a parse, so it carries the `--filter` as well as the

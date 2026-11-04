@@ -682,7 +682,7 @@ impl serde::Serialize for TestResultJson<'_> {
         };
         let mut map = serializer.serialize_map(None)?;
         map.serialize_entry("name", &result.name)?;
-        map.serialize_entry("file", &result.source_path.display().to_string())?;
+        map.serialize_entry("file", &result.file.canonical_path.display().to_string())?;
         map.serialize_entry("status", status)?;
         map.serialize_entry("duration_ms", &(result.duration.as_millis() as u64))?;
         map.serialize_entry("stdout", &LogField(result.context.join("stdout.log")))?;
@@ -949,14 +949,18 @@ mod tests {
 
     /// A finished test whose logs live in `context`.
     fn result_in<'a>(context: &Path, name: &'a str) -> TestResult<'a> {
+        static FILE: std::sync::LazyLock<crate::parser::TestFile> =
+            std::sync::LazyLock::new(|| crate::parser::TestFile {
+                canonical_path: PathBuf::from("/repo/a b.test"),
+                ..Default::default()
+            });
         TestResult {
             name: name.to_string(),
             test: name,
-            file: crate::parser::TestFile::empty(),
+            file: &FILE,
             outcome: Outcome::Timeout,
             duration: Duration::from_millis(1500),
             context: context.to_path_buf(),
-            source_path: PathBuf::from("/repo/a b.test"),
             resources: None,
             syscalls: None,
             violations: Vec::new(),

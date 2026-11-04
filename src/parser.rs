@@ -12,11 +12,15 @@ use tracing::warn;
 use crate::decorator::{self, Decorator};
 
 /// File containing tests.
-#[cfg_attr(test, derive(Default))]
+#[derive(Default)]
 pub struct TestFile {
     /// The file this was parsed from. Every test in it shares it, so it is kept
     /// here rather than repeated per test.
     pub path: PathBuf,
+    /// [`TestFile::path`] canonicalized, where it can be: the `$0` a test sees
+    /// (it runs in a fresh working directory) and the `file` `--json` reports.
+    /// Empty, like the script and the shell, for a file the scan ruled out.
+    pub canonical_path: PathBuf,
     /// Names of the test functions, in source order — one per name the shell
     /// would actually run (see [`parse_test_file`]).
     pub tests: Vec<String>,
@@ -388,12 +392,7 @@ pub fn parse_test_file(path: &Path, scan: &Prescan) -> anyhow::Result<TestFile> 
     if !scan.may_define(&contents) {
         return Ok(TestFile {
             path: path.to_path_buf(),
-            tests: Vec::new(),
-            script: String::new(),
-            functions: Vec::new(),
-            shell: crate::discovery::script_shell(&contents),
-            decorators: Vec::new(),
-            test_lines: HashMap::new(),
+            ..Default::default()
         });
     }
 
@@ -465,6 +464,7 @@ pub fn parse_test_file(path: &Path, scan: &Prescan) -> anyhow::Result<TestFile> 
     }
     Ok(TestFile {
         path: path.to_path_buf(),
+        canonical_path: path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
         tests,
         script,
         functions: bounds,
