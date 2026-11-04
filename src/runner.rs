@@ -215,6 +215,15 @@ impl Tailed {
     /// in the file is all of it. Until then a trailing [`output::C1_LEAD`] is
     /// left unconsumed and re-read next time (see [`output::replay_log_err`]).
     fn flush_new(&mut self, last: bool) {
+        self.flush_new_via(last, output::replay_log_err);
+    }
+
+    /// [`Tailed::flush_new`], replaying the new bytes through `replay` rather
+    /// than onto the process's stderr. The unit tests replay into a buffer:
+    /// whether stderr still has a reader is up to whatever runs the test
+    /// binary, and once it has none [`output::output_closed`] latches for the
+    /// whole process and every replay after it reads nothing.
+    fn flush_new_via(&mut self, last: bool, replay: impl FnOnce(&mut std::fs::File, bool) -> u64) {
         if self.interrupted && self.has_new() {
             xtrace_header(&self.name);
             self.interrupted = false;
@@ -222,7 +231,7 @@ impl Tailed {
         if self.file.seek(SeekFrom::Start(self.offset)).is_err() {
             return;
         }
-        self.offset += output::replay_log_err(&mut self.file, last);
+        self.offset += replay(&mut self.file, last);
     }
 }
 
@@ -1610,6 +1619,14 @@ mod tests {
     use std::process::Command;
     use tempfile::TempDir;
 
+    impl Tailed {
+        /// [`Tailed::flush_new`] into `out` rather than stderr (see
+        /// [`Tailed::flush_new_via`]).
+        fn flush_into(&mut self, out: &mut Vec<u8>, last: bool) {
+            self.flush_new_via(last, |log, last| output::replay_log_to(out, log, last));
+        }
+    }
+
     /// How overlays can be mounted where the tests are running, probed once
     /// per process — or `None` where they cannot be at all, in which case a
     /// test that spawns anything returns early: a test is only ever run in an
@@ -2727,22 +2744,26 @@ mod tests {
             interrupted: false,
         };
 
-        tailed.flush_new(false);
+        let mut out = Vec::new();
+        tailed.flush_into(&mut out, false);
         assert_eq!(
             tailed.offset, 11,
             "the trailing \\xc2 was printed before its second byte arrived"
         );
+        assert_eq!(out, b"+1: payload");
 
         // The second half lands: the pair is now sanitized together.
         fs::write(&log, b"+1: payload\xc2\x9b2K").unwrap();
-        tailed.flush_new(false);
+        tailed.flush_into(&mut out, false);
         assert_eq!(tailed.offset, 15);
+        assert_eq!(out, br"+1: payload\xc2\x9b2K");
 
         // Once the test is done there is no more to wait for, so a log that
         // really does end in a lone `\xc2` is not held back forever.
         fs::write(&log, b"+1: payload\xc2\x9b2K\xc2").unwrap();
-        tailed.flush_new(true);
+        tailed.flush_into(&mut out, true);
         assert_eq!(tailed.offset, 16);
+        assert_eq!(out, b"+1: payload\\xc2\\x9b2K\xc2");
     }
 
     #[test]
@@ -2763,19 +2784,21 @@ mod tests {
             offset: 0,
             interrupted: false,
         });
-        tailed.as_mut().unwrap().flush_new(false);
+        let mut out = Vec::new();
+        tailed.as_mut().unwrap().flush_into(&mut out, false);
 
         finish_xtrace(&mut tailed, "test_other", other.path());
         let holder = tailed.as_mut().expect("the holder keeps the tail");
         assert!(holder.interrupted, "another test's output went unnoticed");
 
-        holder.flush_new(false);
+        holder.flush_into(&mut out, false);
         assert!(holder.interrupted, "re-announced with nothing to follow");
 
         fs::write(&log, b"+1: first\n+2: second\n").unwrap();
-        holder.flush_new(false);
+        holder.flush_into(&mut out, false);
         assert!(!holder.interrupted);
         assert_eq!(holder.offset, 21);
+        assert_eq!(out, b"+1: first\n+2: second\n");
 
         // The holder finishing releases the tail rather than dumping itself.
         finish_xtrace(&mut tailed, "test_holder", tmp.path());

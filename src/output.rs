@@ -215,6 +215,14 @@ pub fn replay_log_err(log: &mut impl Read, last: bool) -> u64 {
     )
 }
 
+/// [`replay_log_err`] into `stream` instead of stderr, uncoloured and with a
+/// latch of its own, so a test's outcome does not hang on the state of the
+/// process's stderr.
+#[cfg(test)]
+pub(crate) fn replay_log_to(stream: &mut impl Write, log: &mut impl Read, last: bool) -> u64 {
+    stream_log(&AtomicBool::new(false), stream, log, last, Palette::PLAIN)
+}
+
 /// How much of a log is held in memory at a time while it is replayed.
 const LOG_CHUNK: usize = 64 * 1024;
 
