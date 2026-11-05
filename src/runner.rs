@@ -848,17 +848,23 @@ fn context_dir_name(display_name: &str, taken: &mut std::collections::HashSet<St
     if base.is_empty() || base == "." || base == ".." {
         base = format!("_{base}");
     }
+    claim_unique(base, '_', taken)
+}
+
+/// `base`, or `base<sep>2`, `base<sep>3`, … — the first not yet in `taken`,
+/// which it is added to.
+pub(crate) fn claim_unique(
+    base: String,
+    sep: char,
+    taken: &mut std::collections::HashSet<String>,
+) -> String {
     if taken.insert(base.clone()) {
         return base;
     }
-    let mut k = 2;
-    loop {
-        let candidate = format!("{base}_{k}");
-        if taken.insert(candidate.clone()) {
-            return candidate;
-        }
-        k += 1;
-    }
+    (2..)
+        .map(|k| format!("{base}{sep}{k}"))
+        .find(|candidate| taken.insert(candidate.clone()))
+        .expect("an unbounded range")
 }
 
 /// Spawn a child process that will run the test. Returns a `PendingTest` that

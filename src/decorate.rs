@@ -21,7 +21,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::decorator::{Bound, Detail, Metric, Sample, Unit};
+use crate::decorator::{Bound, Detail, Metric, Unit};
 use crate::output::{errln, outln};
 use crate::parser::TestFile;
 use crate::runner::TestResult;
@@ -239,17 +239,8 @@ pub fn plan_additions(results: &[TestResult]) -> Vec<Edit> {
             entry.complete = false;
             continue;
         }
-        // Only the quantities are generated, so the sample carries nothing
-        // else.
-        let sample = Sample {
-            wall: result.duration,
-            resources: result.resources.as_ref(),
-            syscalls: None,
-            writes: None,
-            project: Path::new("/"),
-        };
         for (i, metric) in Metric::GENERATED.iter().enumerate() {
-            if let Some(value) = metric.measure(&sample) {
+            if let Some(value) = metric.measure(result.duration, result.resources.as_ref()) {
                 entry.samples[i].push(value);
             }
         }

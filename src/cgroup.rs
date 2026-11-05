@@ -24,7 +24,7 @@ pub struct ResourceStats {
 }
 
 /// A cgroup directory created for a single test. The forked child calls
-/// `enter()` to place itself inside it; the parent reads stats after the child
+/// [`add_self_to`] on [`Self::procs_cstring`] to place itself inside it; the parent reads stats after the child
 /// exits and the cgroup is cleaned up on drop.
 pub struct TestCgroup {
     path: PathBuf,
@@ -67,7 +67,7 @@ impl TestCgroup {
     }
 
     /// The `cgroup.procs` path as a `CString`, ready for [`add_self_to`] in a
-    /// `Command::pre_exec` hook (after fork, before exec).
+    /// `spawn::Spawn` hook (after fork, before exec).
     pub fn procs_cstring(&self) -> Option<CString> {
         CString::new(self.path.join("cgroup.procs").into_os_string().into_vec()).ok()
     }

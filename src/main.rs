@@ -196,7 +196,8 @@ enum Commands {
 /// selected file is qualified with its file name (`a.test:test_foo`) so
 /// results are tellable-apart and per-test context directories, which are
 /// keyed by display name, never collide; a numeric suffix breaks any
-/// remaining tie (same name defined twice in one file).
+/// remaining tie (the same name in two files of the same name, `a/x.test`
+/// and `b/x.test`).
 fn display_base(
     name: &str,
     file: &Path,
@@ -212,17 +213,7 @@ fn display_base(
     } else {
         name.to_string()
     };
-    if taken.insert(base.clone()) {
-        return base;
-    }
-    let mut k = 2;
-    loop {
-        let candidate = format!("{base}:{k}");
-        if taken.insert(candidate.clone()) {
-            return candidate;
-        }
-        k += 1;
-    }
+    runner::claim_unique(base, ':', taken)
 }
 
 /// Split a `<file>/<name>` argument on its last `/`, but only where the left

@@ -136,10 +136,9 @@ impl Metric {
 
     /// This metric's value for a run, in its base unit (microseconds, bytes
     /// or a count), or `None` when the run did not measure it.
-    pub fn measure(self, sample: &Sample) -> Option<u64> {
-        let r = sample.resources;
+    pub fn measure(self, wall: Duration, r: Option<&ResourceStats>) -> Option<u64> {
         match self {
-            Metric::Wall => Some(sample.wall.as_micros().try_into().unwrap_or(u64::MAX)),
+            Metric::Wall => Some(wall.as_micros().try_into().unwrap_or(u64::MAX)),
             // The same "user plus system" the resource line reports: a
             // condition on `cpu` is checked against the number the user sees.
             Metric::Cpu => {
@@ -475,7 +474,7 @@ impl Condition {
         };
         match &self.kind {
             Kind::Quantity { metric, bounds } => {
-                let Some(value) = metric.measure(sample) else {
+                let Some(value) = metric.measure(sample.wall, sample.resources) else {
                     return Verdict::Unmeasured(Measure::Metric(*metric));
                 };
                 match bounds.broken_by(value) {
