@@ -111,7 +111,10 @@ struct Cli {
 
     /// Filter tests by pattern: `[<file>/]<name>` where `<name>` supports `*` wildcards and
     /// plain names match as prefixes (e.g. `foo.sh/test_net*`)
-    #[arg(long, add = ArgValueCompleter::new(complete_filter))]
+    // Global, so `list` reads the same one: as a flag of each, a `--filter`
+    // written before `list` was parsed into the run's copy and dropped,
+    // listing every test instead of the ones the filter selects.
+    #[arg(long, global = true, add = ArgValueCompleter::new(complete_filter))]
     filter: Option<String>,
 
     /// Copy each test's logs, filesystem delta and working directory into DIR
@@ -191,11 +194,6 @@ enum Commands {
         /// Test target: a file, directory, or `<file>/<test>` pattern
         #[arg(add = ArgValueCompleter::new(complete_target))]
         path: String,
-
-        /// Filter tests by pattern: `[<file>/]<name>` where `<name>` supports `*` wildcards and
-        /// plain names match as prefixes (e.g. `foo.sh/test_net*`)
-        #[arg(long, add = ArgValueCompleter::new(complete_filter))]
-        filter: Option<String>,
     },
     /// Print AI agent skill for writing .test files
     Skill,
@@ -626,8 +624,8 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Skill) => {
             output::write_out(include_str!("../SKILL.md").as_bytes());
         }
-        Some(Commands::List { path, filter }) => {
-            let selection = Selection::resolve(&path, filter, Cores::All)?;
+        Some(Commands::List { path }) => {
+            let selection = Selection::resolve(&path, cli.filter, Cores::All)?;
             let tests: Vec<(&Path, &str)> = selection
                 .tests()
                 .into_iter()
@@ -790,6 +788,22 @@ mod tests {
                     .is_some_and(|e| e.kind() == clap::error::ErrorKind::ValueValidation),
                 "--timeout {bad}: {err:?}"
             );
+        }
+    }
+
+    #[test]
+    fn list_reads_a_filter_on_either_side_of_it() {
+        for args in [
+            &["--filter", "testFoo", "list", "."][..],
+            &["list", "--filter", "testFoo", "."],
+            &["list", ".", "--filter", "testFoo"],
+        ] {
+            let parsed = cli(args).unwrap();
+            assert!(
+                matches!(&parsed.command, Some(Commands::List { path }) if path == "."),
+                "{args:?}"
+            );
+            assert_eq!(parsed.filter.as_deref(), Some("testFoo"), "{args:?}");
         }
     }
 
