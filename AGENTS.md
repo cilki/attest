@@ -366,7 +366,13 @@
   does (hooks in order in the child, a close-on-exec pipe carrying a failing
   hook's errno, EOF meaning the exec went through) but `Spawning::wait_exec`
   polls that pipe together with the child's seccomp listener, if it has
-  one, answering it until the outcome arrives. `Child` is the pid plus whether
+  one, answering it until the outcome arrives. The child gets the parent's
+  environment plus whatever `Spawn::env` set, through `execve`; the runner
+  uses that to set `SHELL` to the test's shell when attest's own environment
+  has none, since bash otherwise fills it in from the passwd database at
+  startup — and glibc's nscd client makes a `socket` and a `connect` for it,
+  which a `syscalls not in {socket}` condition would then blame on the test
+  only on hosts (containers, CI) that do not export `SHELL`. `Child` is the pid plus whether
   it has been reaped, with the `try_wait`/`wait` the runner used from `std`
   (no `kill`: the child leads its own process group, so the runner's
   `kill(-pgid)` already reaches it).

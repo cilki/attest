@@ -953,6 +953,16 @@ fn spawn_test<'a>(
         stdout_log,
         xtrace_log,
     )?;
+    // bash fills in an unset `SHELL` from the passwd database at startup, and
+    // glibc asks nscd first — a `socket` and a `connect` that the test never
+    // made, in the very syscall log a `syscalls not in {socket}` condition is
+    // judged on. Whether that happens would then depend on whether whoever
+    // ran attest exported `SHELL` (a container or a CI job usually does not),
+    // so a test would pass on one machine and fail on the next. Naming the
+    // shell the test runs under keeps the lookup out of every test.
+    if std::env::var_os("SHELL").is_none() {
+        spawn.env("SHELL", shell);
+    }
 
     // Detach into a fresh session/process group so timeouts and cleanup can
     // kill the whole test tree with one kill(-pgid).

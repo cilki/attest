@@ -36,6 +36,8 @@ pub struct Spawn {
     stdout: File,
     stderr: File,
     hooks: Vec<Hook>,
+    /// Variables set in the child on top of the inherited environment.
+    env: Vec<(String, String)>,
 }
 
 impl Spawn {
@@ -55,7 +57,44 @@ impl Spawn {
             stdout,
             stderr,
             hooks: Vec::new(),
+            env: Vec::new(),
         })
+    }
+
+    /// Set `key` to `value` in the child's environment, which is otherwise
+    /// the parent's.
+    pub fn env(&mut self, key: &str, value: &str) -> &mut Self {
+        self.env.retain(|(k, _)| k != key);
+        self.env.push((key.to_owned(), value.to_owned()));
+        self
+    }
+
+    /// The child's environment as `execve` wants it: the parent's, with
+    /// every variable [`Self::env`] set replacing any of the same name.
+    fn envp(&self) -> io::Result<Vec<CString>> {
+        use std::os::unix::ffi::OsStrExt;
+        let overridden = |k: &[u8]| self.env.iter().any(|(o, _)| o.as_bytes() == k);
+        let mut envp = Vec::new();
+        for (k, v) in std::env::vars_os() {
+            if overridden(k.as_bytes()) {
+                continue;
+            }
+            let mut entry = k.as_bytes().to_vec();
+            entry.push(b'=');
+            entry.extend_from_slice(v.as_bytes());
+            // A NUL cannot be in an inherited variable; skip rather than fail.
+            if let Ok(c) = CString::new(entry) {
+                envp.push(c);
+            }
+        }
+        for (k, v) in &self.env {
+            envp.push(
+                CString::new(format!("{k}={v}")).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "NUL in environment")
+                })?,
+            );
+        }
+        Ok(envp)
     }
 
     /// Run `hook` in the child, after every hook added before it.
@@ -67,10 +106,14 @@ impl Spawn {
     /// Fork. The child runs the hooks and execs; the parent gets back at
     /// once, with the child's pid and the pipe its outcome arrives on.
     pub fn start(mut self) -> io::Result<Spawning> {
-        // argv as the `char *const []` execv wants, built before the fork.
+        // argv and envp as the `char *const []` execve wants, built before
+        // the fork.
         let mut argv_ptrs: Vec<*const libc::c_char> =
             self.argv.iter().map(|a| a.as_ptr()).collect();
         argv_ptrs.push(std::ptr::null());
+        let envp = self.envp()?;
+        let mut envp_ptrs: Vec<*const libc::c_char> = envp.iter().map(|e| e.as_ptr()).collect();
+        envp_ptrs.push(std::ptr::null());
 
         let mut fds = [0 as libc::c_int; 2];
         if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
@@ -107,7 +150,13 @@ impl Spawn {
                     fail(e);
                 }
             }
-            unsafe { libc::execv(self.program.as_ptr(), argv_ptrs.as_ptr()) };
+            unsafe {
+                libc::execve(
+                    self.program.as_ptr(),
+                    argv_ptrs.as_ptr(),
+                    envp_ptrs.as_ptr(),
+                )
+            };
             fail(io::Error::last_os_error());
         }
 
@@ -325,6 +374,27 @@ mod tests {
             .read_to_string(&mut s)
             .unwrap();
         assert_eq!(s, "oops\n");
+    }
+
+    /// A variable set with `env` reaches the child, replacing one of the same
+    /// name, and the rest of the parent's environment is still inherited.
+    #[test]
+    fn env_overrides_on_top_of_the_inherited_environment() {
+        let (tmp, out, err) = logs();
+        let mut spawn = Spawn::new(
+            "/bin/sh",
+            &["sh", "-c", "echo \"$ATTEST_SPAWN_X|${PATH:+inherited}\""],
+            out,
+            err,
+        )
+        .unwrap();
+        spawn
+            .env("ATTEST_SPAWN_X", "first")
+            .env("ATTEST_SPAWN_X", "second");
+        let mut child = spawn.start().unwrap().wait_exec(None).unwrap();
+        assert!(child.wait().unwrap().success());
+        let s = std::fs::read_to_string(tmp.path().join("out")).unwrap();
+        assert_eq!(s, "second|inherited\n");
     }
 
     #[test]
