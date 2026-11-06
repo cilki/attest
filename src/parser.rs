@@ -7,7 +7,6 @@ use brush_parser::ast::{
     Command, CompoundCommand, CompoundList, FunctionDefinition, Program, SourceLocation,
 };
 use brush_parser::{Parser, ParserOptions};
-use tracing::warn;
 
 use crate::decorator::{self, Decorator};
 
@@ -24,6 +23,14 @@ pub struct TestFile {
     /// Names of the test functions, in source order — one per name the shell
     /// would actually run (see [`parse_test_file`]).
     pub tests: Vec<String>,
+    /// Test names defined more than once in the file, each once, in source
+    /// order of their second definition. Every earlier body is dead code —
+    /// the shell runs the last one — which is almost always a copy-paste
+    /// whose author believes both run, so the caller warns about it. Kept
+    /// here rather than logged by the parse: the log is silent at the
+    /// default level, and completion parses files too, where a warning on
+    /// stderr would land in the middle of the user's command line.
+    pub shadowed: Vec<String>,
     /// The shell source that defines this file's functions, which the runner
     /// carries into the script it runs a test with (see
     /// [`build_functions_source`]). It is the same text for every test in the
@@ -431,20 +438,18 @@ pub fn parse_test_file(path: &Path, scan: &Prescan) -> anyhow::Result<TestFile> 
     // one of which would run the same, last body. `functions` still carries
     // all definitions so the rendered script is unchanged.
     let mut tests = Vec::new();
+    let mut shadowed = Vec::new();
     let mut seen = HashSet::new();
     for f in &functions {
-        if !f.fname.value.starts_with(TEST_PREFIX) {
+        let name = &f.fname.value;
+        if !name.starts_with(TEST_PREFIX) {
             continue;
         }
-        if !seen.insert(f.fname.value.as_str()) {
-            warn!(
-                "test function `{}` is defined more than once in {}; only the last definition runs",
-                f.fname.value,
-                path.display()
-            );
-            continue;
+        if seen.insert(name.as_str()) {
+            tests.push(name.clone());
+        } else if !shadowed.contains(name) {
+            shadowed.push(name.clone());
         }
-        tests.push(f.fname.value.clone());
     }
 
     // All built here, from the text this parse came from, so the script, the
@@ -466,6 +471,7 @@ pub fn parse_test_file(path: &Path, scan: &Prescan) -> anyhow::Result<TestFile> 
         path: path.to_path_buf(),
         canonical_path: path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
         tests,
+        shadowed,
         script,
         functions: bounds,
         shell: crate::discovery::script_shell(&contents),
@@ -1160,7 +1166,28 @@ mod tests {
 
         let result = parse_test_file(&path, &Prescan::default()).unwrap();
         assert_eq!(result.tests, ["test_dup"]);
+        assert_eq!(result.shadowed, ["test_dup"]);
         assert_eq!(result.script, source);
+    }
+
+    #[test]
+    fn shadowed_names_each_test_once_and_no_helper() {
+        let tmp = TempDir::new().unwrap();
+        // Three definitions are still one shadowed name, a helper defined
+        // twice is not a test nobody runs, and a test defined once is fine.
+        let source = "\
+test_a() { :; }
+helper() { :; }
+test_b() { :; }
+test_a() { :; }
+helper() { :; }
+test_a() { :; }
+";
+        let path = write_script(tmp.path(), "dup.test", source);
+
+        let result = parse_test_file(&path, &Prescan::default()).unwrap();
+        assert_eq!(result.tests, ["test_a", "test_b"]);
+        assert_eq!(result.shadowed, ["test_a"]);
     }
 
     /// The names each test's conditions were written against, in order.

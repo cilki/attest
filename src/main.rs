@@ -273,7 +273,19 @@ fn parse_discovered(
     // the warnings have to read the same way from one run to the next.
     for result in parse_each(&files, cores, scan) {
         match result {
-            Ok(test_file) => parsed.push(test_file),
+            Ok(test_file) => {
+                // Printed for the same reason: the earlier body of a test
+                // defined twice is never run, so the run covers less than
+                // the file says it does.
+                for name in &test_file.shadowed {
+                    errln!(
+                        "warning: test function `{}` is defined more than once in {}; only the last definition runs",
+                        output::escape_label(name),
+                        output::escape_label(&test_file.path.display().to_string())
+                    );
+                }
+                parsed.push(test_file)
+            }
             Err(e) if explicit_file => return Err(e),
             // Printed directly rather than logged: dropping a file changes
             // what the run covers, so it must show up whatever the log level

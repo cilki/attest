@@ -504,7 +504,10 @@ back to `/bin/sh` when that shell is not installed and to `bash` when there is
 no recognized shebang. Every command
 in a test function is an implicit assertion - if it exits nonzero, the test
 fails. Non-test functions (helpers/setup) are also extracted and made available
-to tests.
+to tests. A test name defined twice in one file is one test, the last
+definition (the one the shell runs); the name goes on `TestFile::shadowed`
+and `parse_discovered` warns about it on stderr whatever the log level,
+since the earlier body is never run.
 
 Only function definitions are extracted (`build_functions_source` drops
 everything else), so top-level code in a test file never runs: globals, `trap`s

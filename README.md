@@ -97,6 +97,10 @@ consequences:
 Dropping the top level is also what makes inline tests work: taking the
 functions out of a script that happens to be a program doesn't run the program.
 
+Since every definition is handed to the same shell, a test name defined twice
+in one file is one test: the last definition, the only one the shell can call.
+attest warns about it on stderr, because the earlier body is never run.
+
 Nothing is sourced to arrange any of this. The definitions are the head of the
 script the shell is handed, so running a test asks the shell for nothing beyond
 defining a function and calling it — a shell that implements neither `.` nor
