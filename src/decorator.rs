@@ -907,15 +907,16 @@ fn parse_set(text: &str) -> Result<Vec<String>, String> {
 /// One side of a comparison.
 enum Operand {
     Metric(Metric),
-    /// A number with the unit suffix it was written with, not yet scaled:
-    /// which family it must be in is only known once the metric is. `span`
-    /// is where the token sits in the condition's text.
-    Quantity {
-        number: f64,
-        suffix: String,
-        span: Range<usize>,
-        text: String,
-    },
+    Quantity(Qty),
+}
+
+/// A number with the unit suffix it was written with, not yet scaled: which
+/// family it must be in is only known once the metric is. `span` is where
+/// the token sits in the condition's text.
+struct Qty {
+    number: f64,
+    suffix: String,
+    span: Range<usize>,
 }
 
 /// Which way a comparison points. `Less` is `<`/`<=`: left is below right.
@@ -953,80 +954,53 @@ fn parse_quantity_condition(text: &str) -> Result<Kind, String> {
     }
 
     // The shapes a condition can take: exactly one metric, compared with one
-    // or two quantities.
-    let metric_at = operands
-        .iter()
-        .position(|o| matches!(o, Operand::Metric(_)))
-        .ok_or_else(|| "a condition compares a metric (cpu, wall, mem, io_read, io_write, pids) against a value".to_string())?;
-    let metric = match operands[metric_at] {
-        Operand::Metric(m) => m,
-        _ => unreachable!(),
-    };
-    if operands
-        .iter()
-        .filter(|o| matches!(o, Operand::Metric(_)))
-        .count()
-        > 1
-    {
-        return Err("a condition compares only one metric".to_string());
-    }
-    let valid_shape = match operands.len() {
-        2 => true,
-        3 => metric_at == 1,
-        _ => false,
-    };
-    if !valid_shape {
-        return Err(
-            "expected `cpu < 10ms`, `2ms < cpu` or `2ms < cpu < 10ms` (one metric, at most two values)"
+    // or two quantities. Each comparison comes out as its quantity, its
+    // operator and whether the metric is on the operator's left.
+    use Operand::{Metric as M, Quantity as Q};
+    let (metric, comparisons) = match (operands.as_slice(), ops.as_slice()) {
+        ([M(m), Q(q)], [op]) => (*m, vec![(q, op, true)]),
+        ([Q(q), M(m)], [op]) => (*m, vec![(q, op, false)]),
+        ([Q(lo), M(m), Q(hi)], [a, b]) => {
+            if a.direction != b.direction {
+                return Err(
+                    "a chained comparison must point the same way, as in `2ms < cpu < 10ms`"
+                        .to_string(),
+                );
+            }
+            (*m, vec![(lo, a, false), (hi, b, true)])
+        }
+        _ => {
+            return Err(
+                match operands.iter().filter(|o| matches!(o, M(_))).count() {
+                    0 => "a condition compares a metric (cpu, wall, mem, io_read, io_write, pids) against a value",
+                    1 => "expected `cpu < 10ms`, `2ms < cpu` or `2ms < cpu < 10ms` (one metric, at most two values)",
+                    _ => "a condition compares only one metric",
+                }
                 .to_string(),
-        );
-    }
-    if ops.len() == 2 && ops[0].direction != ops[1].direction {
-        return Err(
-            "a chained comparison must point the same way, as in `2ms < cpu < 10ms`".to_string(),
-        );
-    }
+            );
+        }
+    };
 
     let unit = metric.unit();
     let mut bounds = Bounds::default();
-    for (k, op) in ops.iter().enumerate() {
-        // Each comparison has the metric on one side and a quantity on the
-        // other; which side the quantity is on and which way the operator
-        // points together say which end of the range it is.
-        let (quantity, metric_is_left) = match (&operands[k], &operands[k + 1]) {
-            (Operand::Metric(_), q) => (q, true),
-            (q, Operand::Metric(_)) => (q, false),
-            _ => unreachable!("the shape check leaves a metric in every pair"),
-        };
-        let Operand::Quantity {
-            number,
-            suffix,
-            span,
-            text,
-        } = quantity
-        else {
-            unreachable!()
-        };
-        let value = scale(*number, suffix, unit)?;
+    for (q, op, metric_is_left) in comparisons {
         let bound = Bound {
-            value,
+            value: scale(q.number, &q.suffix, unit)?,
             inclusive: op.inclusive,
             literal: Literal {
                 line: 0,
-                span: span.clone(),
-                text: text.clone(),
+                span: q.span.clone(),
+                text: text[q.span.clone()].to_string(),
             },
         };
-        let is_upper = (op.direction == Direction::Less) == metric_is_left;
-        let slot = if is_upper {
-            &mut bounds.upper
+        // Which side the metric is on and which way the operator points
+        // together say which end of the range this is. A chain points one
+        // way throughout, so its two comparisons always bound opposite ends.
+        if (op.direction == Direction::Less) == metric_is_left {
+            bounds.upper = Some(bound);
         } else {
-            &mut bounds.lower
-        };
-        if slot.is_some() {
-            return Err("both comparisons bound the same end of the range".to_string());
+            bounds.lower = Some(bound);
         }
-        *slot = Some(bound);
     }
     if let (Some(lo), Some(hi)) = (&bounds.lower, &bounds.upper)
         && (lo.value > hi.value || (lo.value == hi.value && !(lo.inclusive && hi.inclusive)))
@@ -1081,12 +1055,11 @@ fn parse_operand(text: &str, at: usize) -> Result<(Operand, &str), String> {
             .parse()
             .map_err(|_| format!("`{num}` is not a number"))?;
         return Ok((
-            Operand::Quantity {
+            Operand::Quantity(Qty {
                 number,
                 suffix: suffix.to_string(),
                 span: at..at + end,
-                text: word.to_string(),
-            },
+            }),
             rest,
         ));
     }
@@ -1099,43 +1072,26 @@ fn parse_operand(text: &str, at: usize) -> Result<(Operand, &str), String> {
 }
 
 fn parse_op(text: &str) -> Result<(Op, &str), String> {
-    let (op, len) = if text.starts_with("<=") {
-        (
-            Op {
-                direction: Direction::Less,
-                inclusive: true,
-            },
-            2,
-        )
-    } else if text.starts_with(">=") {
-        (
-            Op {
-                direction: Direction::Greater,
-                inclusive: true,
-            },
-            2,
-        )
-    } else if text.starts_with('<') {
-        (
-            Op {
-                direction: Direction::Less,
-                inclusive: false,
-            },
-            1,
-        )
-    } else if text.starts_with('>') {
-        (
-            Op {
-                direction: Direction::Greater,
-                inclusive: false,
-            },
-            1,
-        )
-    } else {
+    use Direction::{Greater, Less};
+    // The two-character operators first, so `<=` is not read as `<`.
+    const OPS: [(&str, Direction, bool); 4] = [
+        ("<=", Less, true),
+        (">=", Greater, true),
+        ("<", Less, false),
+        (">", Greater, false),
+    ];
+    let Some(&(symbol, direction, inclusive)) = OPS.iter().find(|(s, ..)| text.starts_with(s))
+    else {
         let shown: String = text.chars().take(8).collect();
         return Err(format!("expected `<`, `<=`, `>` or `>=` at `{shown}`"));
     };
-    Ok((op, &text[len..]))
+    Ok((
+        Op {
+            direction,
+            inclusive,
+        },
+        &text[symbol.len()..],
+    ))
 }
 
 #[cfg(test)]
@@ -1313,6 +1269,16 @@ mod tests {
         ] {
             assert!(scan(&format!("#attest({text})\n")).is_err(), "{text}");
         }
+        // A shape that is not a comparison says what is wrong with it.
+        for (text, says) in [
+            ("2ms < 10ms", "compares a metric"),
+            ("cpu < wall", "only one metric"),
+            ("cpu < 2ms < 10ms", "at most two values"),
+            ("2ms > cpu < 10ms", "point the same way"),
+        ] {
+            let err = scan(&format!("#attest({text})\n")).unwrap_err();
+            assert!(err.message.contains(says), "{text}: {}", err.message);
+        }
         // The empty range at equal bounds is fine when both are inclusive.
         let d = one("#attest(2ms <= cpu <= 2ms)\n");
         let (_, bounds) = quantity(&d.conditions[0]);
@@ -1489,9 +1455,7 @@ testX() {
 
     #[test]
     fn set_conditions_parse() {
-        let d = one(
-            "#attest(syscalls not in {socket, connect}, writes in {./build, /tmp,})",
-        );
+        let d = one("#attest(syscalls not in {socket, connect}, writes in {./build, /tmp,})");
         assert_eq!(
             d.conditions[0].kind,
             Kind::Syscalls {
@@ -1529,9 +1493,7 @@ testX() {
         );
         // A set may be spread over lines, and its commas do not split
         // conditions.
-        let d = one(
-            "#attest(\n#  writes in {\n#    ./a,\n#    /tmp/b,\n#  },\n#  cpu < 1s,\n#)",
-        );
+        let d = one("#attest(\n#  writes in {\n#    ./a,\n#    /tmp/b,\n#  },\n#  cpu < 1s,\n#)");
         assert_eq!(d.conditions.len(), 2);
         assert_eq!(d.conditions[0].line, 2);
         assert_eq!(d.conditions[1].line, 6);
