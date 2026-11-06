@@ -14,6 +14,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::output::errln;
 
@@ -68,17 +69,25 @@ fn bind_bare_fuzz(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
 
 const FUZZ_DEFAULT: &str = "0.5";
 
-fn parse_timeout(s: &str) -> Result<f64, String> {
+/// Parsed straight into the `Duration` the runner uses, so a number too big
+/// for one (`1e20`) is a usage error here rather than a panic in
+/// `Duration::from_secs_f64` once the arguments have been accepted.
+fn parse_timeout(s: &str) -> Result<Duration, String> {
     let v: f64 = s
         .parse()
         .map_err(|_| format!("'{}' is not a valid number", s))?;
-    if v.is_finite() && v > 0.0 {
-        Ok(v)
-    } else {
-        Err(format!(
+    if !(v.is_finite() && v > 0.0) {
+        return Err(format!(
             "timeout must be a positive number of seconds, got {}",
             v
-        ))
+        ));
+    }
+    match Duration::try_from_secs_f64(v) {
+        Ok(d) if !d.is_zero() => Ok(d),
+        Ok(_) => Err(format!(
+            "timeout of {v} seconds is shorter than a nanosecond"
+        )),
+        Err(_) => Err(format!("timeout of {v} seconds is too large")),
     }
 }
 
@@ -142,7 +151,7 @@ struct Cli {
 
     /// Kill a test and mark it as timed out after this many seconds (wall-clock time)
     #[arg(long, value_parser = parse_timeout)]
-    timeout: Option<f64>,
+    timeout: Option<Duration>,
 
     /// Print results as JSONL (one JSON object per test) instead of terminal output
     #[arg(long)]
@@ -688,7 +697,7 @@ fn main() -> anyhow::Result<()> {
                 override_cmds: cli.r#override,
                 bin_dirs,
                 strace: cli.strace,
-                timeout: cli.timeout.map(std::time::Duration::from_secs_f64),
+                timeout: cli.timeout,
                 fuzz: cli.fuzz,
                 update_decorators: cli.update_decorators,
             };
@@ -764,6 +773,24 @@ mod tests {
 
         let parsed = cli(&[".", "--fuzz"]).unwrap();
         assert_eq!(parsed.fuzz, Some(0.5));
+    }
+
+    #[test]
+    fn timeout_is_parsed_into_a_duration_or_refused() {
+        let parsed = cli(&["--timeout", "0.5", "."]).unwrap();
+        assert_eq!(parsed.timeout, Some(Duration::from_millis(500)));
+
+        // Each of these used to be accepted as a finite positive f64 and then
+        // panic in `Duration::from_secs_f64`, or be a zero-length timeout
+        // that fails every test.
+        for bad in ["1e20", "1e300", "1e-12", "0", "-1", "inf", "nan", "soon"] {
+            let err = cli(&[&format!("--timeout={bad}"), "."]).err();
+            assert!(
+                err.as_ref()
+                    .is_some_and(|e| e.kind() == clap::error::ErrorKind::ValueValidation),
+                "--timeout {bad}: {err:?}"
+            );
+        }
     }
 
     #[test]
