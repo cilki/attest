@@ -94,6 +94,13 @@ consequences:
   }
   ```
 
+  The one exception the shell itself makes to `set -e` is closed for you: a
+  statement negated with `!` is exempt from it, so `! grep -q error log` that
+  *does* find `error` would otherwise just carry on to the next line. attest
+  runs each such statement as `! … || false`, which fails the test like any
+  other command (the trace then ends in that `false`). A `!` in an `if` or
+  `while` condition or inside an `&&`/`||` list behaves as the shell has it.
+
 Dropping the top level is also what makes inline tests work: taking the
 functions out of a script that happens to be a program doesn't run the program.
 

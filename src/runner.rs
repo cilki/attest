@@ -940,6 +940,7 @@ fn spawn_test<'a>(
     let runner_content = build_runner_script(
         spec.name,
         &spec.file.script,
+        &spec.file.negations,
         &context,
         &config.bin_dirs,
         &config.strace,
@@ -1338,16 +1339,31 @@ fn sh_quote(path: &Path) -> String {
 /// line indexes the original source directly — which is how `diagnostics`
 /// points at the command that failed. A prelude above them would shift all of
 /// it by its own length.
+///
+/// `negations` are the offsets into `functions` that end a negated statement
+/// ([`crate::parser::TestFile::negations`]), each of which gets
+/// [`crate::parser::NEGATION_GUARD`] so that `! cmd` fails the test like any
+/// other command. The guard lengthens a line but never adds one, so the line
+/// numbers stay those of the source.
 fn build_runner_script(
     test_name: &str,
     functions: &str,
+    negations: &[usize],
     working_dir: &Path,
     bin_dirs: &[PathBuf],
     strace: &[String],
 ) -> String {
     use std::fmt::Write;
 
-    let mut s = String::from(functions);
+    let guard = crate::parser::NEGATION_GUARD;
+    let mut s = String::with_capacity(functions.len() + negations.len() * guard.len());
+    let mut copied = 0;
+    for &at in negations {
+        s.push_str(&functions[copied..at]);
+        s.push_str(guard);
+        copied = at;
+    }
+    s.push_str(&functions[copied..]);
     // `build_functions_source` ends every function on a line of its own, but a
     // file holding none at all renders as the empty string.
     if !s.is_empty() && !s.ends_with('\n') {
@@ -2272,6 +2288,56 @@ mod tests {
         );
     }
 
+    /// A negated command is an assertion like any other: `set -e` exempts a
+    /// `!` pipeline, so without the guard `! grep -q foo f` that finds `foo`
+    /// went on to the next line and the test passed (issue #113). One that
+    /// holds still passes, and so does a `!` where `set -e` is off anyway.
+    #[test]
+    fn a_negated_command_that_fails_fails_the_test() {
+        let tmp = TempDir::new().unwrap();
+        let script = "\
+test_found() {
+  echo foo > f
+  ! grep -q foo f
+  echo unreachable
+}
+test_absent() {
+  echo foo > f
+  ! grep -q bar f
+  if ! grep -q foo f; then false; fi
+  ! grep -q foo f && false
+  { ! false; }
+}
+";
+        let Some(found) = run_script(tmp.path(), script, "test_found", &RunConfig::default())
+        else {
+            return;
+        };
+        assert_eq!(found.outcome, Outcome::Fail);
+        let stdout = fs::read_to_string(found.context.join("stdout.log")).unwrap();
+        assert!(!stdout.contains("unreachable"), "{stdout}");
+
+        let absent = run_script(tmp.path(), script, "test_absent", &RunConfig::default()).unwrap();
+        assert_eq!(absent.outcome, Outcome::Pass);
+    }
+
+    /// The guard goes after each negated statement and adds no line, so the
+    /// trace still indexes the source.
+    #[test]
+    fn the_runner_script_guards_each_negation_in_place() {
+        let functions = "test_x() {\n  ! a; ! b\n}\n";
+        let negations = [
+            functions.find("a;").unwrap() + 1,
+            functions.find(" b").unwrap() + 2,
+        ];
+        let script =
+            build_runner_script("test_x", functions, &negations, Path::new("/ctx"), &[], &[]);
+        assert!(
+            script.starts_with("test_x() {\n  ! a || false; ! b || false\n}\n"),
+            "{script}"
+        );
+    }
+
     /// Nothing may be emitted above the function definitions, and nothing the
     /// runner adds below them may be a command a shell can lack.
     ///
@@ -2285,6 +2351,7 @@ mod tests {
         let script = build_runner_script(
             "test_x",
             functions,
+            &[],
             Path::new("/ctx"),
             &[PathBuf::from("/bins")],
             &["strace_me".to_string()],
