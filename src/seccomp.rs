@@ -420,90 +420,85 @@ impl Listener {
     }
 }
 
-/// Does the whole round trip work here — install, notify, `CONTINUE`?
+/// Does the whole round trip work here — install, hand off, notify,
+/// `CONTINUE`?
 ///
-/// A child installs a filter watching `getppid`, calls it, and exits 0 only
-/// if the call still returned its parent's pid; the parent answers the one
-/// notification. Anything short of that — `seccomp(2)` refusing the
-/// listener flag, `pidfd_getfd` missing (Linux before 5.6) or refused (a
-/// Yama `ptrace_scope` that bars it), `CONTINUE` refused (Linux before 5.5),
-/// the child never reporting — is the error, which says which.
+/// `/bin/sh -c :` is spawned the way the runner spawns a test, under a
+/// filter watching `execve`: its own exec is the one notification, and it
+/// only goes through if the answer does. Anything short of that —
+/// `seccomp(2)` refusing the listener flag, `pidfd_getfd` missing (Linux
+/// before 5.6) or refused (a Yama `ptrace_scope` that bars it), `CONTINUE`
+/// refused (Linux before 5.5) — is the error, which says which.
 pub fn probe() -> Result<(), String> {
-    let Some(filter) = Filter::watching(&[Sysno::getppid]) else {
-        return Err("no filter for this architecture".to_string());
-    };
+    let (status, log) = run_watched(&[Sysno::execve], "/bin/sh", &["sh", "-c", ":"])?;
+    if !status.success() {
+        return Err(format!("the child ended with {status}"));
+    }
+    if log.counts.get(&Sysno::execve) != Some(&1) {
+        return Err(format!("expected one execve, heard {:?}", log.counts));
+    }
+    Ok(())
+}
+
+/// Spawn `program` with `argv` under a filter watching `watched`, through
+/// the same [`Spawn`](crate::spawn::Spawn), [`Handoff`] and
+/// [`wait_exec`](crate::spawn::Spawning::wait_exec) path the runner takes,
+/// and answer its notifications until it exits. Its output is discarded.
+fn run_watched(
+    watched: &[Sysno],
+    program: &str,
+    argv: &[&str],
+) -> Result<(std::process::ExitStatus, SyscallLog), String> {
+    let filter = Filter::watching(watched).ok_or("no filter for this architecture")?;
     let handoff = Handoff::new().map_err(|e| format!("mapping the handoff page: {e}"))?;
     let end = handoff.child_end();
-    let me = unsafe { libc::getpid() };
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        return Err(format!("fork: {}", io::Error::last_os_error()));
-    }
-    if pid == 0 {
-        unsafe {
-            let code = match filter.install_and_hand_off(end) {
-                Ok(()) => i32::from(libc::getppid() != me),
-                Err(e) => 100 + e.raw_os_error().unwrap_or(0).clamp(0, 100),
-            };
-            libc::_exit(code);
+    let null = || {
+        std::fs::File::options()
+            .write(true)
+            .open("/dev/null")
+            .map_err(|e| format!("opening /dev/null: {e}"))
+    };
+    let mut spawn = crate::spawn::Spawn::new(program, argv, null()?, null()?)
+        .map_err(|e| format!("spawning {program}: {e}"))?;
+    spawn.hook(move || unsafe { filter.install_and_hand_off(end) });
+    let spawning = spawn.start().map_err(|e| format!("fork: {e}"))?;
+    let mut listener = match handoff.take(spawning.pid()) {
+        Ok(Some(listener)) => listener,
+        // Nothing published: the install failed, and its errno is on the
+        // exec-status pipe (which reaps the child).
+        Ok(None) => {
+            return Err(match spawning.wait_exec(None) {
+                Err(e) => format!("seccomp(2): {e}"),
+                Ok(mut child) => {
+                    let _ = child.wait();
+                    "the child installed no listener".to_string()
+                }
+            });
         }
-    }
-    let exit_code = |status: libc::c_int| -> Result<(), String> {
-        if !libc::WIFEXITED(status) {
-            return Err("the child was killed".to_string());
-        }
-        match libc::WEXITSTATUS(status) {
-            0 => Ok(()),
-            1 => Err("CONTINUE did not let the syscall through".to_string()),
-            code => Err(format!(
-                "seccomp(2): {}",
-                io::Error::from_raw_os_error(code - 100)
-            )),
+        Err(e) => {
+            // `take` killed the child, which is still ours to reap.
+            if let Ok(mut child) = spawning.wait_exec(None) {
+                let _ = child.wait();
+            }
+            return Err(format!("taking the listener (pidfd_getfd): {e}"));
         }
     };
-    (|| -> Result<(), String> {
-        let mut status = 0;
-        let taken = handoff.take(pid);
-        let Some(mut listener) = taken.map_err(|e| {
-            // `take` killed the child, which is still ours to reap.
-            unsafe { libc::waitpid(pid, &mut status, 0) };
-            format!("taking the listener (pidfd_getfd): {e}")
-        })?
-        else {
-            // Nothing published: the install failed, and the exit code says why.
-            unsafe { libc::waitpid(pid, &mut status, 0) };
-            exit_code(status)?;
-            return Err("the child installed no listener".to_string());
+    let mut child = spawning
+        .wait_exec(Some(&mut listener))
+        .map_err(|e| format!("exec under the filter: {e}"))?;
+    // Whatever it makes after the exec may be watched too: keep answering
+    // until it has exited.
+    while !child.has_exited().map_err(|e| format!("waitid: {e}"))? {
+        listener.service();
+        let mut pfd = libc::pollfd {
+            fd: listener.poll_fd().unwrap_or(-1),
+            events: libc::POLLIN,
+            revents: 0,
         };
-        // The one `getppid`, then the exit: wait for either.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            listener.service();
-            let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-            if r == pid {
-                break;
-            }
-            if std::time::Instant::now() > deadline {
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                    libc::waitpid(pid, &mut status, 0);
-                }
-                return Err("the child hung on its notification".to_string());
-            }
-            let mut pfd = libc::pollfd {
-                fd: listener.fd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            unsafe { libc::poll(&mut pfd, 1, 10) };
-        }
-        exit_code(status)?;
-        let log = listener.into_log();
-        if log.counts.get(&Sysno::getppid).copied().unwrap_or(0) != 1 {
-            return Err(format!("expected one getppid, heard {:?}", log.counts));
-        }
-        Ok(())
-    })()
+        unsafe { libc::poll(&mut pfd, 1, 10) };
+    }
+    let status = child.wait().map_err(|e| format!("waitpid: {e}"))?;
+    Ok((status, listener.into_log()))
 }
 
 #[cfg(test)]
@@ -533,29 +528,9 @@ mod tests {
     /// answering while it waits for the exec to go through: the exec may be
     /// a watched syscall itself.
     fn exec_under(watched: &[Sysno]) -> SyscallLog {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let out = std::fs::File::create(tmp.path().join("out")).unwrap();
-        let err = std::fs::File::create(tmp.path().join("err")).unwrap();
-        let filter = Filter::watching(watched).unwrap();
-        let handoff = Handoff::new().unwrap();
-        let end = handoff.child_end();
-        let mut spawn =
-            crate::spawn::Spawn::new("/bin/sh", &["sh", "-c", "true"], out, err).unwrap();
-        spawn.hook(move || unsafe { filter.install_and_hand_off(end) });
-        let spawning = spawn.start().unwrap();
-        let mut listener = handoff.take(spawning.pid()).unwrap().expect("a listener");
-        let mut child = spawning
-            .wait_exec(Some(&mut listener))
-            .expect("the exec went through");
-        loop {
-            listener.service();
-            if let Some(status) = child.try_wait().unwrap() {
-                assert!(status.success(), "{status:?}");
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        listener.into_log()
+        let (status, log) = run_watched(watched, "/bin/sh", &["sh", "-c", "true"]).unwrap();
+        assert!(status.success(), "{status:?}");
+        log
     }
 
     /// The spawn path the runner uses, with `execve` itself watched: the
