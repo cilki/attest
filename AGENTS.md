@@ -522,7 +522,16 @@ everything else), so top-level code in a test file never runs: globals, `trap`s
 and `set` options have to live inside a function. The generated runner script
 enables `set -e` and `set -x` and nothing more — `pipefail` in particular is
 off, so a test asserting on a pipeline must set it itself (see
-`examples/race_condition.test`).
+`examples/race_condition.test`). The one thing it adds to the definitions is
+`parser::NEGATION_GUARD`: POSIX exempts a `!` pipeline from `set -e`, so a
+foreground statement that is nothing but a negated pipeline gets ` || false`
+appended where it ends (issue #113). `build_functions_source` records those
+offsets (`TestFile::negations`, found by `negated_statements` outside
+`if`/`while`/`until` conditions, skipping a statement whose lines hold a
+`<<`, since a here-document's span ends past its delimiter) and
+`build_runner_script` splices them in; `TestFile::script` stays as written
+because it is also what a failure snippet renders. The guard never adds a
+line, so the trace still indexes the source.
 
 A comment block of the form `# attest(cond, cond, ...)` directly above a test
 function (comment lines, a doc comment included, may sit between) is a

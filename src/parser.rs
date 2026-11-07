@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use brush_parser::ast::{
-    Command, CompoundCommand, CompoundList, FunctionDefinition, Program, SourceLocation,
+    AndOr, Command, CompoundCommand, CompoundList, FunctionDefinition, Program, SeparatorOperator,
+    SourceLocation,
 };
 use brush_parser::{Parser, ParserOptions};
 use tracing::warn;
@@ -49,6 +50,12 @@ pub struct TestFile {
     /// to find these — bounds for the *source*, which are only the bounds of
     /// the script the shell ran when every function was located.
     pub functions: Vec<(usize, usize)>,
+    /// Byte offsets into [`TestFile::script`], ascending, right after each
+    /// negated statement (`! cmd`) of a function body. The runner inserts
+    /// [`NEGATION_GUARD`] at each of them in the script it runs (see
+    /// [`negated_statements`]); the script itself stays as written, because
+    /// it is also the text a failure snippet shows.
+    pub negations: Vec<usize>,
     /// The shell the runner execs to define [`TestFile::script`] and call one
     /// of [`TestFile::tests`] (see [`crate::discovery::script_shell`]).
     ///
@@ -472,7 +479,7 @@ pub fn parse_test_file(path: &Path, scan: &Prescan) -> anyhow::Result<TestFile> 
     // spans it is cut with, the bounds a snippet clamps to and the shell that
     // runs it can never be out of step: the file is read once and all of them
     // come from that one read.
-    let (script, bounds) = build_functions_source(&functions, &contents, &keep);
+    let (script, bounds, negations) = build_functions_source(&functions, &contents, &keep);
     // A test defined twice is the last definition (the one the shell runs),
     // so that is where its decorator would go; `starts` is unordered, so
     // take the greatest line per name.
@@ -489,6 +496,7 @@ pub fn parse_test_file(path: &Path, scan: &Prescan) -> anyhow::Result<TestFile> 
         tests,
         script,
         functions: bounds,
+        negations,
         shell: crate::discovery::script_shell(&contents),
         decorators,
         test_lines,
@@ -580,17 +588,21 @@ fn attach_decorators(
 /// alignment is lost, but the script still defines and runs the same
 /// functions.
 ///
-/// Returns the script and, for each function, the 0-based inclusive range of
+/// Returns the script; for each function, the 0-based inclusive range of
 /// lines it occupies *in that script* — exact whichever way the function was
-/// rendered, since this is where it was put.
+/// rendered, since this is where it was put; and the byte offsets in the
+/// script that end a negated statement ([`TestFile::negations`]). Only a
+/// function copied from its source lines has any: the offsets are found in
+/// the source, and a re-rendered function is not where the source has it.
 pub(crate) fn build_functions_source(
     functions: &[FunctionDefinition],
     source: &str,
     keep: &HashSet<usize>,
-) -> (String, Vec<(usize, usize)>) {
+) -> (String, Vec<(usize, usize)>, Vec<usize>) {
     let src_lines: Vec<&str> = source.lines().collect();
     let mut out = String::new();
     let mut bounds = Vec::with_capacity(functions.len());
+    let mut negations = Vec::new();
     // 1-based line number of the next line to be written to `out`.
     let mut line = 1usize;
 
@@ -600,6 +612,14 @@ pub(crate) fn build_functions_source(
         } else {
             func.location()
         };
+        // Where each negated statement of this function ends, by the 1-based
+        // line it ends on, as byte offsets into that line.
+        let mut ends: HashMap<usize, Vec<usize>> = HashMap::new();
+        if located.is_some() {
+            for (end_line, column) in negated_statements(func, &src_lines) {
+                ends.entry(end_line).or_default().push(column);
+            }
+        }
         // Where this function's first line lands, whichever way it is rendered.
         let first = match located {
             None => {
@@ -628,6 +648,10 @@ pub(crate) fn build_functions_source(
                 // `end.line` is the line of the closing brace (inclusive here).
                 let last = span.end.line.min(src_lines.len());
                 for idx in span.start.line..=last {
+                    if let Some(columns) = ends.get_mut(&idx) {
+                        columns.sort_unstable();
+                        negations.extend(columns.iter().map(|c| out.len() + c));
+                    }
                     if let Some(text) = src_lines.get(idx - 1) {
                         out.push_str(text);
                     }
@@ -642,7 +666,123 @@ pub(crate) fn build_functions_source(
         }
     }
 
-    (out, bounds)
+    (out, bounds, negations)
+}
+
+/// What the runner puts after a negated statement: `! cmd` becomes
+/// `! cmd || false`.
+///
+/// `set -e` is what makes every command of a test an assertion, and POSIX
+/// exempts a pipeline that starts with `!` from it — so `! grep -q error log`
+/// in the middle of a test returns 1 and the test carries on to pass, unless
+/// it happens to be the last statement. That is the one shape of assertion a
+/// shell has for "this must fail", and the one the test author is least
+/// likely to suspect. `||` binds looser than `!`, so the guard applies to the
+/// whole negated pipeline, and the list it makes ends in a plain `false`,
+/// which `set -e` does not exempt. Its status is the negation's either way,
+/// so where `set -e` is off — a condition, a non-final `&&` operand, a
+/// caller's `if` — nothing changes.
+pub(crate) const NEGATION_GUARD: &str = " || false";
+
+/// Where each negated statement in `func`'s body ends: the 1-based line and
+/// the byte offset into that line (of `src_lines`) where [`NEGATION_GUARD`]
+/// goes.
+///
+/// A statement is an and-or list of the one pipeline, started with `!` and
+/// run in the foreground: `! a && b` already fails on `b`, and a background
+/// job's status is nobody's assertion. The conditions of `if`, `while` and
+/// `until` are left alone — `set -e` is off in them, so the guard would only
+/// add a `false` to the trace. So is a statement holding a here-document,
+/// whose span ends after the body, where the guard would land past the
+/// delimiter; it keeps the shell's own behaviour.
+fn negated_statements(func: &FunctionDefinition, src_lines: &[&str]) -> Vec<(usize, usize)> {
+    let mut found = Vec::new();
+    negations_in_compound(&func.body.0, src_lines, &mut found);
+    found
+}
+
+fn negations_in_list(list: &CompoundList, src_lines: &[&str], found: &mut Vec<(usize, usize)>) {
+    for item in &list.0 {
+        let and_or = &item.0;
+        if and_or.first.bang
+            && and_or.additional.is_empty()
+            && matches!(item.1, SeparatorOperator::Sequence)
+            && let Some(span) = and_or.first.location()
+            && let Some(column) = statement_end(&span, src_lines)
+        {
+            found.push((span.end.line, column));
+        }
+        for pipeline in
+            std::iter::once(&and_or.first).chain(and_or.additional.iter().map(|additional| {
+                match additional {
+                    AndOr::And(p) | AndOr::Or(p) => p,
+                }
+            }))
+        {
+            for cmd in &pipeline.seq {
+                match cmd {
+                    Command::Compound(compound, _) => {
+                        negations_in_compound(compound, src_lines, found)
+                    }
+                    Command::Function(f) => negations_in_compound(&f.body.0, src_lines, found),
+                    Command::Simple(_) => {}
+                }
+            }
+        }
+    }
+}
+
+fn negations_in_compound(
+    compound: &CompoundCommand,
+    src_lines: &[&str],
+    found: &mut Vec<(usize, usize)>,
+) {
+    match compound {
+        CompoundCommand::BraceGroup(b) => negations_in_list(&b.list, src_lines, found),
+        CompoundCommand::Subshell(s) => negations_in_list(&s.list, src_lines, found),
+        CompoundCommand::ForClause(f) => negations_in_list(&f.body.list, src_lines, found),
+        CompoundCommand::ArithmeticForClause(a) => {
+            negations_in_list(&a.body.list, src_lines, found)
+        }
+        CompoundCommand::WhileClause(w) | CompoundCommand::UntilClause(w) => {
+            negations_in_list(&w.1.list, src_lines, found)
+        }
+        CompoundCommand::IfClause(i) => {
+            negations_in_list(&i.then, src_lines, found);
+            for else_clause in i.elses.iter().flatten() {
+                negations_in_list(&else_clause.body, src_lines, found);
+            }
+        }
+        CompoundCommand::CaseClause(c) => {
+            for cmd in c.cases.iter().filter_map(|item| item.cmd.as_ref()) {
+                negations_in_list(cmd, src_lines, found);
+            }
+        }
+        CompoundCommand::Arithmetic(_)
+        | CompoundCommand::Coprocess(_)
+        | CompoundCommand::ExtendedTest(_) => {}
+    }
+}
+
+/// The byte offset into line `span.end.line` where the statement `span`
+/// covers ends, or `None` where the guard cannot safely go there.
+///
+/// The parser's columns count characters, 1-based, and the end is exclusive.
+/// A `<<` anywhere on the statement's lines that is not a `<<<` here-string
+/// may be a here-document, whose body the span runs on into; rather than
+/// tell the two apart (a quoted `<<` is not one), the statement is skipped.
+fn statement_end(span: &brush_parser::SourceSpan, src_lines: &[&str]) -> Option<usize> {
+    let lines = src_lines.get(span.start.line.checked_sub(1)?..span.end.line)?;
+    if lines.iter().any(|l| l.replace("<<<", "").contains("<<")) {
+        return None;
+    }
+    let text = lines.last()?;
+    let column = span.end.column.checked_sub(1)?;
+    match text.char_indices().nth(column) {
+        Some((byte, _)) => Some(byte),
+        None if text.chars().count() == column => Some(text.len()),
+        None => None,
+    }
 }
 
 fn extract_functions(program: &Program) -> Vec<FunctionDefinition> {
@@ -920,6 +1060,77 @@ mod tests {
         assert_eq!(enclosing_function_bounds(source, 5), Some((4, 6)));
     }
 
+    /// The text in front of each negation offset, up to the start of its line
+    /// — what the guard is appended to.
+    fn guarded(source: &str) -> Vec<String> {
+        let tmp = TempDir::new().unwrap();
+        let path = write_script(tmp.path(), "neg.test", source);
+        let tf = parse_test_file(&path, &Prescan::default()).unwrap();
+        tf.negations
+            .iter()
+            .map(|&at| {
+                let start = tf.script[..at].rfind('\n').map_or(0, |i| i + 1);
+                tf.script[start..at].trim_start().to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn negations_end_each_negated_statement() {
+        let source = "\
+test_x() {
+  ! grep -q x f # a comment
+  é; ! a | b; ! c
+  ! e \\
+    f
+  ! { g; }
+  case x in x) ! h;; esac
+  ( ! [[ é == b ]] )
+  for i in 1; do ! j; done
+  if ! k; then ! l; else ! m; fi
+  helper() { ! n; }
+}
+";
+        assert_eq!(
+            guarded(source),
+            [
+                "! grep -q x f",
+                "é; ! a | b",
+                "é; ! a | b; ! c",
+                "f",
+                "! { g; }",
+                "case x in x) ! h",
+                "( ! [[ é == b ]]",
+                "for i in 1; do ! j",
+                "if ! k; then ! l",
+                "if ! k; then ! l; else ! m",
+                "helper() { ! n",
+            ]
+        );
+    }
+
+    #[test]
+    fn negations_leave_alone_what_set_e_already_judges() {
+        // A condition has `set -e` off, an and-or list is judged by its last
+        // pipeline, a background job by nobody, and a here-document's span
+        // ends past its delimiter, where the guard cannot go.
+        let source = "\
+test_x() {
+  if ! a; then :; fi
+  while ! b; do :; done
+  until ! c; do :; done
+  ! d && e
+  f || ! g
+  ! h &
+  ! grep x <<EOF
+x
+EOF
+  ! i
+}
+";
+        assert_eq!(guarded(source), ["! i"]);
+    }
+
     #[test]
     fn functions_source_falls_back_when_the_source_is_unavailable() {
         // Without the original text there are no line numbers to preserve, so
@@ -929,7 +1140,7 @@ mod tests {
         let source = "helper() {\n  echo 42\n}\n\ntest_foo() {\n  test \"$(helper)\" = 42\n}\n";
         let functions = parse_functions(source).unwrap();
 
-        let (generated, bounds) = build_functions_source(&functions, "", &HashSet::new());
+        let (generated, bounds, _) = build_functions_source(&functions, "", &HashSet::new());
         // Even so, where each function landed is known exactly: the two are
         // re-rendered back to back, `helper` as three lines and `test_foo` as
         // the three after it.
