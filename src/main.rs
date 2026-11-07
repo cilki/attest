@@ -687,6 +687,9 @@ fn main() -> anyhow::Result<()> {
                         .map_err(|e| anyhow::anyhow!("--bin-dir: {} ({e})", dir.display()))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
+            for spec in &cli.r#override {
+                spec.check_source()?;
+            }
 
             let config = runner::RunConfig {
                 parallel: cli.parallel,

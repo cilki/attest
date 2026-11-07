@@ -483,6 +483,22 @@ impl std::str::FromStr for OverrideSpec {
     }
 }
 
+impl OverrideSpec {
+    /// Checks, once and before any test is spawned, that the source is a file
+    /// the per-test copy can take. Left to that copy, a directory failed the
+    /// run with `std::fs::copy`'s bare "the source path is neither a regular
+    /// file nor a symlink to a regular file" — naming neither the option nor
+    /// the path.
+    pub fn check_source(&self) -> anyhow::Result<()> {
+        let src = self.source.display();
+        match std::fs::metadata(&self.source) {
+            Ok(meta) if meta.is_file() => Ok(()),
+            Ok(_) => Err(anyhow!("--override: {src} is not a regular file")),
+            Err(e) => Err(anyhow!("--override: {src} ({e})")),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct RunConfig {
     pub parallel: usize,
@@ -908,17 +924,13 @@ fn spawn_test<'a>(
         std::fs::create_dir_all(bin)?;
 
         for spec in &config.override_cmds {
+            // The source was checked before the run (`check_source`); this
+            // only fails if it changed since.
             let src = &spec.source;
-            if !src.exists() {
-                return Err(anyhow!(
-                    "--override: source path does not exist: {}",
-                    src.display()
-                ));
-            }
             let dst = bin.join(&spec.name);
 
             debug!(src=%src.display(), dst=%dst.display(), "Overriding command");
-            std::fs::copy(src, &dst)?;
+            std::fs::copy(src, &dst).map_err(|e| anyhow!("--override: {} ({e})", src.display()))?;
         }
     }
 
@@ -2462,6 +2474,37 @@ mod tests {
         assert!(result.outcome.passed());
         // bin/true should exist in the context dir
         assert!(result.context.join("bin/true").exists());
+    }
+
+    #[test]
+    fn override_source_check_names_the_option_and_the_path() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("tool");
+        fs::write(&file, "#!/bin/sh\n").unwrap();
+        let spec = |source: PathBuf| OverrideSpec {
+            name: "tool".into(),
+            source,
+        };
+
+        assert!(spec(file.clone()).check_source().is_ok());
+
+        // A directory used to reach the per-test copy and fail the run with
+        // `fs::copy`'s message alone.
+        let dir = spec(tmp.path().to_path_buf()).check_source().unwrap_err();
+        assert_eq!(
+            dir.to_string(),
+            format!("--override: {} is not a regular file", tmp.path().display())
+        );
+
+        let missing = tmp.path().join("missing");
+        let err = spec(missing.clone())
+            .check_source()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with(&format!("--override: {} (", missing.display())),
+            "{err}"
+        );
     }
 
     #[test]
