@@ -356,9 +356,10 @@
   exactly as it would have) and only ever reads while `poll` says the
   descriptor is readable, since `NOTIF_RECV` blocks otherwise; `POLLHUP`
   marks it dead, which is nobody left behind the filter. `probe` rehearses
-  the whole round trip once per run (`getppid` through a filter in a forked
-  child, the listener taken with `pidfd_getfd`), and where it fails the run installs nothing and the condition is
-  `Unmeasured`.
+  the whole round trip once per run through the runner's own spawn path
+  (`run_watched`: `/bin/sh -c :` under a filter watching `execve`, the
+  listener taken with `pidfd_getfd` and answered by `wait_exec`), and where
+  it fails the run installs nothing and the condition is `Unmeasured`.
 - `src/spawn.rs` - Fork-and-exec with the parent kept awake. `std::process::
   Command` blocks in `spawn` until the child's `execve` returns — and under
   a filter watching `execve` that return waits on the parent answering the
@@ -373,7 +374,8 @@
   startup — and glibc's nscd client makes a `socket` and a `connect` for it,
   which a `syscalls not in {socket}` condition would then blame on the test
   only on hosts (containers, CI) that do not export `SHELL`. `Child` is the pid plus whether
-  it has been reaped, with the `try_wait`/`wait` the runner used from `std`
+  it has been reaped, with a `has_exited` that leaves the zombie in place
+  and the blocking `wait` that consumes it
   (no `kill`: the child leads its own process group, so the runner's
   `kill(-pgid)` already reaches it).
 - `src/diagnostics.rs` - On failure, parses `xtrace.log` to find the last

@@ -270,8 +270,7 @@ impl Child {
 
     /// Has the child exited? `waitid` with `WNOWAIT` answers that without
     /// consuming the zombie, so the pid — and a process group named after
-    /// it — stays reserved until [`Self::try_wait`] or [`Self::wait`] reaps
-    /// it.
+    /// it — stays reserved until [`Self::wait`] reaps it.
     pub fn has_exited(&self) -> io::Result<bool> {
         if self.reaped() {
             return Ok(true);
@@ -298,39 +297,25 @@ impl Child {
         Ok(unsafe { info.si_pid() } != 0)
     }
 
-    fn waitpid(&mut self, flags: libc::c_int) -> io::Result<Option<ExitStatus>> {
+    /// Reap the child, waiting for it to exit. Once [`Self::has_exited`] has
+    /// said it has, this does not block.
+    pub fn wait(&mut self) -> io::Result<ExitStatus> {
         if let Some(status) = self.status {
-            return Ok(Some(status));
+            return Ok(status);
         }
         loop {
             let mut raw = 0;
-            let pid = unsafe { libc::waitpid(self.pid, &mut raw, flags) };
-            if pid < 0 {
+            if unsafe { libc::waitpid(self.pid, &mut raw, 0) } < 0 {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
                 return Err(err);
             }
-            if pid == 0 {
-                return Ok(None);
-            }
             let status = ExitStatus::from_raw(raw);
             self.status = Some(status);
-            return Ok(Some(status));
+            return Ok(status);
         }
-    }
-
-    /// Reap the child if it has exited; `None` while it is still running.
-    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        self.waitpid(libc::WNOHANG)
-    }
-
-    /// Reap the child, waiting for it to exit.
-    pub fn wait(&mut self) -> io::Result<ExitStatus> {
-        Ok(self
-            .waitpid(0)?
-            .expect("a blocking waitpid returns a status"))
     }
 }
 
@@ -415,9 +400,9 @@ mod tests {
     }
 
     /// `has_exited` sees the exit without reaping: the pid stays the child's
-    /// until `try_wait` consumes the zombie, and only then is it `reaped`.
+    /// until `wait` consumes the zombie, and only then is it `reaped`.
     #[test]
-    fn has_exited_leaves_the_zombie_for_try_wait() {
+    fn has_exited_leaves_the_zombie_for_wait() {
         let (_tmp, out, err) = logs();
         let spawn = Spawn::new("/bin/sh", &["sh", "-c", "exit 3"], out, err).unwrap();
         let mut child = spawn.start().unwrap().wait_exec(None).unwrap();
@@ -427,7 +412,7 @@ mod tests {
         assert!(!child.reaped());
         // Still a zombie of ours: signalling it is not an error.
         assert_eq!(unsafe { libc::kill(child.id() as i32, 0) }, 0);
-        let status = child.try_wait().unwrap().expect("exited");
+        let status = child.wait().unwrap();
         assert_eq!(status.code(), Some(3));
         assert!(child.reaped());
         assert!(child.has_exited().unwrap());

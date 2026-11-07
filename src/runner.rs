@@ -421,7 +421,7 @@ impl PendingTest<'_> {
         // Background processes the test left behind outlive the shell;
         // tests are promised they never have to clean those up themselves.
         self.kill_tree();
-        self.child.try_wait()
+        self.child.wait().map(Some)
     }
 }
 
