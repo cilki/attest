@@ -79,15 +79,6 @@ impl TestCgroup {
         let _ = std::fs::write(self.path.join("cgroup.kill"), "1");
     }
 
-    /// Read total CPU time (user + system) from the cgroup. Returns `None`
-    /// when the cpu controller is unavailable.
-    pub fn read_cpu_time(&self) -> Option<std::time::Duration> {
-        let (user, system) = read_cpu_usec(self.path.join("cpu.stat"));
-        Some(std::time::Duration::from_micros(
-            user? + system.unwrap_or(0),
-        ))
-    }
-
     /// Read resource stats from the cgroup pseudo-files. Call this after the
     /// child has exited (waitpid returned) but before dropping the handle.
     pub fn read_stats(&self) -> ResourceStats {

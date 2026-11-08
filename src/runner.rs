@@ -763,17 +763,15 @@ pub fn run_all_tests<'a>(
             status.suspend(|| tailed = Tailed::open(p));
         }
 
-        // Update status line with currently running tests.
+        // Update status line with currently running tests and how long each
+        // has been running. Wall-clock, not the cgroup's CPU time: a test
+        // waiting on `sleep`, the network or a child barely uses the CPU, so
+        // its CPU time froze in the status line while it ran on — and the
+        // clock it is racing (`--timeout`) and the duration its result line
+        // reports are both wall-clock.
         let running: Vec<(&str, Duration)> = pending_list
             .iter()
-            .map(|p| {
-                let duration = p
-                    .cgroup
-                    .as_ref()
-                    .and_then(|cg| cg.read_cpu_time())
-                    .unwrap_or_else(|| p.start.elapsed());
-                (p.name.as_str(), duration)
-            })
+            .map(|p| (p.name.as_str(), p.start.elapsed()))
             .collect();
         status.update(&running);
 
