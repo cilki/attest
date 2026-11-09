@@ -249,7 +249,7 @@ fn split_path_arg(arg: &str) -> (PathBuf, Option<String>) {
         // is a path — which would swallow the name half we just established is
         // one. The file half matches as a suffix, so dropping it changes
         // nothing else.
-        let file = file.strip_prefix("./").unwrap_or(file);
+        let file = parser::strip_dot_slash(file).unwrap_or(file);
         format!("{file}/{name}")
     });
     (PathBuf::from(file), filter)
@@ -1032,6 +1032,17 @@ mod tests {
         // Both spellings of the target select the same test.
         let (_, bare) = split_path_arg("examples/md5sum.test/testHello");
         assert_eq!(filter, bare);
+
+        // So do the spellings `"$dir/…"` gives for a `$dir` of `./` or `./.`:
+        // keeping what followed the first `./` made the filter
+        // `/examples/…` (absolute) or `./examples/…` (all path).
+        for target in [
+            ".//examples/md5sum.test/testHello",
+            "././examples/md5sum.test/testHello",
+        ] {
+            let (_, other) = split_path_arg(target);
+            assert_eq!(other, bare, "{target}");
+        }
 
         let pattern = parser::TestPattern::parse(&filter.unwrap());
         assert!(pattern.matches(Path::new("./examples/md5sum.test"), "testHello"));

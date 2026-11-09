@@ -129,7 +129,7 @@ impl TestPattern {
         // out empty (`foo.sh/`, `/test_x`), which means "unconstrained"; a name
         // is attached to a path by spelling the selector out without the `./`
         // (`a/x.test/test_foo`), which is the form `list` prints.
-        let (file_part, name_part) = match s.strip_prefix("./") {
+        let (file_part, name_part) = match strip_dot_slash(s) {
             Some(path) => (path, ""),
             None => s.rsplit_once('/').unwrap_or(("", s)),
         };
@@ -172,7 +172,28 @@ impl TestPattern {
 /// hands over.
 pub(crate) fn selector_path(file: &Path) -> String {
     let path = file.to_string_lossy();
-    path.strip_prefix("./").unwrap_or(&path).to_string()
+    strip_dot_slash(&path).unwrap_or(&path).to_string()
+}
+
+/// What follows the `./` marker that opens `s`, or `None` when it has none.
+///
+/// A run of markers and the slashes behind them is one marker: `.//a/x.test`
+/// and `././a/x.test` are the same path as `./a/x.test` to the filesystem, and
+/// they are what `"$dir/x.test"` spells when `$dir` is `./` or `./.`. Stripping
+/// only the first `./` left the rest in front of the selector — `.//a`
+/// became `/a`, an absolute path that names nothing and that no discovered
+/// path ends with, and `././a` became `./a`, which [`TestPattern::parse`] then
+/// read as all path — so such a target selected nothing and `list` printed
+/// selectors that pointed at `/a/x.test`.
+pub(crate) fn strip_dot_slash(s: &str) -> Option<&str> {
+    let mut rest = s.strip_prefix("./")?;
+    loop {
+        rest = rest.trim_start_matches('/');
+        match rest.strip_prefix("./") {
+            Some(next) => rest = next,
+            None => return Some(rest),
+        }
+    }
 }
 
 /// Format a `(file, test name)` pair as the `<file>/<name>` selector that
@@ -760,6 +781,40 @@ mod tests {
         let p = TestPattern::parse("foo.sh/test_bar");
         assert_eq!(p.file.as_deref(), Some(Path::new("foo.sh")));
         assert_eq!(p.name.as_deref(), Some("test_bar"));
+    }
+
+    /// `.//x` and `././x` are `./x` spelled by a `"$dir/x"` whose `$dir` is
+    /// `./` or `./.`; each used to keep what followed its first `./` — a root
+    /// `/` that made the path absolute, or a second marker.
+    #[test]
+    fn repeated_dot_slash_is_one_marker() {
+        for spelling in [
+            "./tests/foo.sh",
+            ".//tests/foo.sh",
+            "././tests/foo.sh",
+            "././/./tests/foo.sh",
+        ] {
+            let p = TestPattern::parse(spelling);
+            assert_eq!(
+                p.file.as_deref(),
+                Some(Path::new("tests/foo.sh")),
+                "{spelling}"
+            );
+            assert!(p.name.is_none(), "{spelling}");
+            assert!(
+                p.matches(Path::new("./tests/foo.sh"), "test_bar"),
+                "{spelling}"
+            );
+
+            assert_eq!(
+                selector(Path::new(spelling), "test_bar"),
+                "tests/foo.sh/test_bar"
+            );
+        }
+        // No marker, nothing stripped: an absolute path stays one.
+        assert_eq!(strip_dot_slash("/tests/foo.sh"), None);
+        assert_eq!(selector(Path::new("/tests/foo.sh"), "t"), "/tests/foo.sh/t");
+        assert_eq!(strip_dot_slash(".//"), Some(""));
     }
 
     #[test]
