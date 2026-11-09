@@ -193,7 +193,7 @@ impl Tailed {
     /// yet: the test's own shell creates the file as it starts up, so a
     /// freshly spawned test may not have one for the first tick or two.
     fn open(pending: &PendingTest) -> Option<Self> {
-        let xtrace_path = pending.context.as_ref().unwrap().join("xtrace.log");
+        let xtrace_path = pending.context.join("xtrace.log");
         let file = overlay::open_nofollow(&xtrace_path).ok()?;
         xtrace_header(&pending.name);
         Some(Self {
@@ -360,15 +360,17 @@ impl TestResult<'_> {
 }
 
 /// State held by the parent for a spawned test child that has not yet been
-/// waited on. Dropping this kills the child (if still running) and cleans up.
+/// waited on. Dropping this kills the child (if still running) and reaps it.
 struct PendingTest<'a> {
     child: Child,
     /// Set to `true` when the child was killed due to exceeding `--timeout`.
     timed_out: bool,
     name: String,
     start: Instant,
-    /// `None` after the path has been transferred to `TestResult`.
-    context: Option<PathBuf>,
+    /// The test's context dir, under the run's temp dir. Never removed on its
+    /// own: a finished test's is read by the report for as long as the run
+    /// lasts, and the temp dir takes every one of them with it at the end.
+    context: PathBuf,
     /// The parse the test was run from: the failure report renders its
     /// snippet out of the script this holds (see
     /// [`crate::diagnostics::print_failure_snippet`]), and the function's
@@ -432,9 +434,6 @@ impl Drop for PendingTest<'_> {
         // torn down there, and `kill_tree` is a no-op once that has happened.
         self.kill_tree();
         let _ = self.child.wait();
-        if let Some(ref dir) = self.context {
-            let _ = std::fs::remove_dir_all(dir);
-        }
         // cgroup field drops here, removing the cgroup directory
     }
 }
@@ -636,7 +635,7 @@ pub fn run_all_tests<'a>(
         // A SIGINT/SIGTERM arrived: kill every test tree and abort the run.
         if INTERRUPTED.load(Ordering::Relaxed) {
             let n = pending_list.len();
-            pending_list.clear(); // drop kills the trees and removes contexts
+            pending_list.clear(); // drop kills and reaps the trees
             status.finish();
             anyhow::bail!("interrupted; killed {n} running test(s)");
         }
@@ -646,7 +645,7 @@ pub fn run_all_tests<'a>(
         // report to, so wind the run down like an interrupt rather than running
         // it out in silence; `main` then exits on a real SIGPIPE.
         if output::output_closed() {
-            pending_list.clear(); // drop kills the trees and removes contexts
+            pending_list.clear(); // drop kills and reaps the trees
             status.finish();
             return Ok(results);
         }
@@ -693,10 +692,9 @@ pub fn run_all_tests<'a>(
             let pending = pending_list.remove(i);
             if bail_flag {
                 if config.verbose >= 2 {
-                    let context = pending.context.as_deref().unwrap();
-                    status.suspend(|| finish_xtrace(&mut tailed, &pending.name, context));
+                    status.suspend(|| finish_xtrace(&mut tailed, &pending.name, &pending.context));
                 }
-                continue; // Drop kills + cleans up
+                continue; // Drop kills and reaps it
             }
             let result = build_result(pending, exit_status, config, &env);
             if let Some(ref save_dir) = config.save_context {
@@ -826,9 +824,8 @@ fn private_temp_dir() -> std::io::Result<tempfile::TempDir> {
 /// anything there, `/` and `..` included (`test_x/../../../etc() { … }` parses
 /// and runs fine under sh and bash). Joining such a name onto the run's temp
 /// dir escapes it, and the escape is not contained by test isolation: the
-/// parent process creates the context dir, opens the test's logs in it, and
-/// `remove_dir_all`s it on drop, all outside any overlay and
-/// with the invoking user's privileges. `--save-context` would likewise copy
+/// parent process creates the context dir and opens the test's logs in it,
+/// outside any overlay and with the invoking user's privileges. `--save-context` would likewise copy
 /// the test's files outside the directory that was asked for.
 ///
 /// So the display name is kept verbatim for output and the directory name is
@@ -1067,7 +1064,7 @@ fn spawn_test<'a>(
         timed_out: false,
         name: display_name.clone(),
         start,
-        context: Some(context),
+        context,
         file: spec.file,
         test: spec.name,
         cgroup,
@@ -1111,8 +1108,7 @@ fn build_result<'a>(
             .iter()
             .any(|c| matches!(c.kind, decorator::Kind::Writes(_)))
         {
-            let context = pending.context.as_deref().unwrap();
-            match overlay::delta_paths(context, &env.submounts) {
+            match overlay::delta_paths(&pending.context, &env.submounts) {
                 Ok(paths) => Some(paths),
                 Err(e) => {
                     debug!(test = %pending.name, "could not read the delta: {e}");
@@ -1144,18 +1140,18 @@ fn build_result<'a>(
     }
 
     TestResult {
-        name: pending.name.clone(),
+        name: std::mem::take(&mut pending.name),
         test: pending.test,
         file: pending.file,
         outcome,
         duration,
-        context: pending.context.take().unwrap(),
+        context: std::mem::take(&mut pending.context),
         resources,
         syscalls,
         violations,
     }
-    // pending drops here: a reaped child skips kill/wait, context=None skips
-    // dir removal, cgroup drops removing the cgroup directory.
+    // pending drops here: a reaped child skips kill/wait, cgroup drops
+    // removing the cgroup directory.
 }
 
 /// Say once per run, per metric, that conditions on it are going unchecked.
@@ -2414,7 +2410,7 @@ mod tests {
         let status = reap_blocking(&mut pending);
         assert!(status.success());
 
-        let context = pending.context.clone().unwrap();
+        let context = pending.context.clone();
         let pid: u32 = fs::read_to_string(cwd_dir(&context).join("pid"))
             .unwrap()
             .trim()
