@@ -36,6 +36,9 @@
 //! the hostname does not change the host's.
 
 use std::ffi::{CStr, CString, OsString};
+use std::fs::File;
+use std::io::Read;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
@@ -779,15 +782,12 @@ unsafe fn run_probe(plan: &RootOverlay) -> Result<(), ProbeFailure> {
         if libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
             return Err(ProbeFailure::Lost);
         }
-        let [rd, wr] = fds;
+        let [rd, wr] = fds.map(|fd| OwnedFd::from_raw_fd(fd));
         let pid = libc::fork();
         if pid < 0 {
-            libc::close(rd);
-            libc::close(wr);
             return Err(ProbeFailure::Lost);
         }
         if pid == 0 {
-            libc::close(rd);
             let code = match setup_root(plan) {
                 Ok(()) => 0,
                 Err((stage, errno)) => {
@@ -797,29 +797,22 @@ unsafe fn run_probe(plan: &RootOverlay) -> Result<(), ProbeFailure> {
                     let mut report = [0u8; 8];
                     report[..4].copy_from_slice(&stage.to_ne_bytes());
                     report[4..].copy_from_slice(&errno.to_ne_bytes());
-                    libc::write(wr, report.as_ptr().cast(), report.len());
+                    libc::write(wr.as_raw_fd(), report.as_ptr().cast(), report.len());
                     1
                 }
             };
             libc::_exit(code);
         }
-        libc::close(wr);
+        drop(wr);
+        // One `write` of fewer than `PIPE_BUF` bytes, so all of it or nothing.
         let mut buf = [0u8; 8];
-        let mut got = 0usize;
-        while got < buf.len() {
-            let n = libc::read(rd, buf[got..].as_mut_ptr().cast(), buf.len() - got);
-            if n <= 0 {
-                break;
-            }
-            got += n as usize;
-        }
-        libc::close(rd);
+        let reported = File::from(rd).read_exact(&mut buf).is_ok();
         let mut status = 0;
         libc::waitpid(pid, &mut status, 0);
         if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
             return Ok(());
         }
-        if got == buf.len() {
+        if reported {
             let stage = u32::from_ne_bytes(buf[..4].try_into().unwrap()) as usize;
             let errno = i32::from_ne_bytes(buf[4..].try_into().unwrap());
             return Err(ProbeFailure::Setup {

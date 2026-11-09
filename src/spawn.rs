@@ -17,7 +17,7 @@
 
 use std::ffi::CString;
 use std::fs::File;
-use std::io;
+use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
@@ -163,7 +163,7 @@ impl Spawn {
         drop(status_wr);
         Ok(Spawning {
             child: Child { pid, status: None },
-            status_rd,
+            status_rd: File::from(status_rd),
         })
     }
 }
@@ -171,7 +171,7 @@ impl Spawn {
 /// A forked child that has not yet been seen to exec.
 pub struct Spawning {
     child: Child,
-    status_rd: OwnedFd,
+    status_rd: File,
 }
 
 impl Spawning {
@@ -216,35 +216,18 @@ impl Spawning {
                 continue;
             }
             // The outcome: EOF for an exec that went through, an errno for
-            // a hook or exec that did not.
-            let mut buf = [0u8; 4];
-            let mut got = 0;
-            while got < buf.len() {
-                let n = unsafe {
-                    libc::read(
-                        self.status_rd.as_raw_fd(),
-                        buf[got..].as_mut_ptr().cast(),
-                        buf.len() - got,
-                    )
-                };
-                match n {
-                    0 => break,
-                    n if n > 0 => got += n as usize,
-                    _ => {
-                        let err = io::Error::last_os_error();
-                        if err.kind() == io::ErrorKind::Interrupted {
-                            continue;
-                        }
-                        return Err(err);
-                    }
+            // a hook or exec that did not. The child writes the errno in one
+            // `write` of fewer than `PIPE_BUF` bytes, which a pipe delivers
+            // whole, so there is no such thing as part of one.
+            let mut errno = [0u8; 4];
+            return match self.status_rd.read_exact(&mut errno) {
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(self.child),
+                Err(e) => Err(e),
+                Ok(()) => {
+                    let _ = self.child.wait();
+                    Err(io::Error::from_raw_os_error(i32::from_ne_bytes(errno)))
                 }
-            }
-            if got == 0 {
-                return Ok(self.child);
-            }
-            let errno = i32::from_ne_bytes(buf);
-            let _ = self.child.wait();
-            return Err(io::Error::from_raw_os_error(errno));
+            };
         }
     }
 }
