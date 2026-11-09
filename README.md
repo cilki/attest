@@ -930,6 +930,11 @@ subshell — here the two halves of `$(echo hello | md5sum)`. The exception is
 the very first line, which is the runner calling the test function: its number
 belongs to the small script `attest` generates, not to your file.
 
+The `-->` line names the file the way `list` does — by the path it was found
+under, relative to where you ran `attest` (`tests/net/dns.test:7:2` for
+`attest .`) — so two files with the same name stay apart and the location
+opens straight from the terminal.
+
 The snippet points at the last command the trace recorded, with up to three
 lines of context on either side, clamped to the enclosing function so it never
 runs on into the next test. Subshell lines are skipped when locating it, so a

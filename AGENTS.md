@@ -419,6 +419,9 @@
   but prints `U+0080`–`U+009F` through, and those are controls a UTF-8
   terminal obeys (`U+009B` is `CSI`). Escaping happens before the annotation
   span is measured, since it moves the offsets the span is built from.
+  The snippet's `-->` path is `TestFile::path` through `selector_path` — the
+  path the walk found, as `list` prints it — not the base name, which could
+  not tell `x/t.test` from `y/t.test` and resolved from nowhere.
   `print_violations` is the report for a test that failed only its
   `#attest(...)` conditions: one snippet per violation, rendered from the same
   `script` (the parser keeps decorator lines in it at their own line numbers
