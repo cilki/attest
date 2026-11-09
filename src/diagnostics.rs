@@ -63,7 +63,7 @@ pub fn print_failure_snippet(result: &TestResult) {
         "{}",
         render_snippet(
             title,
-            &result.file.canonical_path,
+            &result.file.path,
             &lines,
             Highlight::line(line_idx),
             func_start_line,
@@ -113,7 +113,7 @@ pub fn print_violations(result: &TestResult) {
             "{}",
             render_snippet(
                 "assertion on the run failed",
-                &result.file.canonical_path,
+                &result.file.path,
                 &lines,
                 Highlight {
                     line: line_idx,
@@ -322,15 +322,16 @@ fn render_snippet(
 
     let line_idx = highlight.line;
 
-    // A file name comes out of the directory walk, so it is as much the tree's
-    // choice as a test name is: annotate-snippets substitutes the control
-    // characters in the rendered *source*, but prints the path it is given
-    // as-is.
-    let file_name = source_path
-        .file_name()
-        .map(|n| n.to_string_lossy())
-        .unwrap_or_else(|| source_path.to_string_lossy());
-    let path_str = crate::output::escape_label(&file_name);
+    // The path as discovered, spelled the way `list` spells it: the `-->`
+    // line is where an editor or a terminal jumps from, so it has to name
+    // the file from the directory the run was started in. The base name alone
+    // named `t.test` for both `x/t.test` and `y/t.test`, and resolved against
+    // nothing for a file outside the cwd. A path comes out of the directory
+    // walk, so it is as much the tree's choice as a test name is:
+    // annotate-snippets substitutes the control characters in the rendered
+    // *source*, but prints the path it is given as-is.
+    let path = crate::parser::selector_path(source_path);
+    let path_str = crate::output::escape_label(&path);
 
     let start = line_idx.saturating_sub(CONTEXT_LINES).max(func_start_line);
     let end = (line_idx + CONTEXT_LINES + 1)
@@ -937,6 +938,29 @@ mod tests {
             "{rendered}"
         );
         assert_eq!(strip_ansi(underline[0]).trim_end().len() - caret_col, 5);
+    }
+
+    #[test]
+    fn snippet_names_the_file_by_its_discovered_path() {
+        // Two files with one base name in different directories have to be
+        // told apart, and the location has to resolve from where the run was
+        // started — so the path is the one the walk found, minus the `./`
+        // it walked from, as `list` prints it.
+        let lines = ["test_x() {", "  false", "}"];
+        let render = |path: &str| {
+            render_snippet(
+                "command failed",
+                Path::new(path),
+                &lines,
+                Highlight::line(1),
+                0,
+                2,
+                false,
+            )
+        };
+        assert!(render("./x/t.test").contains("--> x/t.test:2:3"));
+        assert!(render("../y/t.test").contains("--> ../y/t.test:2:3"));
+        assert!(render("/abs/t.test").contains("--> /abs/t.test:2:3"));
     }
 
     #[test]
