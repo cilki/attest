@@ -250,7 +250,10 @@ number that was wrong is replaced in place, so `cpu < 10ms, pids <= 3` with
 `cpu` measured at 12.2ms becomes `cpu < 16ms, pids <= 3`. Bounds that held
 are never touched, and neither is anything but the number. A `syscalls` or
 `writes` condition has no number: which calls or paths a test may use is a
-decision, so a violated one is reported with a warning and left as written.
+decision, so a violated one is reported with a warning, left as written, and
+still fails its test — as does a bound no number could satisfy (`cpu > 1ms`
+measured at zero) — so the run's exit status does not claim that a condition
+still broken in the file holds.
 
 A new bound is the measurement plus headroom — ×1.25 for an upper bound,
 ×0.8 for a lower one, rounded outwards to two significant figures — so the
@@ -748,7 +751,7 @@ condition in the file), `condition` (its text as written, `cpu < 10ms`) and
 message names only the first few of. A test with any is
 `fail`: a decorator failure is a failure of the ordinary kind — except under
 `--update-decorators`, where it is `pass` and the entry says what was
-rewritten. The list of edits then goes to stderr, so stdout stays JSONL.
+rewritten (unless one of its violations has no number to rewrite). The list of edits then goes to stderr, so stdout stays JSONL.
 
 The exit status is unchanged by `--json`: 1 if any test failed, 0 otherwise.
 

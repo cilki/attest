@@ -111,6 +111,32 @@ fn round_sig(value: f64, up: bool) -> u64 {
     (rounded * magnitude).round() as u64
 }
 
+/// Whether `--update-decorators` can rewrite the condition `v` broke so that
+/// it admits what was measured — the test that broke it is only excused from
+/// failing if so.
+///
+/// A set condition has no number to loosen, and a quantity has none when no
+/// value satisfies its bound for this measurement. The latter is decided on
+/// this one sample, which agrees with what [`plan_updates`] decides over all
+/// of a `--repeat`'s: folding only moves the extreme further from the bound,
+/// so a sample nothing admits leaves the fold with nothing either.
+pub fn updatable(v: &crate::decorator::Violation) -> bool {
+    match &v.detail {
+        Detail::Quantity {
+            metric,
+            measured,
+            broken,
+        } => bound_for(
+            metric.unit(),
+            broken.upper,
+            broken.bound.inclusive,
+            &[*measured],
+        )
+        .is_some(),
+        Detail::Set { .. } => false,
+    }
+}
+
 /// A literal to rewrite, keyed by where it is: the same condition of the
 /// same file, however many times `--repeat` ran its test.
 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
@@ -655,6 +681,27 @@ mod tests {
         // max 14ms × 1.25 = 17.5ms → 18ms.
         assert_eq!(new, "18ms");
         assert_eq!(condition.1, "cpu < 18ms");
+    }
+
+    #[test]
+    fn only_a_violation_with_a_number_to_rewrite_is_updatable() {
+        let tf = TestFile::default();
+        let quantity = |condition, measured| {
+            violated(&tf, "test_x", 1, condition, measured)
+                .violations
+                .pop()
+                .unwrap()
+        };
+        assert!(updatable(&quantity("cpu < 10ms", 12_200)));
+        assert!(updatable(&quantity("cpu > 10ms", 5)));
+        // Nothing is less than nothing: `> x` under a sample of 0 has no
+        // rewrite, and `plan_updates` skips it.
+        assert!(!updatable(&quantity("cpu > 10ms", 0)));
+        let mut set = quantity("cpu < 10ms", 12_200);
+        set.detail = Detail::Set {
+            offenders: vec!["/tmp/zzz".into()],
+        };
+        assert!(!updatable(&set));
     }
 
     #[test]

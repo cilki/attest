@@ -507,6 +507,7 @@ pub struct RunConfig {
     /// A violated `#attest(...)` condition is recorded but does not fail the
     /// test: the run is there to find out what the bounds should be, and
     /// `decorate::plan_updates` rewrites them from the violations afterwards.
+    /// A violation it cannot rewrite (`decorate::updatable`) still fails.
     pub update_decorators: bool,
 }
 
@@ -1133,8 +1134,13 @@ fn build_result<'a>(
             }
         }
         // A run that exists to find the right bounds is not failed by the
-        // wrong ones; the violations are what it came for.
-        if !violations.is_empty() && !config.update_decorators {
+        // wrong ones; the violations are what it came for. Only by the ones
+        // it can rewrite, though: a `syscalls`/`writes` condition, or a bound
+        // nothing satisfies, is left as written, so excusing it would let the
+        // run pass on a condition that is still broken.
+        let excused =
+            |v: &decorator::Violation| config.update_decorators && crate::decorate::updatable(v);
+        if !violations.iter().all(excused) {
             outcome = Outcome::Fail;
         }
     }
@@ -1818,6 +1824,26 @@ mod tests {
         let lit = &broken.bound.literal;
         assert_eq!(lit.line, 1);
         assert_eq!(&script.lines().next().unwrap()[lit.span.clone()], "1us");
+    }
+
+    #[test]
+    fn under_update_decorators_a_violation_with_no_number_still_fails() {
+        // A `writes` condition is left as written, so a run that passed the
+        // test on it would report success for a condition that is still
+        // broken. The quantity beside it is excused as usual.
+        let script =
+            "#attest(wall < 1us, writes in {/var})\ntest_x() {\n  echo x > /tmp/attest_upd\n}\n";
+        let tmp = TempDir::new().unwrap();
+        let config = RunConfig {
+            update_decorators: true,
+            ..Default::default()
+        };
+        let Some(r) = run_script(tmp.path(), script, "test_x", &config) else {
+            return;
+        };
+        assert_eq!(r.violations.len(), 2, "{:?}", r.violations);
+        assert_eq!(r.outcome, Outcome::Fail);
+        assert!(r.commands_succeeded());
     }
 
     #[test]
