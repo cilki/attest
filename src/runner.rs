@@ -615,7 +615,10 @@ pub fn run_all_tests<'a>(
     // upper layer and logs out afterward (see save_test_context).
     let contexts_dir = tmp.path();
     if let Some(ref save_dir) = config.save_context {
-        std::fs::create_dir_all(save_dir)?;
+        // Name the flag and the path: a bare io::Error ("File exists (os
+        // error 17)" for a DIR that is a regular file) says neither.
+        std::fs::create_dir_all(save_dir)
+            .map_err(|e| anyhow!("--save-context: {} ({e})", save_dir.display()))?;
     }
 
     let mut context_names = std::collections::HashSet::new();
@@ -2032,6 +2035,31 @@ mod tests {
             .collect();
         assert_eq!(saved.len(), 1, "unexpected save dir contents: {saved:?}");
         assert!(saved[0].join("stdout.log").exists());
+    }
+
+    /// A `--save-context` DIR that cannot be created fails the run with the
+    /// flag and the path in the message, not a bare "File exists (os error
+    /// 17)" that leaves the user to guess which of their arguments it means.
+    #[test]
+    fn unusable_save_dir_is_named_in_the_error() {
+        if overlay_mode().is_none() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let tf = parse_script(tmp.path(), "test_ok() {\n  true\n}\n");
+        let save_dir = tmp.path().join("a-file");
+        fs::write(&save_dir, "").unwrap();
+        let config = RunConfig {
+            save_context: Some(save_dir.clone()),
+            ..RunConfig::default()
+        };
+
+        let err = run_all_tests(vec![spec(&tf, "test_ok", "test_ok")], &config)
+            .err()
+            .expect("a save dir that is a file must fail the run")
+            .to_string();
+        assert!(err.starts_with("--save-context: "), "{err}");
+        assert!(err.contains(&save_dir.display().to_string()), "{err}");
     }
 
     /// Is SIGCHLD blocked for the calling thread? Read by passing a null set to
