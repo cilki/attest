@@ -649,7 +649,10 @@ there isn't always the same thing:
   (schema below)
 - `--override SPEC` — copy a binary into the test's `bin/` dir so tests resolve
   that name to it. `SPEC` is a path (`/usr/bin/example`) or a mapping
-  (`example=/usr/bin/override`)
+  (`example=/usr/bin/override`). A mapping to a binary of another name puts a
+  wrapper that `exec`s it on the `bin/` dir instead of a renamed copy, so a
+  multicall binary (busybox, single-binary coreutils) still runs as itself:
+  `curl=/bin/true` succeeds
 - `--bin-dir DIR` — prepend DIR to each test's PATH, without copying anything
 - `--strace CMD` — run CMD under strace, saving the log to the test's context
   dir. `CMD` is a command name or a path to one; tests that call it by its base

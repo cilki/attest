@@ -561,7 +561,11 @@ left alone with a warning).
   `a/x.test/`)
 - `--override SPEC` — copy a binary into the test context `bin/` dir so tests
   use it exclusively. SPEC is either a path (`/usr/bin/example` or
-  `./bin/example`) or a mapping (`example=/usr/bin/override`)
+  `./bin/example`) or a mapping (`example=/usr/bin/override`). A mapping whose
+  source has another file name gets a `#!/bin/sh` wrapper `exec`ing the source
+  at its absolute path instead of a copy (`install_override`): busybox and
+  single-binary coreutils pick the applet from `argv[0]`, so a renamed copy of
+  `/bin/true` runs as `curl` and fails
 - `--bin-dir DIR` — prepend DIR to each test's PATH so bare-name calls resolve to
   executables in DIR (no copy). Lower precedence than `--override`, higher than the
   inherited PATH. Repeatable

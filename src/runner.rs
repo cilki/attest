@@ -913,7 +913,7 @@ fn spawn_test<'a>(
             let dst = bin.join(&spec.name);
 
             debug!(src=%src.display(), dst=%dst.display(), "Overriding command");
-            std::fs::copy(src, &dst)?;
+            install_override(src, &spec.name, &dst)?;
         }
     }
 
@@ -1562,6 +1562,30 @@ fn stat_state(stat: &str) -> Option<char> {
 /// The parent pid field of a `/proc/<pid>/stat` line.
 fn stat_ppid(stat: &str) -> Option<u32> {
     stat_fields(stat)?.nth(1)?.parse().ok()
+}
+
+/// Put an `--override` source on the context's `bin/` as `dst`, which the
+/// test reaches by `name`.
+///
+/// Under its own file name the source is copied. Under any other name it is
+/// reached through a wrapper that `exec`s it at its own path instead, because
+/// a renamed copy is a different program wherever the binary picks its
+/// behaviour from `argv[0]`: coreutils built as one multicall binary (Nix,
+/// `--enable-single-binary`) and busybox (Alpine) both do, so
+/// `--override curl=/bin/true` copied as `bin/curl` runs as `curl` — and
+/// fails with "unknown program" / "applet not found" rather than succeeding.
+/// The source path is visible inside the test's root, which is an overlay of
+/// the host's; it is made absolute because the test runs in a directory of
+/// its own.
+fn install_override(src: &Path, name: &str, dst: &Path) -> Result<()> {
+    if src.file_name() == Some(std::ffi::OsStr::new(name)) {
+        std::fs::copy(src, dst)?;
+        return Ok(());
+    }
+    let src = std::path::absolute(src)?;
+    std::fs::write(dst, format!("#!/bin/sh\nexec {} \"$@\"\n", sh_quote(&src)))?;
+    std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o755))?;
+    Ok(())
 }
 
 fn create_strace_wrappers(working_dir: &Path, commands: &[String]) -> Result<()> {
@@ -2456,6 +2480,39 @@ mod tests {
         assert!(result.outcome.passed());
         // bin/true should exist in the context dir
         assert!(result.context.join("bin/true").exists());
+    }
+
+    #[test]
+    fn override_under_another_name_runs_the_source_as_itself() {
+        // A multicall binary (busybox, single-binary coreutils) decides what
+        // it is from argv[0]: this one only succeeds when called `real`, so a
+        // copy renamed to `stub` would fail the test.
+        let tmp = TempDir::new().unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let real = src_dir.path().join("real");
+        fs::write(
+            &real,
+            "#!/bin/sh\ncase \"${0##*/}\" in real) exit 0 ;; *) exit 1 ;; esac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = RunConfig {
+            override_cmds: vec![OverrideSpec {
+                name: "stub".into(),
+                source: real,
+            }],
+            ..RunConfig::default()
+        };
+        let Some(result) = run_script(
+            tmp.path(),
+            "test_override() {\n  stub\n}\n",
+            "test_override",
+            &config,
+        ) else {
+            return;
+        };
+        assert!(result.outcome.passed(), "{:?}", result.outcome);
     }
 
     #[test]
