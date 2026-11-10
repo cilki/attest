@@ -532,43 +532,91 @@ fn escape_for_display(value: &str) -> String {
 
 /// Render a comparison between bracket expression operands.
 fn render_bracket_diff(expr: &BracketExpr) {
-    let Palette {
-        green, red, reset, ..
-    } = out_palette();
+    outln!();
+    for line in bracket_diff_lines(expr, out_palette()) {
+        outln!("{line}");
+    }
+}
+
+/// The `left`/`right` lines for a failed comparison and, for the equality
+/// operators, the character-level `diff` under them.
+///
+/// The diff marks the characters that differ in colour. Without colour — any
+/// report that is not going to a terminal, which is to say every CI log — the
+/// two `diff` lines would be the `left` and `right` lines over again, with the
+/// one thing they exist to show gone. So off a terminal each of them is
+/// followed by a line of `^` under the characters that differ (only when there
+/// are any on that side: a right operand that is a prefix of the left one has
+/// nothing of its own to point at), the way the snippet above underlines the
+/// command.
+fn bracket_diff_lines(expr: &BracketExpr, palette: Palette) -> Vec<String> {
     let left = escape_for_display(&expr.left);
     let right = escape_for_display(&expr.right);
 
-    outln!();
-    outln!("  left: \"{left}\"");
-    outln!(" right: \"{right}\"");
+    let mut lines = vec![
+        format!("  left: \"{left}\""),
+        format!(" right: \"{right}\""),
+    ];
 
     // For equality operators, show inline diff if values differ
     if matches!(expr.op.as_str(), "=" | "==" | "!=") && left != right {
         use similar::{ChangeTag, TextDiff};
+        let Palette {
+            green, red, reset, ..
+        } = palette;
         let diff = TextDiff::from_chars(&left, &right);
-        let mut left_hl = String::new();
-        let mut right_hl = String::new();
+        let mut left_side = DiffSide::default();
+        let mut right_side = DiffSide::default();
         for change in diff.iter_all_changes() {
             let val = change.value();
             match change.tag() {
                 ChangeTag::Equal => {
-                    left_hl.push_str(val);
-                    right_hl.push_str(val);
+                    left_side.push(val, None);
+                    right_side.push(val, None);
                 }
-                ChangeTag::Delete => {
-                    left_hl.push_str(red);
-                    left_hl.push_str(val);
-                    left_hl.push_str(reset);
-                }
-                ChangeTag::Insert => {
-                    right_hl.push_str(green);
-                    right_hl.push_str(val);
-                    right_hl.push_str(reset);
-                }
+                ChangeTag::Delete => left_side.push(val, Some((red, reset))),
+                ChangeTag::Insert => right_side.push(val, Some((green, reset))),
             }
         }
-        outln!("  diff: \"{left_hl}\"");
-        outln!("        \"{right_hl}\"");
+        let plain = !palette.is_colored();
+        lines.push(format!("  diff: \"{}\"", left_side.text));
+        if plain && left_side.marked {
+            lines.push(format!("         {}", left_side.carets.trim_end()));
+        }
+        lines.push(format!("        \"{}\"", right_side.text));
+        if plain && right_side.marked {
+            lines.push(format!("         {}", right_side.carets.trim_end()));
+        }
+    }
+    lines
+}
+
+/// One operand of a character-level diff as it is laid out: the text with the
+/// changed characters wrapped in colour, and a line that puts a `^` under each
+/// of them and a blank under everything else, column for column.
+#[derive(Default)]
+struct DiffSide {
+    text: String,
+    carets: String,
+    /// Whether any character of this side differs from the other.
+    marked: bool,
+}
+
+impl DiffSide {
+    fn push(&mut self, val: &str, style: Option<(&str, &str)>) {
+        use unicode_width::UnicodeWidthStr;
+        let mark = if style.is_some() { "^" } else { " " };
+        let width = UnicodeWidthStr::width(val);
+        self.carets.push_str(&mark.repeat(width));
+        self.marked |= style.is_some() && width > 0;
+        match style {
+            Some((on, off)) => {
+                self.text.push_str(on);
+                self.text.push_str(val);
+                self.text.push_str(off);
+            }
+            None => self.text.push_str(val),
+        }
     }
 }
 
@@ -615,6 +663,76 @@ mod tests {
         assert_eq!(expr.left, "foo");
         assert_eq!(expr.op, "!=");
         assert_eq!(expr.right, "bar");
+    }
+
+    fn diff_of(left: &str, op: &str, right: &str, palette: Palette) -> Vec<String> {
+        let expr = BracketExpr {
+            left: left.into(),
+            op: op.into(),
+            right: right.into(),
+        };
+        bracket_diff_lines(&expr, palette)
+    }
+
+    #[test]
+    fn plain_diff_points_at_the_characters_that_differ() {
+        // Off a terminal there is no colour to show the change, so the diff
+        // would otherwise repeat `left`/`right` verbatim.
+        assert_eq!(
+            diff_of("hash4  -", "=", "hash5  -", Palette::PLAIN),
+            [
+                "  left: \"hash4  -\"",
+                " right: \"hash5  -\"",
+                "  diff: \"hash4  -\"",
+                "             ^",
+                "        \"hash5  -\"",
+                "             ^",
+            ]
+        );
+    }
+
+    #[test]
+    fn plain_diff_marks_only_the_side_with_something_of_its_own() {
+        // `right` is a prefix of `left`: everything that differs is on the
+        // left, so the right line gets no caret line under it.
+        assert_eq!(
+            diff_of("abc ", "==", "abc", Palette::PLAIN),
+            [
+                "  left: \"abc \"",
+                " right: \"abc\"",
+                "  diff: \"abc \"",
+                "            ^",
+                "        \"abc\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn plain_diff_carets_follow_display_width() {
+        // A wide character takes two columns, so the caret after it has to
+        // move over by two to stay under the character that changed.
+        let lines = diff_of("日x", "=", "日y", Palette::PLAIN);
+        assert_eq!(lines[3], "           ^");
+        assert_eq!(lines[5], "           ^");
+    }
+
+    #[test]
+    fn colored_diff_has_no_caret_lines() {
+        let lines = diff_of("ab", "=", "ac", Palette::ANSI);
+        assert_eq!(
+            lines,
+            [
+                "  left: \"ab\"",
+                " right: \"ac\"",
+                "  diff: \"a\x1b[31mb\x1b[0m\"",
+                "        \"a\x1b[32mc\x1b[0m\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn numeric_comparison_has_no_diff() {
+        assert_eq!(diff_of("1", "-eq", "2", Palette::PLAIN).len(), 2);
     }
 
     #[test]

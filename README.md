@@ -921,7 +921,9 @@ error: command failed
   left: "b1946ac92492d2347c6235b4d2611184  -"
  right: "b1946ac92492d2347c6235b4d2611185  -"
   diff: "b1946ac92492d2347c6235b4d2611184  -"
+                                        ^
         "b1946ac92492d2347c6235b4d2611185  -"
+                                        ^
 ```
 
 Each trace line is prefixed with the line of your file the command came from,
@@ -959,10 +961,11 @@ from the trace and printed as `left` and `right`, so you don't have to pick them
 out of the quoting yourself. `[ "$a" = "$b" ]` and `test "$a" = "$b"` are the
 same builtin spelled two ways and report identically. For `=`, `==` and `!=` a
 character-level `diff` of the two follows, which is what finds the stray space
-or the changed digit: the characters that differ are colored (red on the first
-line, green on the second), so in the plain text above the `diff` lines look
-just like the `left` and `right` ones. Newlines and tabs in an operand are
-printed as `\n` and `\t` to keep all four lines aligned.
+or the changed digit. On a terminal the characters that differ are colored (red
+on the first line, green on the second); anywhere else — a file, a pipe, a CI
+log — there is no color to show them, so each `diff` line is followed by a line
+of `^` under them instead, as above. Newlines and tabs in an operand are
+printed as `\n` and `\t` to keep the lines aligned.
 
 ### Where a test's own output goes
 
