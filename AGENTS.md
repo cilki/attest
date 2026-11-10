@@ -262,7 +262,9 @@
   failure gets `diagnostics::print_violations` and no xtrace replay, because
   there is no failed command in the trace to replay or to blame. Under
   `RunConfig::update_decorators` a violation is recorded but the outcome
-  stays `Pass` — the run exists to find the right bounds. `TestResult::test`
+  stays `Pass` — the run exists to find the right bounds — unless it is one
+  `decorate::updatable` says no edit can fix (a set condition, a bound
+  nothing satisfies), since that one stays broken in the file. `TestResult::test`
   is the function's name as written (the display name may be qualified and
   numbered), which is what `decorate` keys additions by, and
   `TestResult::file` is the parse it ran from — the failure report renders
