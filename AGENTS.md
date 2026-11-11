@@ -519,8 +519,10 @@ enables `set -e` and `set -x` and nothing more — `pipefail` in particular is
 off, so a test asserting on a pipeline must set it itself (see
 `examples/race_condition.test`). The one thing it adds to the definitions is
 `parser::NEGATION_GUARD`: POSIX exempts a `!` pipeline from `set -e`, so a
-foreground statement that is nothing but a negated pipeline gets ` || false`
-appended where it ends (issue #113). `build_functions_source` records those
+foreground statement that is nothing but a negated pipeline gets
+` || (exit 1) 2>/dev/null` appended where it ends (issue #113) — a subshell
+because neither it nor its stderr-discarded `exit` shows up in the xtrace, and
+instrumentation must not appear in what the user is shown. `build_functions_source` records those
 offsets (`TestFile::negations`, found by `negated_statements` outside
 `if`/`while`/`until` conditions, skipping a statement whose lines hold a
 `<<`, since a here-document's span ends past its delimiter) and

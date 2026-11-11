@@ -2316,6 +2316,11 @@ test_absent() {
         assert_eq!(found.outcome, Outcome::Fail);
         let stdout = fs::read_to_string(found.context.join("stdout.log")).unwrap();
         assert!(!stdout.contains("unreachable"), "{stdout}");
+        // The guard is instrumentation: the trace ends on the negated command
+        // the test wrote, with nothing of the guard after it.
+        let xtrace = fs::read_to_string(found.context.join("xtrace.log")).unwrap();
+        assert!(xtrace.trim_end().ends_with("+3: grep -q foo f"), "{xtrace}");
+        assert!(!xtrace.contains("exit"), "{xtrace}");
 
         let absent = run_script(tmp.path(), script, "test_absent", &RunConfig::default()).unwrap();
         assert_eq!(absent.outcome, Outcome::Pass);
@@ -2333,7 +2338,9 @@ test_absent() {
         let script =
             build_runner_script("test_x", functions, &negations, Path::new("/ctx"), &[], &[]);
         assert!(
-            script.starts_with("test_x() {\n  ! a || false; ! b || false\n}\n"),
+            script.starts_with(
+                "test_x() {\n  ! a || (exit 1) 2>/dev/null; ! b || (exit 1) 2>/dev/null\n}\n"
+            ),
             "{script}"
         );
     }

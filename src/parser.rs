@@ -649,7 +649,7 @@ pub(crate) fn build_functions_source(
 }
 
 /// What the runner puts after a negated statement: `! cmd` becomes
-/// `! cmd || false`.
+/// `! cmd || (exit 1) 2>/dev/null`.
 ///
 /// `set -e` is what makes every command of a test an assertion, and POSIX
 /// exempts a pipeline that starts with `!` from it — so `! grep -q error log`
@@ -657,11 +657,22 @@ pub(crate) fn build_functions_source(
 /// it happens to be the last statement. That is the one shape of assertion a
 /// shell has for "this must fail", and the one the test author is least
 /// likely to suspect. `||` binds looser than `!`, so the guard applies to the
-/// whole negated pipeline, and the list it makes ends in a plain `false`,
-/// which `set -e` does not exempt. Its status is the negation's either way,
-/// so where `set -e` is off — a condition, a non-final `&&` operand, a
+/// whole negated pipeline, and the list it makes ends in a subshell exiting
+/// 1, which `set -e` does not exempt. Its status is the negation's either
+/// way, so where `set -e` is off — a condition, a non-final `&&` operand, a
 /// caller's `if` — nothing changes.
-pub(crate) const NEGATION_GUARD: &str = " || false";
+///
+/// The guard is instrumentation, so it must not show up in the trace the
+/// user is shown: a plain `|| false` traced as a `false` the test never
+/// wrote. A subshell is not itself traced (bash, dash and busybox `sh`
+/// alike), and its `exit 1` traces into the subshell's own stderr, which the
+/// redirection discards — so the trace ends on the negated command, which is
+/// also the line the failure snippet blames. A subshell rather than a
+/// `{ …; }` group because `set -e` would exit the shell from *inside* a
+/// group, with the redirection still in force, and an `EXIT` trap would then
+/// run with its stderr in `/dev/null`. The fork is only paid when the
+/// negation has already failed.
+pub(crate) const NEGATION_GUARD: &str = " || (exit 1) 2>/dev/null";
 
 /// Where each negated statement in `func`'s body ends: the 1-based line and
 /// the byte offset into that line (of `src_lines`) where [`NEGATION_GUARD`]
@@ -671,7 +682,7 @@ pub(crate) const NEGATION_GUARD: &str = " || false";
 /// run in the foreground: `! a && b` already fails on `b`, and a background
 /// job's status is nobody's assertion. The conditions of `if`, `while` and
 /// `until` are left alone — `set -e` is off in them, so the guard would only
-/// add a `false` to the trace. So is a statement holding a here-document,
+/// cost a fork. So is a statement holding a here-document,
 /// whose span ends after the body, where the guard would land past the
 /// delimiter; it keeps the shell's own behaviour.
 fn negated_statements(func: &FunctionDefinition, src_lines: &[&str]) -> Vec<(usize, usize)> {
