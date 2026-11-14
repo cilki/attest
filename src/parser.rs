@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use brush_parser::ast::{
-    AndOr, Command, CompoundCommand, CompoundList, FunctionDefinition, Program, SeparatorOperator,
-    SourceLocation,
+    Command, CompoundCommand, CompoundList, CompoundListItem, FunctionDefinition, Program,
+    SeparatorOperator, SourceLocation,
 };
 use brush_parser::{Parser, ParserOptions};
 use tracing::warn;
@@ -708,12 +708,11 @@ pub(crate) const NEGATION_GUARD: &str = " || (exit 1) 2>/dev/null";
 /// delimiter; it keeps the shell's own behaviour.
 fn negated_statements(func: &FunctionDefinition, src_lines: &[&str]) -> Vec<(usize, usize)> {
     let mut found = Vec::new();
-    negations_in_compound(&func.body.0, src_lines, &mut found);
-    found
-}
-
-fn negations_in_list(list: &CompoundList, src_lines: &[&str], found: &mut Vec<(usize, usize)>) {
-    for item in &list.0 {
+    let walk = Walk {
+        conditions: false,
+        functions: true,
+    };
+    walk_compound(&func.body.0, walk, &mut |item| {
         let and_or = &item.0;
         if and_or.first.bang
             && and_or.additional.is_empty()
@@ -723,50 +722,73 @@ fn negations_in_list(list: &CompoundList, src_lines: &[&str], found: &mut Vec<(u
         {
             found.push((span.end.line, column));
         }
-        for pipeline in
-            std::iter::once(&and_or.first).chain(and_or.additional.iter().map(|additional| {
-                match additional {
-                    AndOr::And(p) | AndOr::Or(p) => p,
-                }
-            }))
-        {
+    });
+    found
+}
+
+/// What a walk over the AST descends into, beyond the bodies of the compound
+/// commands it meets — which every walk does.
+#[derive(Clone, Copy)]
+struct Walk {
+    /// The conditions of `if`, `elif`, `while` and `until`.
+    conditions: bool,
+    /// The bodies of the function definitions it meets.
+    functions: bool,
+}
+
+/// Call `visit` on every statement under `list`, in source order: the items
+/// of `list` itself, each followed by those of whatever its commands hold
+/// that `walk` admits.
+fn walk_items<'a>(list: &'a CompoundList, walk: Walk, visit: &mut dyn FnMut(&'a CompoundListItem)) {
+    for item in &list.0 {
+        visit(item);
+        for (_, pipeline) in item.0.iter() {
             for cmd in &pipeline.seq {
                 match cmd {
-                    Command::Compound(compound, _) => {
-                        negations_in_compound(compound, src_lines, found)
-                    }
-                    Command::Function(f) => negations_in_compound(&f.body.0, src_lines, found),
-                    Command::Simple(_) => {}
+                    Command::Compound(compound, _) => walk_compound(compound, walk, visit),
+                    Command::Function(f) if walk.functions => walk_compound(&f.body.0, walk, visit),
+                    Command::Function(_) | Command::Simple(_) => {}
                 }
             }
         }
     }
 }
 
-fn negations_in_compound(
-    compound: &CompoundCommand,
-    src_lines: &[&str],
-    found: &mut Vec<(usize, usize)>,
+/// [`walk_items`] over the lists `compound` is made of.
+fn walk_compound<'a>(
+    compound: &'a CompoundCommand,
+    walk: Walk,
+    visit: &mut dyn FnMut(&'a CompoundListItem),
 ) {
+    let mut list = |list: &'a CompoundList| walk_items(list, walk, visit);
     match compound {
-        CompoundCommand::BraceGroup(b) => negations_in_list(&b.list, src_lines, found),
-        CompoundCommand::Subshell(s) => negations_in_list(&s.list, src_lines, found),
-        CompoundCommand::ForClause(f) => negations_in_list(&f.body.list, src_lines, found),
-        CompoundCommand::ArithmeticForClause(a) => {
-            negations_in_list(&a.body.list, src_lines, found)
-        }
+        CompoundCommand::BraceGroup(b) => list(&b.list),
+        CompoundCommand::Subshell(s) => list(&s.list),
+        CompoundCommand::ForClause(f) => list(&f.body.list),
+        CompoundCommand::ArithmeticForClause(a) => list(&a.body.list),
         CompoundCommand::WhileClause(w) | CompoundCommand::UntilClause(w) => {
-            negations_in_list(&w.1.list, src_lines, found)
+            if walk.conditions {
+                list(&w.0);
+            }
+            list(&w.1.list);
         }
         CompoundCommand::IfClause(i) => {
-            negations_in_list(&i.then, src_lines, found);
+            if walk.conditions {
+                list(&i.condition);
+            }
+            list(&i.then);
             for else_clause in i.elses.iter().flatten() {
-                negations_in_list(&else_clause.body, src_lines, found);
+                if walk.conditions
+                    && let Some(condition) = &else_clause.condition
+                {
+                    list(condition);
+                }
+                list(&else_clause.body);
             }
         }
         CompoundCommand::CaseClause(c) => {
             for cmd in c.cases.iter().filter_map(|item| item.cmd.as_ref()) {
-                negations_in_list(cmd, src_lines, found);
+                list(cmd);
             }
         }
         CompoundCommand::Arithmetic(_)
@@ -796,79 +818,27 @@ fn statement_end(span: &brush_parser::SourceSpan, src_lines: &[&str]) -> Option<
     }
 }
 
+/// Every function definition in `program`, in source order, wherever it is
+/// written — a condition included. A definition nested inside another is
+/// not its own: it is rendered as part of the function that holds it.
 fn extract_functions(program: &Program) -> Vec<FunctionDefinition> {
     let mut functions = Vec::new();
+    let walk = Walk {
+        conditions: true,
+        functions: false,
+    };
     for complete_command in &program.complete_commands {
-        extract_from_compound_list(complete_command, &mut functions);
+        walk_items(complete_command, walk, &mut |item| {
+            for (_, pipeline) in item.0.iter() {
+                for cmd in &pipeline.seq {
+                    if let Command::Function(func) = cmd {
+                        functions.push(func.clone());
+                    }
+                }
+            }
+        });
     }
     functions
-}
-
-fn extract_from_compound_list(list: &CompoundList, functions: &mut Vec<FunctionDefinition>) {
-    for item in &list.0 {
-        let and_or = &item.0;
-        extract_from_pipeline(&and_or.first, functions);
-        for additional in &and_or.additional {
-            let pipeline = match additional {
-                brush_parser::ast::AndOr::And(p) | brush_parser::ast::AndOr::Or(p) => p,
-            };
-            extract_from_pipeline(pipeline, functions);
-        }
-    }
-}
-
-fn extract_from_pipeline(
-    pipeline: &brush_parser::ast::Pipeline,
-    functions: &mut Vec<FunctionDefinition>,
-) {
-    for cmd in &pipeline.seq {
-        match cmd {
-            Command::Function(func) => functions.push(func.clone()),
-            Command::Compound(compound, _) => extract_from_compound(compound, functions),
-            Command::Simple(_) => {}
-        }
-    }
-}
-
-fn extract_from_compound(compound: &CompoundCommand, functions: &mut Vec<FunctionDefinition>) {
-    match compound {
-        CompoundCommand::BraceGroup(b) => extract_from_compound_list(&b.list, functions),
-        CompoundCommand::Subshell(s) => extract_from_compound_list(&s.list, functions),
-        CompoundCommand::ForClause(f) => extract_from_compound_list(&f.body.list, functions),
-        CompoundCommand::ArithmeticForClause(a) => {
-            extract_from_compound_list(&a.body.list, functions)
-        }
-        CompoundCommand::WhileClause(w) => {
-            extract_from_compound_list(&w.0, functions);
-            extract_from_compound_list(&w.1.list, functions);
-        }
-        CompoundCommand::IfClause(i) => {
-            extract_from_compound_list(&i.condition, functions);
-            extract_from_compound_list(&i.then, functions);
-            if let Some(elses) = &i.elses {
-                for else_clause in elses {
-                    if let Some(cond) = &else_clause.condition {
-                        extract_from_compound_list(cond, functions);
-                    }
-                    extract_from_compound_list(&else_clause.body, functions);
-                }
-            }
-        }
-        CompoundCommand::CaseClause(c) => {
-            for case_item in &c.cases {
-                if let Some(cmd) = &case_item.cmd {
-                    extract_from_compound_list(cmd, functions);
-                }
-            }
-        }
-        CompoundCommand::UntilClause(w) => {
-            extract_from_compound_list(&w.0, functions);
-            extract_from_compound_list(&w.1.list, functions);
-        }
-        CompoundCommand::Arithmetic(_)
-        | CompoundCommand::Coprocess(_)
-        | CompoundCommand::ExtendedTest(_) => {}
-    }
 }
 
 #[cfg(test)]
@@ -1411,18 +1381,29 @@ EOF
 
     #[test]
     fn extract_functions_from_nested_blocks() {
-        let tmp = TempDir::new().unwrap();
-        // Function defined inside an if block
-        let path = write_script(
-            tmp.path(),
-            "nested.sh",
-            "if true; then\n  test_inside_if() {\n    true\n  }\nfi\n\nfor x in 1; do\n  test_inside_for() {\n    true\n  }\ndone\n",
-        );
+        // A definition is found wherever it is written — in a block's body or
+        // in a condition — but one nested in another function is part of that
+        // function, not a definition of its own.
+        let source = "\
+if test_in_condition() { true; }; then
+  test_inside_if() {
+    true
+  }
+fi
 
-        let result = parse_test_file(&path, &Prescan::default()).unwrap();
-        let names: Vec<&str> = result.tests.iter().map(String::as_str).collect();
-        assert!(names.contains(&"test_inside_if"));
-        assert!(names.contains(&"test_inside_for"));
+for x in 1; do
+  test_inside_for() {
+    test_nested() { true; }
+    test_nested
+  }
+done
+";
+        let functions = parse_functions(source).unwrap();
+        let names: Vec<&str> = functions.iter().map(|f| f.fname.value.as_str()).collect();
+        assert_eq!(
+            names,
+            ["test_in_condition", "test_inside_if", "test_inside_for"]
+        );
     }
 
     #[test]
