@@ -391,7 +391,15 @@
   — and `parse_xtrace_failure` stops there, so the failure stays on the last
   command of the body even when the trap goes on to call a function whose
   lines are in the file. (`DEBUG`/`ERR` actions trace at `++` depth and are
-  already skipped as subshells.)
+  already skipped as subshells.) A command the shell gives up on *during*
+  expansion — `$unset` under `set -u`, `${x:?}`, `$((1/0))`, a bad
+  substitution — is never traced, so the last trace line is the command
+  before it, which succeeded; what the shell prints instead is an error
+  naming the line it stopped on (`<$0>: line N: …` in bash, `<$0>: N: …` in
+  dash), and `parse_shell_error_line` reads that line number out of it,
+  anchored on the file's canonical path since that is the `$0` the runner
+  passes — `bash other.sh` reporting `other.sh: line 5:` names no line of
+  this script. The last of the two kinds of line to appear is the failure.
   Also shows `left`/`right` operands for a failed `[`/`test`/`[[` comparison
   and, for `=`/`==`/`!=`, an inline character-level diff of them. `[` and
   `test` are one builtin under two names, and xtrace renders them the same way
