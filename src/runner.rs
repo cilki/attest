@@ -3261,4 +3261,28 @@ test_absent() {
             "expected failing command on source line 7, got {last:?}"
         );
     }
+
+    #[test]
+    fn a_failure_in_expansion_is_blamed_on_its_own_line() {
+        // `set -u` and an unbound variable: the shell stops in expansion,
+        // before it traces the command, so the last trace line is the `echo`
+        // on line 3, which succeeded. What places the failure is the shell's
+        // own error, which names line 4 and starts with the `$0` the runner
+        // passed — the file's canonical path. This is the whole chain, from
+        // a real shell to the line the snippet points at.
+        let source = "test_foo() {\n  set -u\n  echo before\n  echo \"$NOPE\"\n}\n";
+        let Some(r) = run_inline(source, "test_foo") else {
+            return;
+        };
+        assert!(!r.outcome.passed());
+
+        let xtrace = fs::read_to_string(r.context.join("xtrace.log")).unwrap();
+        assert!(
+            xtrace.contains("+3: echo before\n") && !xtrace.contains("+4: "),
+            "the failing command must not have traced: {xtrace:?}"
+        );
+        let failure = crate::diagnostics::parse_xtrace_failure(&r.context, r.file)
+            .expect("a failure to point at");
+        assert_eq!(failure.lineno, 4, "xtrace was: {xtrace:?}");
+    }
 }

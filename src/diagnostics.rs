@@ -5,12 +5,14 @@ use crate::parser::TestFile;
 use crate::runner::{Outcome, TestResult};
 
 /// Information extracted from an xtrace log about the failing command.
-struct FailureInfo {
+pub(crate) struct FailureInfo {
     /// 1-based line number where the failure occurred. The runner script
     /// preserves the source's line numbers, so this is also the line in the
     /// source file.
-    lineno: usize,
-    /// The command text as shown in xtrace (e.g. `'[' ABC = DEF ']'`).
+    pub(crate) lineno: usize,
+    /// The command text as shown in xtrace (e.g. `'[' ABC = DEF ']'`), or
+    /// empty when the shell gave up on `lineno` before tracing it (see
+    /// [`parse_shell_error_line`]).
     command: String,
     /// 0-based inclusive line range of the function `lineno` sits in.
     function: (usize, usize),
@@ -183,7 +185,16 @@ impl Highlight<'_> {
 /// trap's `+1:` then reads as that function's, and the snippet points into it
 /// as it always did. A shebang or a comment on line 1 is enough to tell them
 /// apart.
-fn parse_xtrace_failure(tmp_dir: &Path, file: &TestFile) -> Option<FailureInfo> {
+///
+/// The trace is not the whole story, though: the shell prints a command's
+/// trace line only once it has expanded the command, so one it gives up on
+/// *during* expansion — `$unset` under `set -u`, `${x:?}`, `$((1/0))`, a bad
+/// substitution — never appears in it, and the last trace line is the command
+/// before it, which succeeded. What the shell does print is an error naming
+/// the line it stopped on, and [`parse_shell_error_line`] reads that: it
+/// carries the same `$LINENO` the trace does, so it maps onto the script the
+/// same way, and the last of the two kinds of line to appear is the failure.
+pub(crate) fn parse_xtrace_failure(tmp_dir: &Path, file: &TestFile) -> Option<FailureInfo> {
     // Open the log the runner created for the test, never a symlink the test
     // left at that name (see `overlay::open_nofollow`).
     let log = crate::overlay::open_nofollow(&tmp_dir.join("xtrace.log")).ok()?;
@@ -199,8 +210,21 @@ fn parse_xtrace_failure(tmp_dir: &Path, file: &TestFile) -> Option<FailureInfo> 
     let mut line = Vec::new();
     while read_capped_line(&mut reader, &mut line).unwrap_or(false) {
         // Most of a noisy log is the test's own output, which can never be a
-        // trace line: settle that on the first byte, before decoding it.
+        // trace line: settle that on the first byte, before decoding it. The
+        // one other line that places the failure is the shell's own error,
+        // and that one starts with the script's path.
         if line.first() != Some(&b'+') {
+            if let Some(lineno) = parse_shell_error_line(&line, &file.canonical_path)
+                && let Some(function) = lineno
+                    .checked_sub(1)
+                    .and_then(|idx| file.enclosing_function(idx))
+            {
+                last_match = Some(FailureInfo {
+                    lineno,
+                    command: String::new(),
+                    function,
+                });
+            }
             continue;
         }
         // Lossy because a test is free to write non-UTF-8 to its stderr, and a
@@ -281,6 +305,32 @@ fn parse_trace_line(line: &str) -> Option<(usize, &str)> {
     }
     let (lineno, command) = rest.split_once(": ")?;
     Some((lineno.trim().parse().ok()?, command))
+}
+
+/// The line of the script a shell error message names, if `line` is one.
+///
+/// A shell that gives up on a command before running it — an unbound variable
+/// under `set -u`, a `${x:?}`, an arithmetic error, a bad substitution — says
+/// so on stderr with the line it stopped on: bash as `<$0>: line <N>: <msg>`,
+/// dash as `<$0>: <N>: <msg>`. The runner passes the file's canonical path as
+/// `$0` (see `runner`), so that path is what the message starts with, and
+/// requiring it is what keeps a program the test ran from placing the failure:
+/// `bash other.sh` reports `other.sh: line 5: …`, which names no line of this
+/// script. Only the number is wanted; the message itself is already in the
+/// replayed log, right under the trace.
+fn parse_shell_error_line(line: &[u8], script: &Path) -> Option<usize> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let rest = line
+        .strip_prefix(script.as_os_str().as_bytes())?
+        .strip_prefix(b": ")?;
+    let rest = rest.strip_prefix(b"line ").unwrap_or(rest);
+    let end = rest.iter().position(|&b| b == b':')?;
+    let (digits, after) = rest.split_at(end);
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) || !after.starts_with(b": ") {
+        return None;
+    }
+    std::str::from_utf8(digits).ok()?.parse().ok()
 }
 
 /// How many lines of context to show on each side of the annotated line.
@@ -957,6 +1007,97 @@ mod tests {
     fn parse_xtrace_declines_when_no_command_of_the_test_ran() {
         // Nothing to point at: the only trace line is the runner's call.
         assert!(failure_of("+40: test_x\n", &one_function(10)).is_none());
+    }
+
+    #[test]
+    fn parse_xtrace_blames_the_line_the_shell_gave_up_on() {
+        // `set -u` and an unbound variable: the shell stops in expansion,
+        // before it traces the command, so the last trace line is the command
+        // *before* it — which succeeded. The error the shell prints names the
+        // right line, and that is where the snippet has to point.
+        let log = "+40: test_x\n+3: set -u\n+4: echo before\n\
+                   /x.test: line 5: NOPE: unbound variable\n";
+        let info = failure_of(log, &one_function(10)).unwrap();
+        assert_eq!(info.lineno, 5);
+        assert_eq!(info.command, "");
+        assert_eq!(info.function, (0, 9));
+    }
+
+    #[test]
+    fn parse_xtrace_blames_the_shells_line_inside_a_helper() {
+        // The line the shell names may be in another function than the last
+        // trace line — a helper the test called, whose `${x:?}` failed. The
+        // snippet's window is the function of the line it points at.
+        let file = test_file(
+            "\nhelper() {\n  echo in\n  echo \"${REQ:?}\"\n}\ntest_x() {\n  helper\n}\n",
+            vec![(1, 4), (5, 7)],
+        );
+        let log = "+20: test_x\n+7: helper\n+3: echo in\n/x.test: line 4: REQ: parameter null or not set\n";
+        let info = failure_of(log, &file).unwrap();
+        assert_eq!(info.lineno, 4);
+        assert_eq!(info.function, (1, 4));
+    }
+
+    #[test]
+    fn parse_xtrace_lets_a_later_trace_line_outrank_an_earlier_error() {
+        // A message the shell printed and carried on from (here a warning on
+        // line 3) does not place the failure once a later command has traced:
+        // whichever of the two came last is where the test stopped.
+        let log = "+40: test_x\n+3: cat\n/x.test: line 3: warning: here-document delimited by end-of-file\n+6: false\n";
+        let info = failure_of(log, &one_function(10)).unwrap();
+        assert_eq!(info.lineno, 6);
+        assert_eq!(info.command, "false");
+    }
+
+    #[test]
+    fn parse_xtrace_stays_on_the_body_when_an_exit_trap_follows_the_shells_error() {
+        // The shell's error, then the trap running with `$LINENO` restarted:
+        // the error's line is the failure, and the `+1:` still ends the scan.
+        let file = test_file(
+            "\n\ntest_x() {\n  trap 'rm -rf x' EXIT\n  echo \"$NOPE\"\n}\n",
+            vec![(2, 5)],
+        );
+        let log = "+20: test_x\n+4: trap 'rm -rf x' EXIT\n/x.test: line 5: NOPE: unbound variable\n+1: rm -rf x\n";
+        let info = failure_of(log, &file).unwrap();
+        assert_eq!(info.lineno, 5);
+        assert_eq!(info.function, (2, 5));
+    }
+
+    #[test]
+    fn parse_xtrace_ignores_another_scripts_error_and_a_line_outside_the_file() {
+        // A program the test ran may print the same shape of message about
+        // *its* lines (`bash other.sh`), and the shell itself may name a line
+        // the script has no function at — neither says where this test is.
+        let log = "+40: test_x\n+4: bash other.sh\n\
+                   other.sh: line 2: X: unbound variable\n\
+                   /x.test: line 30: Y: unbound variable\n";
+        let info = failure_of(log, &one_function(10)).unwrap();
+        assert_eq!(info.lineno, 4);
+        assert_eq!(info.command, "bash other.sh");
+    }
+
+    #[test]
+    fn parse_shell_error_line_reads_bash_and_dash_spellings() {
+        let script = Path::new("/repo/t.test");
+        let parse = |line: &str| parse_shell_error_line(line.as_bytes(), script);
+        assert_eq!(
+            parse("/repo/t.test: line 11: X: unbound variable"),
+            Some(11)
+        );
+        assert_eq!(parse("/repo/t.test: 11: X: parameter not set"), Some(11));
+        // Trailing `\r` or not, the number is what is read.
+        assert_eq!(parse("/repo/t.test: line 7: msg\r"), Some(7));
+        // Another path, no number, a number with no message after it, or a
+        // number spelled with a sign are not the shell placing a failure.
+        assert_eq!(
+            parse("/repo/other.test: line 11: X: unbound variable"),
+            None
+        );
+        assert_eq!(parse("/repo/t.test: line : msg"), None);
+        assert_eq!(parse("/repo/t.test: line 11"), None);
+        assert_eq!(parse("/repo/t.test: line +11: msg"), None);
+        assert_eq!(parse("/repo/t.test: some output: 11: x"), None);
+        assert_eq!(parse("/repo/t.test.bak: line 3: msg"), None);
     }
 
     #[test]

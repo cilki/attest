@@ -956,7 +956,11 @@ statement containing it rather than at the command itself. So is anything an
 `EXIT` trap ran: the shell runs `trap 'rm -rf "$tmp"' EXIT` *after* the
 failure, with line numbers of its own (`+1: rm -rf /tmp/…` in the trace), and
 the snippet stays on the last command of the test before the trap fired —
-whether the trap is a command string or names a cleanup function. A timed-out
+whether the trap is a command string or names a cleanup function. A command
+the shell gave up on while expanding it — `$unset` under `set -u`, `${x:?}`,
+`$((1/0))`, a bad substitution — never makes it into the trace at all, so the
+snippet takes its line from the shell's own error instead (`line 11: NOPE:
+unbound variable`), rather than blaming the command before it. A timed-out
 test gets the same snippet under `test timed out`, pointing at whatever it was
 running when the clock ran out.
 
