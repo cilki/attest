@@ -407,13 +407,15 @@ fn parse_claimed(
 struct Selection {
     /// The path half of the target, kept for the "nothing found" message.
     path: PathBuf,
-    /// `--filter`, or the name half the target carried, as written — kept for
-    /// the "nothing matched" message.
-    filter: Option<String>,
-    /// The parsed form of [`Selection::filter`]. Built once, because it
-    /// decides which files are worth parsing as well as which of their tests
-    /// are selected, and those two have to be the same pattern.
-    pattern: Option<parser::TestPattern>,
+    /// The name half the target carried, then `--filter`, each as written —
+    /// kept for the "nothing matched" message. A test has to match every one
+    /// of them: `--filter` narrows what the target names, it does not replace
+    /// it.
+    filters: Vec<String>,
+    /// The parsed forms of [`Selection::filters`]. Built once, because they
+    /// decide which files are worth parsing as well as which of their tests
+    /// are selected, and those two have to be the same patterns.
+    patterns: Vec<parser::TestPattern>,
     /// The files that parsed, in discovery order. Each file is parsed exactly
     /// once and kept alive here, so every test can borrow its path and the
     /// script the runner sources rather than re-deriving either per test (and
@@ -423,23 +425,36 @@ struct Selection {
 
 impl Selection {
     /// Resolve `target` and `filter`: split the target, discover and parse what
-    /// its path half names, and take the name half as the filter unless
-    /// `--filter` gave one explicitly.
+    /// its path half names, and select the tests that match both the name
+    /// half it carried and `--filter`.
+    ///
+    /// Both apply, since `--filter` is documented to narrow whatever the
+    /// target selects. It used to *replace* the target's name half instead, so
+    /// `attest a.test/testEcho --filter 'testW*'` ran `testWrites` — a test
+    /// the user had just named another one over.
     ///
     /// `cores` only says how fast to get there, never what is found: the
     /// selection a run resolves and the one `list` prints have to be the same
     /// one (see [`Cores`] for why they ask for different amounts of machine).
     fn resolve(target: &str, filter: Option<String>, cores: Cores) -> anyhow::Result<Self> {
         let (path, inline_filter) = split_path_arg(target);
-        let filter = filter.or(inline_filter);
-        let pattern = filter.as_deref().map(parser::TestPattern::parse);
+        let filters: Vec<String> = inline_filter.into_iter().chain(filter).collect();
+        let patterns: Vec<parser::TestPattern> = filters
+            .iter()
+            .map(|filter| parser::TestPattern::parse(filter))
+            .collect();
 
         // What the selection already rules out, applied before the parse
         // instead of after it: a filter normally excludes almost every script
         // the walk turns up, and parsing one costs orders of magnitude more
-        // than deciding not to (see `parser::Prescan`).
-        let scan = pattern
-            .as_ref()
+        // than deciding not to (see `parser::Prescan`). The scan reads one
+        // pattern, and any of them is sound — it only ever rules out, and a
+        // file one pattern rejects fails the match whatever the others say —
+        // so it reads the last, which is `--filter` when there is one: a
+        // target that carried a name half is already a single file, so its
+        // pattern has nothing left to rule out.
+        let scan = patterns
+            .last()
             .map_or_else(parser::Prescan::default, parser::Prescan::of);
         let files: Vec<PathBuf> = discovery::discover_test_files(&path)?
             .into_iter()
@@ -449,25 +464,25 @@ impl Selection {
         Ok(Self {
             files: parse_discovered(files, path.is_file(), cores, &scan)?,
             path,
-            filter,
-            pattern,
+            filters,
+            patterns,
         })
     }
 
     /// The selected tests as `(function name, the file defining it)`, in
     /// discovery order.
     ///
-    /// The pattern has the final say even though it already narrowed the
-    /// parse: a [`parser::Prescan`] only ever rules files *out*, so every file
-    /// here still reports every test in it.
+    /// The patterns have the final say even though one of them already
+    /// narrowed the parse: a [`parser::Prescan`] only ever rules files *out*,
+    /// so every file here still reports every test in it.
     fn tests(&self) -> Vec<(&str, &parser::TestFile)> {
         self.files
             .iter()
             .flat_map(|file| file.tests.iter().map(move |name| (name.as_str(), file)))
             .filter(|&(name, file)| {
-                self.pattern
-                    .as_ref()
-                    .is_none_or(|p| p.matches(&file.path, name))
+                self.patterns
+                    .iter()
+                    .all(|pattern| pattern.matches(&file.path, name))
             })
             .collect()
     }
@@ -475,9 +490,12 @@ impl Selection {
     /// Why nothing was selected: a filter that matched nothing is a different
     /// mistake from a target that holds no tests at all.
     fn nothing_selected(&self) -> anyhow::Error {
-        match &self.filter {
-            Some(f) => anyhow::anyhow!("no tests match filter '{f}'"),
-            None => anyhow::anyhow!("no test functions found in {}", self.path.display()),
+        match self.filters.as_slice() {
+            [] => anyhow::anyhow!("no test functions found in {}", self.path.display()),
+            [filter] => anyhow::anyhow!("no tests match filter '{filter}'"),
+            [target, filter, ..] => {
+                anyhow::anyhow!("no tests match filter '{filter}' within '{target}'")
+            }
         }
     }
 }
@@ -980,6 +998,47 @@ mod tests {
             tests,
             [parser::selector(&tmp.path().join("b.test"), "testAlpha")]
         );
+    }
+
+    /// A `--filter` beside a `<file>/<test>` target narrows what the target
+    /// names; it used to replace it, so the run picked a test the user had
+    /// just named another one over.
+    #[test]
+    fn a_filter_narrows_a_target_that_already_names_a_test() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        script(
+            tmp.path(),
+            "a.test",
+            "testAlpha() {\n\ttrue\n}\ntestBeta() {\n\ttrue\n}\n",
+        );
+        let target = tmp.path().join("a.test/testAlpha");
+        let target = target.to_str().unwrap();
+
+        let selected = |filter: &str| {
+            let selection =
+                Selection::resolve(target, Some(filter.to_string()), Cores::One).unwrap();
+            let names: Vec<String> = selection
+                .tests()
+                .into_iter()
+                .map(|(name, _)| name.to_string())
+                .collect();
+            (selection, names)
+        };
+
+        // A filter the named test satisfies leaves it selected.
+        let (_, names) = selected("test*");
+        assert_eq!(names, ["testAlpha"]);
+        let (_, names) = selected("a.test/testAl");
+        assert_eq!(names, ["testAlpha"]);
+
+        // One it does not satisfy selects nothing — not the test the filter
+        // alone would have picked out of the same file.
+        let (selection, names) = selected("testBeta");
+        assert!(names.is_empty());
+        // And the message names both halves of the contradiction.
+        let message = selection.nothing_selected().to_string();
+        assert!(message.contains("'testBeta'"), "{message}");
+        assert!(message.contains("a.test/testAlpha'"), "{message}");
     }
 
     /// A file no selected test can come out of is a file the run has nothing

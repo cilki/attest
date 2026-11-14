@@ -3,7 +3,9 @@
 - `src/main.rs` - CLI entry point using clap. Invoking `attest` with no
   subcommand runs the tests; `list` and `skill` are the only subcommands. The
   positional target is a file, a directory, or a `<file>/<test>` pattern, which
-  is split into a path plus an implicit `--filter`. `list` prints each test as
+  is split into a path plus an implicit `--filter`; an explicit `--filter`
+  beside it narrows that rather than replacing it, so a selected test matches
+  both (`Selection::patterns`). `list` prints each test as
   that same selector, keeping the directories the file was discovered under —
   the file half matches as a path suffix and a positional target only splits
   where its left half is an existing file, so a base-name-only listing is both

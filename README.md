@@ -553,8 +553,9 @@ the default place for all of it is the shared `/tmp`.
 ### Selecting tests
 
 Any `<file>/<test>` pair works as a target, and `--filter` narrows a wider run
-down the same way. A name without a `*` matches as a prefix, so you rarely have
-to spell one out in full:
+down the same way — or a `<file>/<test>` target further, since a test has to
+match both. A name without a `*` matches as a prefix, so you rarely have to
+spell one out in full:
 
 ```sh
 # Just one test
