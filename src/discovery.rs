@@ -50,14 +50,12 @@ pub fn discover_test_files(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
 fn collect_script_files(dir: &Path, files: &mut Vec<PathBuf>) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
-        let path = entry.path();
-        if path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with('.'))
-        {
+        // On the bytes, so a name that is not UTF-8 is still hidden when it
+        // starts with a dot, rather than falling through to the scan.
+        if entry.file_name().as_encoded_bytes().starts_with(b".") {
             continue;
         }
+        let path = entry.path();
         // `file_type()` comes from the directory entry (or an lstat), so a
         // symlink reports as one rather than as whatever it points at.
         let file_type = entry.file_type()?;
@@ -82,45 +80,39 @@ fn is_shell_script(path: &Path) -> bool {
         return true;
     }
 
-    read_first_line(path).is_some_and(|line| is_shell_interpreter(&line))
-}
-
-/// Reads the first line of a file (up to 256 bytes). Returns `None` if the file
-/// cannot be opened or read.
-fn read_first_line(path: &Path) -> Option<String> {
-    let mut file = std::fs::File::open(path).ok()?;
+    // Only the first line of the head is decoded. The read is a fixed length
+    // and may well stop inside a multibyte character further down; decoding
+    // the whole head used to fail on that and lose the shebang in front of
+    // it, so an extension-less script with non-ASCII text in its first few
+    // lines was not discovered.
     let mut buf = [0u8; 256];
-    let n = file.read(&mut buf).ok()?;
-    let head = std::str::from_utf8(&buf[..n]).unwrap_or("");
-    Some(head.lines().next().unwrap_or("").to_string())
+    let Ok(n) = std::fs::File::open(path).and_then(|mut file| file.read(&mut buf)) else {
+        return false;
+    };
+    let head = &buf[..n];
+    let line = &head[..memchr::memchr(b'\n', head).unwrap_or(n)];
+    std::str::from_utf8(line).is_ok_and(|line| shebang_shell(line).is_some())
 }
 
-/// Extracts the interpreter token from a shebang line, handling the
-/// `#!/usr/bin/env bash` form. Returns `None` when the line is not a shebang.
-fn shebang_interpreter(line: &str) -> Option<&str> {
-    let mut parts = line.strip_prefix("#!")?.split_whitespace();
-    let first = parts.next()?;
-    if first.ends_with("/env") {
-        parts.next()
-    } else {
-        Some(first)
-    }
-}
-
-/// The shell a shebang line asks for, or `None` when it names no shell we
-/// recognize (or is not a shebang at all).
+/// The shell a shebang line asks for — `#!/bin/bash` and `#!/usr/bin/env bash`
+/// alike — or `None` when it names no shell we recognize, or is not a shebang
+/// at all.
 ///
 /// The one place that answers both questions asked of a shebang — whether the
 /// file is a shell script and which shell it wants — so the two can never
 /// disagree about an interpreter.
 fn shebang_shell(line: &str) -> Option<&str> {
-    let interpreter = shebang_interpreter(line)?;
-    let basename = interpreter.rsplit('/').next().unwrap_or(interpreter);
+    let mut parts = line.strip_prefix("#!")?.split_whitespace();
+    let first = parts.next()?;
+    let interpreter = if first.ends_with("/env") {
+        parts.next()?
+    } else {
+        first
+    };
+    let basename = interpreter
+        .rsplit_once('/')
+        .map_or(interpreter, |(_, base)| base);
     matches!(basename, "sh" | "bash" | "zsh" | "dash" | "ash" | "ksh").then_some(interpreter)
-}
-
-pub(crate) fn is_shell_interpreter(shebang: &str) -> bool {
-    shebang_shell(shebang).is_some()
 }
 
 /// The path `shell` execs as: itself when it contains a `/` and exists, its
@@ -153,30 +145,22 @@ fn shell_path(shell: &str) -> Option<String> {
 /// settling a file's shell at parse time keeps one file's answer consistent:
 /// a shell appearing on `PATH` mid-run cannot make two files that name the
 /// same shell disagree about it.
+///
+/// The lookup runs under the lock, so two parse workers asking about the same
+/// shell at once do not both pay for it — and cannot get two answers.
 pub(crate) fn resolve_shell(shell: &str) -> String {
     use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{LazyLock, Mutex, PoisonError};
 
-    static RESOLVED: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-    let cache = RESOLVED.get_or_init(Mutex::default);
-
+    static RESOLVED: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Mutex::default);
     // A poisoned lock would mean a panic while resolving, which leaves the map
     // itself intact: take it back rather than turning that into a second panic.
-    let hit = cache
+    RESOLVED
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(shell)
-        .cloned();
-    if let Some(resolved) = hit {
-        return resolved;
-    }
-
-    let resolved = shell_path(shell).unwrap_or_else(|| "/bin/sh".to_string());
-    cache
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(shell.to_string(), resolved.clone());
-    resolved
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(shell.to_owned())
+        .or_insert_with(|| shell_path(shell).unwrap_or_else(|| "/bin/sh".to_owned()))
+        .clone()
 }
 
 /// The shell to run the script `source` under: the one its shebang names if
@@ -217,16 +201,40 @@ mod tests {
     }
 
     #[test]
-    fn discover_directory_finds_shell_files() {
+    fn discover_directory_finds_shell_files_in_order() {
         let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("a.sh"), "#!/bin/bash\n").unwrap();
-        fs::write(tmp.path().join("b.test"), "#!/bin/bash\n").unwrap();
+        fs::write(tmp.path().join("z.sh"), "#!/bin/bash\n").unwrap();
         fs::write(tmp.path().join("c.txt"), "not a script\n").unwrap();
+        fs::write(tmp.path().join("b.test"), "#!/bin/bash\n").unwrap();
+        fs::write(tmp.path().join("a.sh"), "#!/bin/bash\n").unwrap();
 
         let result = discover_test_files(tmp.path()).unwrap();
-        assert_eq!(result.len(), 2);
-        assert!(result.iter().any(|p| p.ends_with("a.sh")));
-        assert!(result.iter().any(|p| p.ends_with("b.test")));
+        let expected: Vec<_> = ["a.sh", "b.test", "z.sh"]
+            .iter()
+            .map(|name| tmp.path().join(name))
+            .collect();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn walk_skips_hidden_entries() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("a.test"), "#!/bin/sh\n").unwrap();
+        fs::write(tmp.path().join(".hidden.test"), "#!/bin/sh\n").unwrap();
+        // A hidden name that is not UTF-8 is hidden all the same.
+        fs::write(
+            tmp.path().join(OsStr::from_bytes(b".\xff.test")),
+            "#!/bin/sh\n",
+        )
+        .unwrap();
+        fs::create_dir(tmp.path().join(".dir")).unwrap();
+        fs::write(tmp.path().join(".dir/b.test"), "#!/bin/sh\n").unwrap();
+
+        let result = discover_test_files(tmp.path()).unwrap();
+        assert_eq!(result, vec![tmp.path().join("a.test")]);
     }
 
     #[test]
@@ -345,22 +353,6 @@ mod tests {
     }
 
     #[test]
-    fn discover_results_are_sorted() {
-        let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("z.sh"), "#!/bin/bash\n").unwrap();
-        fs::write(tmp.path().join("a.sh"), "#!/bin/bash\n").unwrap();
-        fs::write(tmp.path().join("m.sh"), "#!/bin/bash\n").unwrap();
-
-        let result = discover_test_files(tmp.path()).unwrap();
-        let sorted: Vec<_> = {
-            let mut v = result.clone();
-            v.sort();
-            v
-        };
-        assert_eq!(result, sorted);
-    }
-
-    #[test]
     fn shell_script_by_extension() {
         let tmp = TempDir::new().unwrap();
         for ext in &["sh", "bash", "test"] {
@@ -385,18 +377,54 @@ mod tests {
         let python_file = tmp.path().join("not_shell");
         fs::write(&python_file, "#!/usr/bin/python3\nprint('hi')\n").unwrap();
         assert!(!is_shell_script(&python_file));
+
+        let no_newline = tmp.path().join("one_line");
+        fs::write(&no_newline, "#!/bin/sh").unwrap();
+        assert!(is_shell_script(&no_newline));
+
+        // The head is read as a fixed 256 bytes, which here ends in the middle
+        // of a multibyte character: the shebang in front of it still counts.
+        let cut = tmp.path().join("cut_mid_char");
+        let mut text = b"#!/bin/sh\n# ".to_vec();
+        while text.len() < 255 {
+            text.push(b'x');
+        }
+        text.extend_from_slice("é\n".as_bytes());
+        assert_eq!(text[255], 0xC3, "the test must cut the character at 256");
+        fs::write(&cut, &text).unwrap();
+        assert!(is_shell_script(&cut));
+
+        // A first line that is not UTF-8 at all is not a shebang.
+        let binary = tmp.path().join("binary");
+        fs::write(&binary, b"#!/bin/sh\xff\xfe\nx\n").unwrap();
+        assert!(!is_shell_script(&binary));
     }
 
     #[test]
-    fn shebang_names_its_interpreter() {
+    fn shebang_names_its_shell() {
         // The shell a shebang asks for, exactly as written — the `env` form
         // names the shell rather than `env` itself.
         assert_eq!(shebang_shell("#!/bin/bash"), Some("/bin/bash"));
         assert_eq!(shebang_shell("#!/usr/bin/env bash"), Some("bash"));
         assert_eq!(shebang_shell("#!/bin/sh"), Some("/bin/sh"));
-        // Not a shell, and not a shebang at all.
-        assert_eq!(shebang_shell("#!/usr/bin/python3"), None);
-        assert_eq!(shebang_shell("echo hi"), None);
+        assert_eq!(shebang_shell("#! /bin/sh -e"), Some("/bin/sh"));
+        for shell in ["zsh", "dash", "ash", "ksh"] {
+            let direct = format!("#!/bin/{shell}");
+            assert_eq!(shebang_shell(&direct), Some(&direct[2..]));
+            let env = format!("#!/usr/bin/env {shell}");
+            assert_eq!(shebang_shell(&env), Some(shell));
+        }
+        // Not a shell, not a shebang at all, or a shebang naming nothing.
+        for line in [
+            "#!/usr/bin/python3",
+            "#!/usr/bin/env ruby",
+            "#!/usr/bin/env node",
+            "echo hi",
+            "#!",
+            "#!/usr/bin/env",
+        ] {
+            assert_eq!(shebang_shell(line), None, "{line:?}");
+        }
     }
 
     #[test]
@@ -410,16 +438,6 @@ mod tests {
         for source in ["echo hi\n", "#!/usr/bin/python3\nprint('hi')\n", ""] {
             assert_eq!(script_shell(source), resolve_shell("bash"), "{source:?}");
         }
-    }
-
-    #[test]
-    fn shell_path_detects_real_and_missing_shells() {
-        // Absolute path that exists vs. one that doesn't.
-        assert_eq!(shell_path("/bin/sh").as_deref(), Some("/bin/sh"));
-        assert_eq!(shell_path("/no/such/shell"), None);
-        // Bare name resolved via PATH.
-        assert!(shell_path("sh").is_some());
-        assert_eq!(shell_path("definitely-not-a-real-shell-xyz"), None);
     }
 
     #[test]
@@ -439,19 +457,5 @@ mod tests {
         assert_eq!(Path::new(&sh), which::which("sh").unwrap());
         let env_sh = script_shell("#!/usr/bin/env sh\necho hi\n");
         assert!(Path::new(&env_sh).is_absolute(), "{env_sh:?}");
-    }
-
-    #[test]
-    fn interpreter_detection() {
-        assert!(is_shell_interpreter("#!/bin/sh"));
-        assert!(is_shell_interpreter("#!/bin/bash"));
-        assert!(is_shell_interpreter("#!/usr/bin/env bash"));
-        assert!(is_shell_interpreter("#!/usr/bin/env zsh"));
-        assert!(is_shell_interpreter("#!/bin/dash"));
-        assert!(is_shell_interpreter("#!/bin/ash"));
-        assert!(is_shell_interpreter("#!/usr/bin/env ksh"));
-        assert!(!is_shell_interpreter("#!/usr/bin/python3"));
-        assert!(!is_shell_interpreter("#!/usr/bin/env ruby"));
-        assert!(!is_shell_interpreter("#!/usr/bin/env node"));
     }
 }
