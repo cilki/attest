@@ -258,17 +258,84 @@ fn probe_migration(base: &Path) -> bool {
     ok
 }
 
+/// The controllers [`TestCgroup::read_stats`] reads from, in the order the
+/// metrics name them. A `cpu.stat` exists in every cgroup v2 directory, so
+/// `cpu` is measured without its controller; the other three are not.
+const WANTED_CONTROLLERS: [&str; 4] = ["cpu", "memory", "io", "pids"];
+
 /// Enable the controllers we read stats from for `base`'s children, limited to
 /// those its parent already delegated to it (visible in `base/cgroup.controllers`).
 /// Never write to the parent's `cgroup.subtree_control` — doing so while the
 /// parent has live processes transitions it to "domain invalid" on later runs.
+///
+/// Every controller the base did not get is named on the debug log, with the
+/// reason its parent could not pass it down: the "not checked" warning the run
+/// prints for a `mem` or `pids` condition sends the user to `-d` for exactly
+/// that, and this is the only place that knows it.
 fn enable_controllers(base: &Path) {
+    let missing = enable_available_controllers(base);
+    if missing.is_empty() {
+        return;
+    }
+    debug!(
+        path=%base.display(),
+        "controllers not delegated to the cgroup base: {}; {}",
+        missing.join(" "),
+        explain_missing_controllers(base)
+    );
+}
+
+/// Enable each of [`WANTED_CONTROLLERS`] that `base/cgroup.controllers` offers
+/// and return the ones it does not, in the order they are wanted.
+fn enable_available_controllers(base: &Path) -> Vec<&'static str> {
     let available = std::fs::read_to_string(base.join("cgroup.controllers")).unwrap_or_default();
-    for ctrl in available
+    let mut missing = Vec::new();
+    for ctrl in WANTED_CONTROLLERS {
+        if !available.split_whitespace().any(|c| c == ctrl) {
+            missing.push(ctrl);
+            continue;
+        }
+        if let Err(e) = std::fs::write(base.join("cgroup.subtree_control"), format!("+{ctrl}")) {
+            debug!(path=%base.display(), "failed to enable the {ctrl} controller for the test cgroups: {e}");
+        }
+    }
+    missing
+}
+
+/// Why `base/cgroup.controllers` lacks controllers its parent may have: the
+/// parent was not given them either, or it holds processes — in which case
+/// cgroup v2 refuses to delegate any domain controller to its children
+/// (`EBUSY` on its `cgroup.subtree_control`), which is the position of every
+/// process in an interactive session's scope or a systemd service's cgroup.
+fn explain_missing_controllers(base: &Path) -> String {
+    let Some(parent) = base.parent() else {
+        return "the base has no parent cgroup".to_string();
+    };
+    let parent_has = std::fs::read_to_string(parent.join("cgroup.controllers")).unwrap_or_default();
+    let parent_has: Vec<&str> = parent_has
         .split_whitespace()
-        .filter(|c| matches!(*c, "cpu" | "memory" | "io" | "pids"))
-    {
-        let _ = std::fs::write(base.join("cgroup.subtree_control"), format!("+{ctrl}"));
+        .filter(|c| WANTED_CONTROLLERS.contains(c))
+        .collect();
+    if parent_has.is_empty() {
+        return format!(
+            "the parent cgroup {} was not given any of them either (its cgroup.controllers names none)",
+            parent.display()
+        );
+    }
+    let procs = std::fs::read_to_string(parent.join("cgroup.procs")).unwrap_or_default();
+    let occupants = procs.lines().filter(|l| !l.trim().is_empty()).count();
+    if occupants > 0 {
+        format!(
+            "the parent cgroup {} has {} but holds {occupants} process(es) of its own, and cgroup v2 only lets a cgroup delegate controllers to its children while nothing runs in it directly",
+            parent.display(),
+            parent_has.join(" ")
+        )
+    } else {
+        format!(
+            "the parent cgroup {} has {} but does not enable them in its cgroup.subtree_control",
+            parent.display(),
+            parent_has.join(" ")
+        )
     }
 }
 
@@ -406,6 +473,84 @@ mod tests {
         assert_eq!(
             cgroup_ancestors(PathBuf::from("/sys/fs/cgroup")).collect::<Vec<_>>(),
             vec![PathBuf::from("/sys/fs/cgroup")]
+        );
+    }
+
+    /// A `parent/attest` pair of mock cgroup directories: `parent` offering
+    /// `parent_controllers` and holding `parent_procs`, the base offering
+    /// `base_controllers`. Returns the base.
+    fn mock_base(
+        tmp: &Path,
+        parent_controllers: &str,
+        parent_procs: &str,
+        base_controllers: &str,
+    ) -> PathBuf {
+        let base = tmp.join("attest");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(tmp.join("cgroup.controllers"), parent_controllers).unwrap();
+        std::fs::write(tmp.join("cgroup.procs"), parent_procs).unwrap();
+        std::fs::write(base.join("cgroup.controllers"), base_controllers).unwrap();
+        std::fs::write(base.join("cgroup.subtree_control"), "").unwrap();
+        base
+    }
+
+    #[test]
+    fn enabling_controllers_names_the_wanted_ones_the_base_lacks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = mock_base(tmp.path(), "cpu io pids", "", "io pids");
+
+        // Only the wanted controllers count as missing, in the order the
+        // metrics name them; `cpuset` is neither read nor missed.
+        assert_eq!(enable_available_controllers(&base), vec!["cpu", "memory"]);
+        // The ones the base has are enabled for its children, one write each,
+        // and nothing is written for a controller it lacks.
+        assert_eq!(
+            std::fs::read_to_string(base.join("cgroup.subtree_control")).unwrap(),
+            "+pids",
+            "the mock keeps only the last write; it must be for an available controller"
+        );
+
+        let base = mock_base(
+            tmp.path(),
+            "cpu memory io pids cpuset",
+            "",
+            "cpu memory io pids cpuset",
+        );
+        assert!(enable_available_controllers(&base).is_empty());
+
+        // No `cgroup.controllers` at all (the base vanished) misses everything
+        // rather than failing.
+        std::fs::remove_file(base.join("cgroup.controllers")).unwrap();
+        assert_eq!(
+            enable_available_controllers(&base),
+            WANTED_CONTROLLERS.to_vec()
+        );
+    }
+
+    #[test]
+    fn missing_controllers_are_explained_by_the_parent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // The parent holds processes: cgroup v2 forbids it to delegate, which
+        // is where an interactive session or a service cgroup leaves attest.
+        let base = mock_base(tmp.path(), "io pids", "1007\n343513\n", "");
+        let why = explain_missing_controllers(&base);
+        assert!(why.contains("holds 2 process(es)"), "{why}");
+        assert!(why.contains("has io pids"), "{why}");
+        assert!(why.contains(&tmp.path().display().to_string()), "{why}");
+
+        // The parent was not given the controllers either: nothing below it
+        // could ever have them.
+        let base = mock_base(tmp.path(), "cpuset rdma", "1007\n", "");
+        let why = explain_missing_controllers(&base);
+        assert!(why.contains("was not given any of them either"), "{why}");
+
+        // The parent has them and is empty, but does not pass them on.
+        let base = mock_base(tmp.path(), "memory pids", "\n", "");
+        let why = explain_missing_controllers(&base);
+        assert!(
+            why.contains("does not enable them in its cgroup.subtree_control"),
+            "{why}"
         );
     }
 
