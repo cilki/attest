@@ -9,7 +9,11 @@
   that same selector, keeping the directories the file was discovered under —
   the file half matches as a path suffix and a positional target only splits
   where its left half is an existing file, so a base-name-only listing is both
-  ambiguous between same-named files and unusable as a target.
+  ambiguous between same-named files and unusable as a target. A listed
+  selector is not promised to select only its own test: its name half matches
+  as a prefix like any filter's, so `x.test/testKw` also selects
+  `x.test/testKwParen`. That is deliberate (issue #140) — filters always
+  prefix-match, and there is no exact-match special case for `list` output.
   `parse_discovered` parses every discovered file out of which the selection
   could pick a test (`parser::Prescan` settles that from the file's path and
   its text, without a parse): a
