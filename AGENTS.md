@@ -445,10 +445,14 @@
   `script` (the parser keeps decorator lines in it at their own line numbers
   for exactly this), with a `Highlight` that underlines just the condition's
   byte span — `cpu < 10ms` inside `#attest(cpu < 10ms, pids <= 3)` — and
-  carries `cpu was 12.2ms` as the annotation's label. The window runs from
-  the condition to the end of the function below it, so the test's name is in
-  view; the decorator sits outside every function bound, so the clamp is
-  found as the first function starting under it.
+  carries `cpu was 12.2ms` as the annotation's label. The window
+  (`violation_window`) runs from the condition through the usual context
+  and at least to the line after the definition, however many block or doc
+  comment lines sit in between, so the test's name is always in view, and
+  never past the end of that function; the decorator sits outside every
+  function bound, so the function is found as the first one starting under
+  it. A failed command's window is the context clamped to its function
+  instead, so `render_snippet` takes the window from its caller.
 - `src/output.rs` - ANSI-colored terminal output for PASS/FAIL and summary, plus
   the `Palette` that decides whether those sequences are written at all. A
   styled write takes them from the palette of the stream it is bound for

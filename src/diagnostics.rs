@@ -60,6 +60,10 @@ pub fn print_failure_snippet(result: &TestResult) {
     // Clamp the rendered context to the enclosing function so a snippet never
     // leaks into an adjacent test.
     let (func_start_line, func_end_line) = failure.function;
+    let start = line_idx.saturating_sub(CONTEXT_LINES).max(func_start_line);
+    let end = (line_idx + CONTEXT_LINES + 1)
+        .min(lines.len())
+        .min(func_end_line + 1);
 
     outln!(
         "{}",
@@ -68,8 +72,7 @@ pub fn print_failure_snippet(result: &TestResult) {
             &result.file.path,
             &lines,
             Highlight::line(line_idx),
-            func_start_line,
-            func_end_line,
+            start..end,
             out_palette().is_colored(),
         )
     );
@@ -88,8 +91,9 @@ pub fn print_failure_snippet(result: &TestResult) {
 /// holds no failure to replay. What there is to show is the assertion, which
 /// the script carries at its own line number (the parser keeps decorator
 /// lines, see `parser::build_functions_source`), and the number that broke it,
-/// which is the snippet's label. The window runs from the condition down to
-/// the end of the function it decorates, so the test's name is in view too.
+/// which is the snippet's label. The window runs from the condition down past
+/// the definition of the test it decorates ([`violation_window`]), so the
+/// test's name is in view too.
 pub fn print_violations(result: &TestResult) {
     let file = result.file;
     let lines: Vec<&str> = file.script.lines().collect();
@@ -104,13 +108,6 @@ pub fn print_violations(result: &TestResult) {
             );
             continue;
         }
-        // The decorator sits above its function, outside every bound; the
-        // function it belongs to is the first one that starts below it.
-        let func_end = file
-            .functions
-            .iter()
-            .find(|&&(start, _)| start > line_idx)
-            .map_or(lines.len() - 1, |&(_, end)| end);
         outln!(
             "{}",
             render_snippet(
@@ -122,8 +119,7 @@ pub fn print_violations(result: &TestResult) {
                     span: Some(violation.span.clone()),
                     label: Some(&violation.message),
                 },
-                line_idx,
-                func_end,
+                violation_window(&file.functions, line_idx, lines.len()),
                 out_palette().is_colored(),
             )
         );
@@ -139,6 +135,32 @@ pub fn print_violations(result: &TestResult) {
             outln!("");
         }
     }
+}
+
+/// The lines a violation's snippet shows: from the condition on `line` down to
+/// the test it decorates, given the script's function bounds and length.
+///
+/// The decorator sits above its function, outside every bound; the function
+/// it belongs to is the first one that starts below it. A block spread over
+/// several lines, or a doc comment under it, can put that definition further
+/// below the condition than the [`CONTEXT_LINES`] a failed command gets, and
+/// the window reaches it all the same — the definition and the line after it —
+/// since the test's name is what says what the condition is about. It never
+/// runs past the end of that function.
+fn violation_window(
+    functions: &[(usize, usize)],
+    line: usize,
+    len: usize,
+) -> std::ops::Range<usize> {
+    let (func_start, func_end) = functions
+        .iter()
+        .find(|&&(start, _)| start > line)
+        .map_or((line, len - 1), |&bounds| bounds);
+    let end = (line + CONTEXT_LINES + 1)
+        .max(func_start + 2)
+        .min(func_end + 1)
+        .min(len);
+    line..end
 }
 
 /// What a snippet points at: a line of the script, optionally only a byte
@@ -356,21 +378,23 @@ fn escape_c1(line: &str) -> std::borrow::Cow<'_, str> {
 }
 
 /// Render an annotate-snippets diagnostic highlighting `lines[highlight.line]`,
-/// with up to [`CONTEXT_LINES`] lines of surrounding context on each side,
-/// clamped to the enclosing function so a snippet never leaks into an adjacent
-/// test.
+/// showing the lines in `window` (0-based, end exclusive, holding the
+/// highlighted line). The caller picks the window: a failed command gets
+/// [`CONTEXT_LINES`] on each side clamped to its function, so a snippet never
+/// leaks into an adjacent test, while a violated condition runs down to the
+/// function it decorates.
 fn render_snippet(
     title: &str,
     source_path: &Path,
     lines: &[&str],
     highlight: Highlight,
-    func_start_line: usize,
-    func_end_line: usize,
+    window: std::ops::Range<usize>,
     colored: bool,
 ) -> String {
     use annotate_snippets::{AnnotationKind, Level, Renderer, Snippet};
 
     let line_idx = highlight.line;
+    let std::ops::Range { start, end } = window;
 
     // The path as discovered, spelled the way `list` spells it: the `-->`
     // line is where an editor or a terminal jumps from, so it has to name
@@ -383,10 +407,6 @@ fn render_snippet(
     let path = crate::parser::selector_path(source_path);
     let path_str = crate::output::escape_label(&path);
 
-    let start = line_idx.saturating_sub(CONTEXT_LINES).max(func_start_line);
-    let end = (line_idx + CONTEXT_LINES + 1)
-        .min(lines.len())
-        .min(func_end_line + 1);
     // Escaped before anything is measured, so every offset below is an offset
     // into the text that actually gets rendered (see `escape_c1`).
     let window: Vec<std::borrow::Cow<str>> =
@@ -1167,8 +1187,7 @@ mod tests {
             Path::new("t.sh"),
             &lines,
             Highlight::line(2),
-            0,
-            3,
+            0..4,
             true,
         );
 
@@ -1212,8 +1231,7 @@ mod tests {
                 Path::new(path),
                 &lines,
                 Highlight::line(1),
-                0,
-                2,
+                0..3,
                 false,
             )
         };
@@ -1245,8 +1263,7 @@ mod tests {
                 span: Some(span..span + "pids <= 3".len()),
                 label: Some("pids was 5"),
             },
-            2,
-            5,
+            violation_window(&[(3, 5)], 2, lines.len()),
             false,
         );
         assert!(rendered.contains("pids was 5"), "{rendered}");
@@ -1264,6 +1281,50 @@ mod tests {
             Some(caret_col + "pids <= 3".len()),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn violation_window_reaches_a_test_further_down_than_the_context() {
+        // The README's own multi-line form: the first condition sits four
+        // lines above the definition, past the context a failed command gets,
+        // and the snippet used to stop on the doc comment without ever naming
+        // the test.
+        let lines = [
+            "#!/bin/sh",
+            "# attest(",
+            "#   2ms < cpu < 10ms,",
+            "#   pids <= 3,",
+            "# )",
+            "## Doc comments may still sit between the block and the test.",
+            "testHello() {",
+            "  true",
+            "  true",
+            "}",
+            "testOther() {",
+            "  true",
+            "}",
+        ];
+        let functions = [(6, 9), (10, 12)];
+        assert_eq!(violation_window(&functions, 2, lines.len()), 2..8);
+        let rendered = render_snippet(
+            "assertion on the run failed",
+            Path::new("t.sh"),
+            &lines,
+            Highlight {
+                line: 2,
+                span: Some(4..20),
+                label: Some("cpu was 12.2ms"),
+            },
+            violation_window(&functions, 2, lines.len()),
+            false,
+        );
+        assert!(rendered.contains("testHello() {"), "{rendered}");
+
+        // Close by, the usual context still applies, and nothing reaches
+        // past the decorated function into the next one.
+        assert_eq!(violation_window(&functions, 4, lines.len()), 4..8);
+        assert_eq!(violation_window(&functions, 5, lines.len()), 5..9);
+        assert_eq!(violation_window(&[(6, 7), (8, 9)], 5, 10), 5..8);
     }
 
     /// Drop the SGR sequences `Renderer::styled` wraps the snippet in, so a
