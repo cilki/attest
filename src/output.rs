@@ -1116,18 +1116,16 @@ mod tests {
             detail: crate::decorator::Detail::Quantity {
                 metric: crate::decorator::Metric::Cpu,
                 measured: 12_200,
-                broken: crate::decorator::Broken {
-                    bound: crate::decorator::Bound {
-                        value: 10_000,
-                        inclusive: false,
-                        literal: crate::decorator::Literal {
-                            line: 3,
-                            span: 14..18,
-                            text: "10ms".into(),
-                        },
+                bound: crate::decorator::Bound {
+                    value: 10_000,
+                    inclusive: false,
+                    literal: crate::decorator::Literal {
+                        line: 3,
+                        span: 14..18,
+                        text: "10ms".into(),
                     },
-                    upper: true,
                 },
+                upper: true,
             },
         }];
         let parsed = test_result_json(&result);

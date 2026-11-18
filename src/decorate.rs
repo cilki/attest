@@ -21,7 +21,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::decorator::{Bound, Detail, Metric, Unit};
+use crate::decorator::{Bound, Detail, Metric, Unit, Violation};
 use crate::output::{errln, outln};
 use crate::parser::TestFile;
 use crate::runner::TestResult;
@@ -120,43 +120,24 @@ fn round_sig(value: f64, up: bool) -> u64 {
 /// this one sample, which agrees with what [`plan_updates`] decides over all
 /// of a `--repeat`'s: folding only moves the extreme further from the bound,
 /// so a sample nothing admits leaves the fold with nothing either.
-pub fn updatable(v: &crate::decorator::Violation) -> bool {
+pub fn updatable(v: &Violation) -> bool {
     match &v.detail {
         Detail::Quantity {
             metric,
             measured,
-            broken,
-        } => bound_for(
-            metric.unit(),
-            broken.upper,
-            broken.bound.inclusive,
-            &[*measured],
-        )
-        .is_some(),
+            bound,
+            upper,
+        } => bound_for(metric.unit(), *upper, bound.inclusive, &[*measured]).is_some(),
         Detail::Set { .. } => false,
     }
-}
-
-/// A literal to rewrite, keyed by where it is: the same condition of the
-/// same file, however many times `--repeat` ran its test.
-#[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
-struct LiteralKey {
-    path: PathBuf,
-    line: usize,
-    start: usize,
 }
 
 /// The edits `--update-decorators` makes: one per bound a run broke, loosened
 /// to admit every measurement of it.
 pub fn plan_updates(results: &[TestResult]) -> Vec<Edit> {
-    struct Broken<'a> {
-        violation: &'a crate::decorator::Violation,
-        metric: crate::decorator::Metric,
-        bound: &'a crate::decorator::Bound,
-        upper: bool,
-        samples: Vec<u64>,
-    }
-    let mut by_literal: BTreeMap<LiteralKey, Broken> = BTreeMap::new();
+    // Keyed by where the literal is — path, line, start column — so the same
+    // condition of the same file collects every sample `--repeat` took of it.
+    let mut by_literal: BTreeMap<(PathBuf, usize, usize), (&Violation, Vec<u64>)> = BTreeMap::new();
     let mut unwritable: BTreeSet<(PathBuf, usize, String)> = BTreeSet::new();
     for result in results {
         for v in &result.violations {
@@ -164,9 +145,7 @@ pub fn plan_updates(results: &[TestResult]) -> Vec<Edit> {
             // paths a test may use is a decision, not a measurement, so the
             // violation is reported and the condition left as written.
             let Detail::Quantity {
-                metric,
-                measured,
-                broken,
+                measured, bound, ..
             } = &v.detail
             else {
                 unwritable.insert((
@@ -176,21 +155,15 @@ pub fn plan_updates(results: &[TestResult]) -> Vec<Edit> {
                 ));
                 continue;
             };
-            let key = LiteralKey {
-                path: result.file.canonical_path.clone(),
-                line: broken.bound.literal.line,
-                start: broken.bound.literal.span.start,
-            };
+            let key = (
+                result.file.canonical_path.clone(),
+                bound.literal.line,
+                bound.literal.span.start,
+            );
             by_literal
                 .entry(key)
-                .or_insert_with(|| Broken {
-                    violation: v,
-                    metric: *metric,
-                    bound: &broken.bound,
-                    upper: broken.upper,
-                    samples: Vec::new(),
-                })
-                .samples
+                .or_insert_with(|| (v, Vec::new()))
+                .1
                 .push(*measured);
         }
     }
@@ -205,16 +178,22 @@ pub fn plan_updates(results: &[TestResult]) -> Vec<Edit> {
 
     by_literal
         .into_iter()
-        .filter_map(|(key, broken)| {
-            let v = broken.violation;
-            let bound = broken.bound;
-            let unit = broken.metric.unit();
-            let Some(new_value) = bound_for(unit, broken.upper, bound.inclusive, &broken.samples)
+        .filter_map(|((path, line, _), (v, samples))| {
+            let Detail::Quantity {
+                metric,
+                bound,
+                upper,
+                ..
+            } = &v.detail
             else {
+                unreachable!("only quantity violations are collected");
+            };
+            let unit = metric.unit();
+            let Some(new_value) = bound_for(unit, *upper, bound.inclusive, &samples) else {
                 errln!(
                     "warning: {}:{}: no value satisfies `{}` for what was measured; not updated",
-                    key.path.display(),
-                    key.line,
+                    path.display(),
+                    line,
                     v.condition
                 );
                 return None;
@@ -227,9 +206,9 @@ pub fn plan_updates(results: &[TestResult]) -> Vec<Edit> {
             let after = before.replacen(&old, &new, 1);
             let condition = (before, after);
             Some(Edit {
-                path: key.path,
+                path,
                 kind: EditKind::Replace {
-                    line: key.line,
+                    line,
                     span: bound.literal.span.clone(),
                     old,
                     new,
@@ -494,7 +473,7 @@ fn plural(n: usize) -> &'static str {
 mod tests {
     use super::*;
     use crate::cgroup::ResourceStats;
-    use crate::decorator::{Broken, Literal, Violation};
+    use crate::decorator::{Literal, Violation};
     use crate::runner::Outcome;
     use std::time::Duration;
 
@@ -622,18 +601,16 @@ mod tests {
             detail: Detail::Quantity {
                 metric: Metric::Cpu,
                 measured,
-                broken: Broken {
-                    bound: Bound {
-                        value,
-                        inclusive: condition.contains("<=") || condition.contains(">="),
-                        literal: Literal {
-                            line,
-                            span: lit_start..lit_start + lit.len(),
-                            text: lit.to_string(),
-                        },
+                bound: Bound {
+                    value,
+                    inclusive: condition.contains("<=") || condition.contains(">="),
+                    literal: Literal {
+                        line,
+                        span: lit_start..lit_start + lit.len(),
+                        text: lit.to_string(),
                     },
-                    upper,
                 },
+                upper,
             },
         });
         r
