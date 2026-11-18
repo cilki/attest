@@ -13,7 +13,10 @@
 //! child in order, a close-on-exec pipe carries a failing hook's errno back,
 //! and EOF on it means the exec went through — but the parent waits on that
 //! pipe with [`Spawning::wait_exec`], which answers the child's seccomp
-//! listener in the meantime.
+//! listener in the meantime. A filter given to [`Spawn::watch`] is installed
+//! after every hook, and [`Spawn::start`] takes its listener out of the child
+//! before returning, so the whole handoff happens here rather than at each
+//! caller.
 
 use std::ffi::CString;
 use std::fs::File;
@@ -22,7 +25,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 
-use crate::seccomp::Listener;
+use crate::seccomp::{Filter, Handoff, Listener};
 
 /// Something run in the child between `fork` and `exec`. Only
 /// async-signal-safe calls, no allocation: the parent has other threads, and
@@ -38,6 +41,9 @@ pub struct Spawn {
     hooks: Vec<Hook>,
     /// Variables set in the child on top of the inherited environment.
     env: Vec<(String, String)>,
+    /// The seccomp filter to install after the hooks, and the page its
+    /// listener is handed over through.
+    watch: Option<(Filter, Handoff)>,
 }
 
 impl Spawn {
@@ -58,6 +64,7 @@ impl Spawn {
             stderr,
             hooks: Vec::new(),
             env: Vec::new(),
+            watch: None,
         })
     }
 
@@ -103,8 +110,22 @@ impl Spawn {
         self
     }
 
-    /// Fork. The child runs the hooks and execs; the parent gets back at
-    /// once, with the child's pid and the pipe its outcome arrives on.
+    /// Watch the child's syscalls through `filter`: installed in the child
+    /// after every hook, so none of their syscalls are in the count, with
+    /// its listener taken out of the child by [`Self::start`] and answered
+    /// by [`Spawning::wait_exec`] until the exec goes through.
+    pub fn watch(&mut self, filter: Filter) -> io::Result<&mut Self> {
+        self.watch = Some((filter, Handoff::new()?));
+        Ok(self)
+    }
+
+    /// Fork. The child runs the hooks, installs the [`Self::watch`] filter if
+    /// there is one, and execs; the parent gets back as soon as it holds the
+    /// filter's listener (at once, without one), with the pipe the child's
+    /// outcome arrives on.
+    ///
+    /// Failing to take the listener is an error of its own: the child,
+    /// which would otherwise spin waiting for it, has been killed and reaped.
     pub fn start(mut self) -> io::Result<Spawning> {
         // argv and envp as the `char *const []` execve wants, built before
         // the fork.
@@ -150,6 +171,11 @@ impl Spawn {
                     fail(e);
                 }
             }
+            if let Some((filter, handoff)) = &self.watch
+                && let Err(e) = unsafe { filter.install_and_hand_off(handoff) }
+            {
+                fail(e);
+            }
             unsafe {
                 libc::execve(
                     self.program.as_ptr(),
@@ -161,9 +187,20 @@ impl Spawn {
         }
 
         drop(status_wr);
+        let mut child = Child { pid, status: None };
+        // `None` from `take` is a child that ended without publishing a
+        // listener; why is on the status pipe, which `wait_exec` reads.
+        let listener = match &self.watch {
+            Some((_, handoff)) => handoff.take(pid).map_err(|e| {
+                let _ = child.wait();
+                io::Error::new(e.kind(), format!("taking the seccomp listener: {e}"))
+            })?,
+            None => None,
+        };
         Ok(Spawning {
-            child: Child { pid, status: None },
+            child,
             status_rd: File::from(status_rd),
+            listener,
         })
     }
 }
@@ -172,22 +209,18 @@ impl Spawn {
 pub struct Spawning {
     child: Child,
     status_rd: File,
+    listener: Option<Listener>,
 }
 
 impl Spawning {
-    /// The child's pid, for what the parent does with it before the exec
-    /// (taking its seccomp listener). Unreaped until [`Self::wait_exec`].
-    pub fn pid(&self) -> libc::pid_t {
-        self.child.pid
-    }
-
     /// Wait for the child to exec — or to fail before it does, in which case
-    /// the child is reaped and its hook's error returned.
+    /// the child is reaped and its hook's error returned. On success, the
+    /// child comes back with its seccomp listener, if it was watched.
     ///
-    /// The child's seccomp `listener`, when it has one, is serviced while
-    /// this waits: the exec may itself be a watched syscall, held until the
-    /// parent answers it.
-    pub fn wait_exec(mut self, mut listener: Option<&mut Listener>) -> io::Result<Child> {
+    /// The listener is serviced while this waits: the exec may itself be a
+    /// watched syscall, held until the parent answers it.
+    pub fn wait_exec(mut self) -> io::Result<(Child, Option<Listener>)> {
+        let mut listener = self.listener.take();
         let pollfd = |fd| libc::pollfd {
             fd,
             events: libc::POLLIN,
@@ -206,7 +239,7 @@ impl Spawning {
                 return Err(err);
             }
             if fds[1].revents != 0
-                && let Some(l) = listener.as_deref_mut()
+                && let Some(l) = listener.as_mut()
             {
                 l.service();
                 // A listener with nobody left behind it stays in `POLLHUP`.
@@ -221,7 +254,7 @@ impl Spawning {
             // whole, so there is no such thing as part of one.
             let mut errno = [0u8; 4];
             return match self.status_rd.read_exact(&mut errno) {
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(self.child),
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok((self.child, listener)),
                 Err(e) => Err(e),
                 Ok(()) => {
                     let _ = self.child.wait();
@@ -328,7 +361,7 @@ mod tests {
             err,
         )
         .unwrap();
-        let mut child = spawn.start().unwrap().wait_exec(None).unwrap();
+        let (mut child, _) = spawn.start().unwrap().wait_exec().unwrap();
         assert!(child.wait().unwrap().success());
         let mut s = String::new();
         File::open(tmp.path().join("out"))
@@ -359,7 +392,7 @@ mod tests {
         spawn
             .env("ATTEST_SPAWN_X", "first")
             .env("ATTEST_SPAWN_X", "second");
-        let mut child = spawn.start().unwrap().wait_exec(None).unwrap();
+        let (mut child, _) = spawn.start().unwrap().wait_exec().unwrap();
         assert!(child.wait().unwrap().success());
         let s = std::fs::read_to_string(tmp.path().join("out")).unwrap();
         assert_eq!(s, "second|inherited\n");
@@ -370,7 +403,7 @@ mod tests {
         let (_tmp, out, err) = logs();
         let mut spawn = Spawn::new("/bin/sh", &["sh", "-c", "true"], out, err).unwrap();
         spawn.hook(|| Err(io::Error::from_raw_os_error(libc::EPERM)));
-        let err = spawn.start().unwrap().wait_exec(None).unwrap_err();
+        let err = spawn.start().unwrap().wait_exec().unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EPERM));
     }
 
@@ -378,7 +411,7 @@ mod tests {
     fn a_missing_program_is_an_exec_error() {
         let (_tmp, out, err) = logs();
         let spawn = Spawn::new("/nonexistent/prog", &["prog"], out, err).unwrap();
-        let err = spawn.start().unwrap().wait_exec(None).unwrap_err();
+        let err = spawn.start().unwrap().wait_exec().unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
     }
 
@@ -388,7 +421,7 @@ mod tests {
     fn has_exited_leaves_the_zombie_for_wait() {
         let (_tmp, out, err) = logs();
         let spawn = Spawn::new("/bin/sh", &["sh", "-c", "exit 3"], out, err).unwrap();
-        let mut child = spawn.start().unwrap().wait_exec(None).unwrap();
+        let (mut child, _) = spawn.start().unwrap().wait_exec().unwrap();
         while !child.has_exited().unwrap() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -423,7 +456,7 @@ mod tests {
             unsafe { libc::close(fd) };
             Ok(())
         });
-        let mut child = spawn.start().unwrap().wait_exec(None).unwrap();
+        let (mut child, _) = spawn.start().unwrap().wait_exec().unwrap();
         assert!(child.wait().unwrap().success());
     }
 }
