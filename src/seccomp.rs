@@ -137,7 +137,7 @@ impl Filter {
     }
 
     /// Install this filter on the calling thread and hand the listener the
-    /// kernel returns for it to the parent through `end`, returning once the
+    /// kernel returns for it to the parent through `handoff`, returning once the
     /// parent has taken it ([`Handoff::take`]). For the child, between fork
     /// and exec: nothing here allocates, and nothing after the install makes
     /// a syscall — the wait for the parent is a spin on shared memory, since
@@ -148,12 +148,11 @@ impl Filter {
     /// makes it so), so the exec drops it; the parent's copy keeps it alive.
     ///
     /// # Safety
-    /// `end` must come from a [`Handoff`] created before the fork, whose
-    /// parent side calls [`Handoff::take`] with this process's pid.
-    pub unsafe fn install_and_hand_off(&self, end: HandoffEnd) -> io::Result<()> {
-        // SAFETY: the page was mapped before the fork, and the child keeps its
-        // copy of the mapping until it execs or exits.
-        let page = unsafe { &*end.0 };
+    /// `handoff` must have been created before the fork, and its parent side
+    /// must call [`Handoff::take`] with this process's pid.
+    pub unsafe fn install_and_hand_off(&self, handoff: &Handoff) -> io::Result<()> {
+        // The child keeps its copy of the mapping until it execs or exits.
+        let page = handoff.page();
         let mut fprog = libc::sock_fprog {
             len: self.prog.len() as libc::c_ushort,
             // Same layout, by construction.
@@ -211,11 +210,6 @@ pub struct Handoff {
     page: *mut HandoffPage,
 }
 
-/// The child's side of a [`Handoff`]: a pointer into the shared page, valid
-/// in the child because the fork copied the mapping.
-#[derive(Clone, Copy)]
-pub struct HandoffEnd(*const HandoffPage);
-
 impl Handoff {
     /// Map the shared page. Call before the fork.
     pub fn new() -> io::Result<Self> {
@@ -243,11 +237,6 @@ impl Handoff {
         Ok(Self { page })
     }
 
-    /// What the child's hook hands to [`Filter::install_and_hand_off`].
-    pub fn child_end(&self) -> HandoffEnd {
-        HandoffEnd(self.page)
-    }
-
     fn page(&self) -> &HandoffPage {
         // SAFETY: mapped by `new` and unmapped only by `drop`.
         unsafe { &*self.page }
@@ -260,7 +249,10 @@ impl Handoff {
     /// `None` when the child ends without a listener — an earlier hook
     /// failed, or the install did — which the exec-status pipe says more
     /// about. On an error the child, which would spin forever waiting for
-    /// this, is `SIGKILL`ed; the caller still reaps it.
+    /// this, is `SIGKILL`ed; the caller still reaps it ([`Spawn::start`]
+    /// does).
+    ///
+    /// [`Spawn::start`]: crate::spawn::Spawn::start
     pub fn take(&self, pid: libc::pid_t) -> io::Result<Option<Listener>> {
         let taken = self.take_inner(pid);
         if taken.is_err() {
@@ -331,6 +323,7 @@ impl Drop for Handoff {
 
 /// The parent's end of one test's filter: the notifications arrive here,
 /// and the log of what they were about builds up.
+#[derive(Debug)]
 pub struct Listener {
     fd: OwnedFd,
     log: SyscallLog,
@@ -441,7 +434,7 @@ pub fn probe() -> Result<(), String> {
 }
 
 /// Spawn `program` with `argv` under a filter watching `watched`, through
-/// the same [`Spawn`](crate::spawn::Spawn), [`Handoff`] and
+/// the same [`Spawn::watch`](crate::spawn::Spawn::watch) and
 /// [`wait_exec`](crate::spawn::Spawning::wait_exec) path the runner takes,
 /// and answer its notifications until it exits. Its output is discarded.
 fn run_watched(
@@ -450,8 +443,6 @@ fn run_watched(
     argv: &[&str],
 ) -> Result<(std::process::ExitStatus, SyscallLog), String> {
     let filter = Filter::watching(watched).ok_or("no filter for this architecture")?;
-    let handoff = Handoff::new().map_err(|e| format!("mapping the handoff page: {e}"))?;
-    let end = handoff.child_end();
     let null = || {
         std::fs::File::options()
             .write(true)
@@ -460,32 +451,20 @@ fn run_watched(
     };
     let mut spawn = crate::spawn::Spawn::new(program, argv, null()?, null()?)
         .map_err(|e| format!("spawning {program}: {e}"))?;
-    spawn.hook(move || unsafe { filter.install_and_hand_off(end) });
-    let spawning = spawn.start().map_err(|e| format!("fork: {e}"))?;
-    let mut listener = match handoff.take(spawning.pid()) {
-        Ok(Some(listener)) => listener,
-        // Nothing published: the install failed, and its errno is on the
-        // exec-status pipe (which reaps the child).
-        Ok(None) => {
-            return Err(match spawning.wait_exec(None) {
-                Err(e) => format!("seccomp(2): {e}"),
-                Ok(mut child) => {
-                    let _ = child.wait();
-                    "the child installed no listener".to_string()
-                }
-            });
-        }
-        Err(e) => {
-            // `take` killed the child, which is still ours to reap.
-            if let Ok(mut child) = spawning.wait_exec(None) {
-                let _ = child.wait();
-            }
-            return Err(format!("taking the listener (pidfd_getfd): {e}"));
-        }
+    spawn
+        .watch(filter)
+        .map_err(|e| format!("mapping the handoff page: {e}"))?;
+    // A failed install is the hook's errno, which the exec-status pipe
+    // carries to `wait_exec` like any other.
+    let (mut child, listener) = spawn
+        .start()
+        .map_err(|e| format!("starting {program}: {e}"))?
+        .wait_exec()
+        .map_err(|e| format!("seccomp(2) or the exec under the filter: {e}"))?;
+    let Some(mut listener) = listener else {
+        let _ = child.wait();
+        return Err("the child installed no listener".to_string());
     };
-    let mut child = spawning
-        .wait_exec(Some(&mut listener))
-        .map_err(|e| format!("exec under the filter: {e}"))?;
     // Whatever it makes after the exec may be watched too: keep answering
     // until it has exited.
     while !child.has_exited().map_err(|e| format!("waitid: {e}"))? {
@@ -592,11 +571,10 @@ mod tests {
         }
         let filter = Filter::watching(&[Sysno::getpid, Sysno::getppid]).unwrap();
         let handoff = Handoff::new().unwrap();
-        let end = handoff.child_end();
         let pid = unsafe { libc::fork() };
         if pid == 0 {
             unsafe {
-                if filter.install_and_hand_off(end).is_err() {
+                if filter.install_and_hand_off(&handoff).is_err() {
                     libc::_exit(2);
                 }
                 libc::getpid();

@@ -1000,49 +1000,26 @@ fn spawn_test<'a>(
     // namespace before we unshare into a private mount namespace.
     overlay::register_root_mount(&mut spawn, root_plan);
 
-    // Last of all, so that attest's own mounts are not in the count: the
-    // seccomp filter for a test that asserts on its syscalls, where this
-    // kernel can answer one. The child installs it and waits, without a
-    // syscall, for this side to take the listener out of it (see
-    // `seccomp::Handoff`); the spawn is then waited for with the listener in
-    // hand, since the exec itself may be the first syscall notified.
+    // The seccomp filter for a test that asserts on its syscalls, where this
+    // kernel can answer one. `Spawn` installs it after every hook above, so
+    // attest's own mounts are not in the count, and hands back its listener
+    // (see `seccomp::Handoff`).
     let watched: Vec<_> = spec
         .file
         .conditions_of(spec.name)
         .flat_map(|c| c.kind.watched_syscalls())
         .collect();
-    let filter = env
-        .seccomp
-        .then(|| seccomp::Filter::watching(&watched))
-        .flatten();
-    let handoff = match filter {
-        Some(filter) => {
-            let handoff = seccomp::Handoff::new()?;
-            let end = handoff.child_end();
-            spawn.hook(move || unsafe { filter.install_and_hand_off(end) });
-            Some(handoff)
-        }
-        None => None,
-    };
+    if env.seccomp
+        && let Some(filter) = seccomp::Filter::watching(&watched)
+    {
+        spawn.watch(filter)?;
+    }
 
     let start = Instant::now();
-    let spawning = spawn.start()?;
-    let mut listener = match &handoff {
-        Some(handoff) => match handoff.take(spawning.pid()) {
-            Ok(listener) => listener,
-            Err(e) => {
-                // `take` killed the child, which waited on it; reap it.
-                if let Ok(mut child) = spawning.wait_exec(None) {
-                    let _ = child.wait();
-                }
-                return Err(anyhow!(
-                    "spawn failed for {display_name}: taking the seccomp listener: {e}"
-                ));
-            }
-        },
-        None => None,
-    };
-    let child = spawning.wait_exec(listener.as_mut()).map_err(|e| {
+    let spawning = spawn
+        .start()
+        .map_err(|e| anyhow!("spawn failed for {display_name}: {e}"))?;
+    let (child, listener) = spawning.wait_exec().map_err(|e| {
         // The script rides in the argument vector, and Linux caps how long a
         // single argument may be — 32 pages classically, a slice of the stack
         // limit on newer kernels, so half a megabyte of shell either way. Only
