@@ -766,6 +766,7 @@ pub fn print_test_result(result: &TestResult) {
 }
 
 fn print_resource_stats(r: &crate::cgroup::ResourceStats) {
+    let format_bytes = |b| crate::decorator::Unit::Bytes.format(b);
     let mut parts: Vec<String> = Vec::new();
 
     match (r.cpu_user_usec, r.cpu_system_usec) {
@@ -796,21 +797,6 @@ fn print_resource_stats(r: &crate::cgroup::ResourceStats) {
 
     if !parts.is_empty() {
         outln!("      {}", parts.join("  "));
-    }
-}
-
-pub(crate) fn format_bytes(b: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = 1024 * KIB;
-    const GIB: u64 = 1024 * MIB;
-    if b >= GIB {
-        format!("{:.2}GiB", b as f64 / GIB as f64)
-    } else if b >= MIB {
-        format!("{:.1}MiB", b as f64 / MIB as f64)
-    } else if b >= KIB {
-        format!("{:.1}KiB", b as f64 / KIB as f64)
-    } else {
-        format!("{b}B")
     }
 }
 

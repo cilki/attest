@@ -255,41 +255,43 @@ impl Unit {
         })
     }
 
+    /// `value` (in this family's base unit) in the largest unit it reaches:
+    /// the number in that unit, the unit's suffix, and where the unit sits in
+    /// the family — `None` for the base unit, whose number is `value` itself
+    /// and needs no float, `Some(true)` for the largest.
+    fn scaled(self, value: u64) -> (f64, &'static str, Option<bool>) {
+        let steps: &[&str] = match self {
+            Unit::Duration => &["us", "ms", "s"],
+            Unit::Bytes => &["B", "KiB", "MiB", "GiB"],
+            Unit::Count => &[""],
+        };
+        let size = |suffix| self.scale(suffix).expect("a step is a unit of its family");
+        let step = steps
+            .iter()
+            .rposition(|&s| value as f64 >= size(s))
+            .unwrap_or(0);
+        let place = (step > 0).then_some(step == steps.len() - 1);
+        (value as f64 / size(steps[step]), steps[step], place)
+    }
+
     /// `value` (in this family's base unit) as the report spells it, in the
-    /// same style as the resource line under a result.
+    /// same style as the resource line under a result: a whole number of the
+    /// base unit, two decimals of the largest, one of anything between.
     pub fn format(self, value: u64) -> String {
-        match self {
-            Unit::Duration => {
-                if value < 1_000 {
-                    format!("{value}us")
-                } else if value < 1_000_000 {
-                    format!("{:.1}ms", value as f64 / 1e3)
-                } else {
-                    format!("{:.2}s", value as f64 / 1e6)
-                }
-            }
-            Unit::Bytes => crate::output::format_bytes(value),
-            Unit::Count => value.to_string(),
+        match self.scaled(value) {
+            (_, suffix, None) => format!("{value}{suffix}"),
+            (scaled, suffix, Some(false)) => format!("{scaled:.1}{suffix}"),
+            (scaled, suffix, Some(true)) => format!("{scaled:.2}{suffix}"),
         }
     }
 
     /// `value` as a literal the grammar reads back: the unit that keeps the
     /// number short, no decimals it does not need. `16ms`, `5.4MiB`, `3`.
     pub fn literal(self, value: u64) -> String {
-        let (scaled, suffix) = match self {
-            Unit::Duration => match value {
-                v if v < 1_000 => (v as f64, "us"),
-                v if v < 1_000_000 => (v as f64 / 1e3, "ms"),
-                v => (v as f64 / 1e6, "s"),
-            },
-            Unit::Bytes => match value {
-                v if v < 1024 => (v as f64, "B"),
-                v if v < 1024 * 1024 => (v as f64 / 1024.0, "KiB"),
-                v if v < 1024 * 1024 * 1024 => (v as f64 / (1024.0 * 1024.0), "MiB"),
-                v => (v as f64 / (1024.0 * 1024.0 * 1024.0), "GiB"),
-            },
-            Unit::Count => return value.to_string(),
-        };
+        let (scaled, suffix, place) = self.scaled(value);
+        if place.is_none() {
+            return format!("{value}{suffix}");
+        }
         // Two decimals are as many as a value rounded to two significant
         // figures needs below its unit's next step; the trailing zeros go.
         let mut text = format!("{scaled:.2}");
