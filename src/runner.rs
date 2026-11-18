@@ -1837,10 +1837,10 @@ mod tests {
         assert_eq!(r.violations.len(), 1);
         assert_eq!(r.test, "test_x");
         // The literal to rewrite is where the file has it.
-        let decorator::Detail::Quantity { broken, .. } = &r.violations[0].detail else {
+        let decorator::Detail::Quantity { bound, .. } = &r.violations[0].detail else {
             panic!("expected a quantity");
         };
-        let lit = &broken.bound.literal;
+        let lit = &bound.literal;
         assert_eq!(lit.line, 1);
         assert_eq!(&script.lines().next().unwrap()[lit.span.clone()], "1us");
     }

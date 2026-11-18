@@ -484,10 +484,8 @@ impl Condition {
                         Detail::Quantity {
                             metric: *metric,
                             measured: value,
-                            broken: Broken {
-                                bound: bound.clone(),
-                                upper,
-                            },
+                            bound: bound.clone(),
+                            upper,
                         },
                     ),
                 }
@@ -566,18 +564,13 @@ pub enum Detail {
         measured: u64,
         /// The end of the range the measurement fell outside of — what
         /// `--update-decorators` rewrites.
-        broken: Broken,
+        bound: Bound,
+        /// Whether `bound` is the upper end of the range.
+        upper: bool,
     },
     /// Every syscall made or path written that the set did not admit, in
     /// full; the message spells only the first few.
     Set { offenders: Vec<String> },
-}
-
-/// The bound a measurement broke, and which end of its range it is.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Broken {
-    pub bound: Bound,
-    pub upper: bool,
 }
 
 /// One `#attest(...)` block: where it sits in the file and what it asserts.
@@ -1703,26 +1696,27 @@ testX() {
         let Detail::Quantity {
             metric,
             measured,
-            broken,
+            bound,
+            upper,
         } = v.detail
         else {
             panic!("expected a quantity");
         };
         assert_eq!((metric, measured), (Metric::Cpu, 150));
         // 150us is below the lower bound, so that is the one to rewrite.
-        assert!(!broken.upper);
-        assert_eq!(broken.bound.value, 1_000);
-        assert_eq!(&line[broken.bound.literal.span.clone()], "1ms");
+        assert!(!upper);
+        assert_eq!(bound.value, 1_000);
+        assert_eq!(&line[bound.literal.span.clone()], "1ms");
 
         let Verdict::Violated(v) = d.conditions[1].check(&sample) else {
             panic!("expected a violation");
         };
-        let Detail::Quantity { broken, .. } = v.detail else {
+        let Detail::Quantity { bound, upper, .. } = v.detail else {
             panic!("expected a quantity");
         };
-        assert!(broken.upper);
-        assert_eq!(broken.bound.literal.line, 1);
-        assert_eq!(&line[broken.bound.literal.span.clone()], "3");
+        assert!(upper);
+        assert_eq!(bound.literal.line, 1);
+        assert_eq!(&line[bound.literal.span.clone()], "3");
     }
 
     #[test]
