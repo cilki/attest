@@ -50,6 +50,15 @@ pub struct TestFile {
     /// to find these — bounds for the *source*, which are only the bounds of
     /// the script the shell ran when every function was located.
     pub functions: Vec<(usize, usize)>,
+    /// The 0-based lines of [`TestFile::script`], ascending, that lie inside
+    /// one of [`TestFile::functions`] but in front of its first command: the
+    /// `test_x() {` a body starts under. The shell never traces such a line
+    /// as part of the body, so a trace line numbered there is not the test's
+    /// own — it is an `EXIT` trap action, whose `$LINENO` restarts at 1 and
+    /// lands on a file's first line (see
+    /// [`crate::diagnostics::parse_xtrace_failure`]). Only functions copied
+    /// from their source lines have any, since only those have positions.
+    pub headers: Vec<usize>,
     /// Byte offsets into [`TestFile::script`], ascending, right after each
     /// negated statement (`! cmd`) of a function body. The runner inserts
     /// [`NEGATION_GUARD`] at each of them in the script it runs (see
@@ -106,6 +115,16 @@ impl TestFile {
             .iter()
             .copied()
             .find(|&(start, end)| (start..=end).contains(&line))
+    }
+
+    /// [`TestFile::enclosing_function`] for a line the shell reports having
+    /// run: `None` as well for one of [`TestFile::headers`], which holds no
+    /// command a function body could have run.
+    pub fn running_function(&self, line: usize) -> Option<(usize, usize)> {
+        if self.headers.binary_search(&line).is_ok() {
+            return None;
+        }
+        self.enclosing_function(line)
     }
 }
 
@@ -479,7 +498,12 @@ pub fn parse_test_file(path: &Path, scan: &Prescan) -> anyhow::Result<TestFile> 
     // spans it is cut with, the bounds a snippet clamps to and the shell that
     // runs it can never be out of step: the file is read once and all of them
     // come from that one read.
-    let (script, bounds, negations) = build_functions_source(&functions, &contents, &keep);
+    let Rendered {
+        script,
+        bounds,
+        headers,
+        negations,
+    } = build_functions_source(&functions, &contents, &keep);
     // A test defined twice is the last definition (the one the shell runs),
     // so that is where its decorator would go; `starts` is unordered, so
     // take the greatest line per name.
@@ -496,6 +520,7 @@ pub fn parse_test_file(path: &Path, scan: &Prescan) -> anyhow::Result<TestFile> 
         tests,
         script,
         functions: bounds,
+        headers,
         negations,
         shell: crate::discovery::script_shell(&contents),
         decorators,
@@ -590,18 +615,21 @@ fn attach_decorators(
 ///
 /// Returns the script; for each function, the 0-based inclusive range of
 /// lines it occupies *in that script* — exact whichever way the function was
-/// rendered, since this is where it was put; and the byte offsets in the
-/// script that end a negated statement ([`TestFile::negations`]). Only a
-/// function copied from its source lines has any: the offsets are found in
-/// the source, and a re-rendered function is not where the source has it.
+/// rendered, since this is where it was put; the lines of each in front of its
+/// first command ([`TestFile::headers`]); and the byte offsets in the script
+/// that end a negated statement ([`TestFile::negations`]). Only a function
+/// copied from its source lines has headers or negations: both are found from
+/// source positions, and a re-rendered function is not where the source has
+/// it.
 pub(crate) fn build_functions_source(
     functions: &[FunctionDefinition],
     source: &str,
     keep: &HashSet<usize>,
-) -> (String, Vec<(usize, usize)>, Vec<usize>) {
+) -> Rendered {
     let src_lines: Vec<&str> = source.lines().collect();
     let mut out = String::new();
     let mut bounds = Vec::with_capacity(functions.len());
+    let mut headers = Vec::new();
     let mut negations = Vec::new();
     // 1-based line number of the next line to be written to `out`.
     let mut line = 1usize;
@@ -645,6 +673,12 @@ pub(crate) fn build_functions_source(
                 }
 
                 let first = line;
+                // The lines from the definition's first down to its body's
+                // first command hold no command of it. A body with nothing
+                // located in it marks none, which is how this always was.
+                if let Some(body) = first_command_line(func) {
+                    headers.extend((span.start.line..body.min(span.end.line + 1)).map(|l| l - 1));
+                }
                 // `end.line` is the line of the closing brace (inclusive here).
                 let last = span.end.line.min(src_lines.len());
                 for idx in span.start.line..=last {
@@ -666,7 +700,37 @@ pub(crate) fn build_functions_source(
         }
     }
 
-    (out, bounds, negations)
+    Rendered {
+        script: out,
+        bounds,
+        headers,
+        negations,
+    }
+}
+
+/// What [`build_functions_source`] lays out: the [`TestFile`] fields of the
+/// same names (`bounds` is [`TestFile::functions`]).
+pub(crate) struct Rendered {
+    pub script: String,
+    pub bounds: Vec<(usize, usize)>,
+    pub headers: Vec<usize>,
+    pub negations: Vec<usize>,
+}
+
+/// The 1-based source line the first command of `func`'s body starts on, if
+/// the parser located any of them.
+fn first_command_line(func: &FunctionDefinition) -> Option<usize> {
+    let mut first: Option<usize> = None;
+    let walk = Walk {
+        conditions: true,
+        functions: true,
+    };
+    walk_compound(&func.body.0, walk, &mut |item| {
+        if let Some(span) = item.0.first.location() {
+            first = Some(first.map_or(span.start.line, |f| f.min(span.start.line)));
+        }
+    });
+    first
 }
 
 /// What the runner puts after a negated statement: `! cmd` becomes
@@ -1041,6 +1105,32 @@ mod tests {
         assert_eq!(enclosing_function_bounds(source, 5), Some((4, 6)));
     }
 
+    fn headers_of(source: &str) -> Vec<usize> {
+        let tmp = TempDir::new().unwrap();
+        let path = write_script(tmp.path(), "headers.test", source);
+        parse_test_file(&path, &Prescan::default()).unwrap().headers
+    }
+
+    #[test]
+    fn headers_are_the_lines_in_front_of_a_body() {
+        // 0-based: `test_a() {` on 0, the brace-on-its-own-line `test_b` on 3
+        // and 4, a subshell body on 8. The body lines are not headers, nor is
+        // the line of a one-line function, whose header is also its body.
+        let source = "test_a() {\n  true\n}\ntest_b()\n{\n  if true; then :; fi\n}\n\
+                      test_c() { false; }\ntest_d() (\n  cd /\n)\n";
+        assert_eq!(headers_of(source), [0, 3, 4, 8]);
+    }
+
+    #[test]
+    fn running_function_skips_headers() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_script(tmp.path(), "r.test", "test_a() {\n  false\n}\n");
+        let tf = parse_test_file(&path, &Prescan::default()).unwrap();
+        assert_eq!(tf.enclosing_function(0), Some((0, 2)));
+        assert_eq!(tf.running_function(0), None);
+        assert_eq!(tf.running_function(1), Some((0, 2)));
+    }
+
     /// The text in front of each negation offset, up to the start of its line
     /// — what the guard is appended to.
     fn guarded(source: &str) -> Vec<String> {
@@ -1121,7 +1211,11 @@ EOF
         let source = "helper() {\n  echo 42\n}\n\ntest_foo() {\n  test \"$(helper)\" = 42\n}\n";
         let functions = parse_functions(source).unwrap();
 
-        let (generated, bounds, _) = build_functions_source(&functions, "", &HashSet::new());
+        let Rendered {
+            script: generated,
+            bounds,
+            ..
+        } = build_functions_source(&functions, "", &HashSet::new());
         // Even so, where each function landed is known exactly: the two are
         // re-rendered back to back, `helper` as three lines and `test_foo` as
         // the three after it.

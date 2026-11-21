@@ -398,8 +398,12 @@
   `+1: rm -rf …` after the failure and used to put the snippet on the shebang
   — and `parse_xtrace_failure` stops there, so the failure stays on the last
   command of the body even when the trap goes on to call a function whose
-  lines are in the file. (`DEBUG`/`ERR` actions trace at `++` depth and are
-  already skipped as subshells.) A command the shell gives up on *during*
+  lines are in the file. A file with no shebang can open a function on line
+  1, where the trap's `+1:` is inside one, so the lines of a function in
+  front of its first command (`TestFile::headers`, which no body ever traces)
+  count as outside it for this scan (`TestFile::running_function`) — only a
+  one-line function on line 1 is still ambiguous. (`DEBUG`/`ERR` actions
+  trace at `++` depth and are already skipped as subshells.) A command the shell gives up on *during*
   expansion — `$unset` under `set -u`, `${x:?}`, `$((1/0))`, a bad
   substitution — is never traced, so the last trace line is the command
   before it, which succeeded; what the shell prints instead is an error

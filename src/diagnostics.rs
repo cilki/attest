@@ -202,11 +202,14 @@ impl Highlight<'_> {
 /// not, and the failure belongs to the last command of the body before it.
 ///
 /// `DEBUG` and `ERR` actions are not this case — bash traces them one `+`
-/// deeper, like a subshell, and [`parse_trace_line`] already skips those. What
-/// this cannot see through is a file whose first line opens a function: the
-/// trap's `+1:` then reads as that function's, and the snippet points into it
-/// as it always did. A shebang or a comment on line 1 is enough to tell them
-/// apart.
+/// deeper, like a subshell, and [`parse_trace_line`] already skips those.
+///
+/// A file with no shebang may open a function on line 1, and then the trap's
+/// `+1:` *is* inside one — and used to put the snippet into whatever function
+/// that was, often another test entirely. That line is the function's header,
+/// though, which the body never traces ([`TestFile::headers`]), so it ends the
+/// scan the same way. What is still ambiguous is a one-line function on line 1
+/// (`test_x() { false; }`), whose header is also a line of its body.
 ///
 /// The trace is not the whole story, though: the shell prints a command's
 /// trace line only once it has expanded the command, so one it gives up on
@@ -239,7 +242,7 @@ pub(crate) fn parse_xtrace_failure(tmp_dir: &Path, file: &TestFile) -> Option<Fa
             if let Some(lineno) = parse_shell_error_line(&line, &file.canonical_path)
                 && let Some(function) = lineno
                     .checked_sub(1)
-                    .and_then(|idx| file.enclosing_function(idx))
+                    .and_then(|idx| file.running_function(idx))
             {
                 last_match = Some(FailureInfo {
                     lineno,
@@ -258,7 +261,7 @@ pub(crate) fn parse_xtrace_failure(tmp_dir: &Path, file: &TestFile) -> Option<Fa
         let is_call = std::mem::replace(&mut first, false);
         let function = lineno
             .checked_sub(1)
-            .and_then(|idx| file.enclosing_function(idx));
+            .and_then(|idx| file.running_function(idx));
         match function {
             Some(function) => {
                 last_match = Some(FailureInfo {
@@ -1021,6 +1024,31 @@ mod tests {
         assert_eq!(info.lineno, 7);
         assert_eq!(info.command, "false");
         assert_eq!(info.function, (4, 7));
+    }
+
+    #[test]
+    fn parse_xtrace_stops_at_an_exit_trap_when_line_1_opens_a_function() {
+        // No shebang, so line 1 is another test's header and the trap's `+1:`
+        // falls inside a function. It is that function's header, which no body
+        // traces, so the trap still ends the scan — rather than the snippet
+        // landing on `test_a`, which never ran.
+        let file = TestFile {
+            headers: vec![0, 3],
+            ..test_file(
+                "test_a() {\n  sleep 5\n}\ntest_x() {\n  trap 'echo bye' EXIT\n  false\n}\n",
+                vec![(0, 2), (3, 6)],
+            )
+        };
+        let log = "+20: test_x\n+5: trap 'echo bye' EXIT\n+6: false\n+1: echo bye\nbye\n";
+        let info = failure_of(log, &file).unwrap();
+        assert_eq!(info.lineno, 6);
+        assert_eq!(info.command, "false");
+        assert_eq!(info.function, (3, 6));
+
+        // Under `set -u` the action may fail in expansion instead, and the
+        // shell's error names line 1: not the test's line either.
+        let log = "+20: test_x\n+6: false\n/x.test: line 1: NOPE: unbound variable\n";
+        assert_eq!(failure_of(log, &file).unwrap().lineno, 6);
     }
 
     #[test]
