@@ -165,6 +165,15 @@ impl Spawn {
                 {
                     fail(io::Error::last_os_error());
                 }
+                // Rust ignores SIGPIPE at startup, and an ignored disposition
+                // survives exec — `Command` puts it back in the child, so
+                // this has to as well. Left ignored, a test's whole tree
+                // inherits it and no shell can undo it (a non-interactive
+                // shell may not trap a signal ignored on entry): `yes | head
+                // -1` complains of a broken pipe instead of dying quietly,
+                // and a writer that shrugs off the `EPIPE` (a loop of `echo`
+                // outside `set -e`) never ends.
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
             }
             for hook in &mut self.hooks {
                 if let Err(e) = hook() {
@@ -396,6 +405,18 @@ mod tests {
         assert!(child.wait().unwrap().success());
         let s = std::fs::read_to_string(tmp.path().join("out")).unwrap();
         assert_eq!(s, "second|inherited\n");
+    }
+
+    /// The child starts with SIGPIPE at its default, not ignored the way the
+    /// Rust runtime (this test binary's included) leaves it in the parent:
+    /// a shell sending itself one dies of it.
+    #[test]
+    fn the_child_dies_of_sigpipe() {
+        let (_tmp, out, err) = logs();
+        let spawn =
+            Spawn::new("/bin/sh", &["sh", "-c", "kill -PIPE $$; exit 0"], out, err).unwrap();
+        let mut child = spawn.start().unwrap().wait_exec(None).unwrap();
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGPIPE));
     }
 
     #[test]
