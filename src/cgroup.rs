@@ -69,7 +69,7 @@ impl TestCgroup {
     /// The `cgroup.procs` path as a `CString`, ready for [`add_self_to`] in a
     /// `spawn::Spawn` hook (after fork, before exec).
     pub fn procs_cstring(&self) -> Option<CString> {
-        CString::new(self.path.join("cgroup.procs").into_os_string().into_vec()).ok()
+        procs_cstring(&self.path)
     }
 
     /// Kill every process in the cgroup by writing to `cgroup.kill`
@@ -112,6 +112,11 @@ impl Drop for TestCgroup {
             warn!("failed to remove test cgroup {:?}: {e}", self.path);
         }
     }
+}
+
+/// `dir/cgroup.procs` as a `CString`, built before a fork for [`add_self_to`].
+fn procs_cstring(dir: &Path) -> Option<CString> {
+    CString::new(dir.join("cgroup.procs").into_os_string().into_vec()).ok()
 }
 
 fn cgroup_type(path: &Path) -> String {
@@ -190,9 +195,8 @@ enum Attempt {
 }
 
 /// Try to set up `<ancestor>/attest` as the base holding one cgroup per test,
-/// leaving nothing behind unless it succeeds. `pid` is this process's pid as a
-/// decimal string, ready to write to a `cgroup.procs`.
-fn try_ancestor(ancestor: &Path, pid: &str) -> Attempt {
+/// leaving nothing behind unless it succeeds.
+fn try_ancestor(ancestor: &Path) -> Attempt {
     // Only "domain" cgroups can parent child cgroups that hold processes.
     // "domain threaded" and "domain invalid" ancestors yield unusable children.
     if !is_domain(ancestor) {
@@ -212,7 +216,7 @@ fn try_ancestor(ancestor: &Path, pid: &str) -> Attempt {
     let main_cgroup = base.join("main");
     let attempt = if !ensure_domain_cgroup(&main_cgroup) {
         Attempt::TryParent
-    } else if let Err(e) = std::fs::write(main_cgroup.join("cgroup.procs"), pid) {
+    } else if let Err(e) = std::fs::write(main_cgroup.join("cgroup.procs"), SELF) {
         if e.raw_os_error() == Some(libc::EOPNOTSUPP) {
             // The cgroup is in a threaded subtree; cgroup.procs is not valid
             // anywhere in this hierarchy. No point walking up.
@@ -232,7 +236,7 @@ fn try_ancestor(ancestor: &Path, pid: &str) -> Attempt {
     } else {
         // We are now inside base/main, which is about to be removed: step back
         // out to the ancestor first.
-        let _ = std::fs::write(ancestor.join("cgroup.procs"), pid);
+        let _ = std::fs::write(ancestor.join("cgroup.procs"), SELF);
         debug!(path=%base.display(), "cgroup.procs probe failed; trying parent");
         Attempt::TryParent
     };
@@ -246,16 +250,28 @@ fn try_ancestor(ancestor: &Path, pid: &str) -> Attempt {
 
 /// Fork a child that inherits `base/main` (a leaf) and check that it can
 /// migrate to a sibling cgroup by writing to its `cgroup.procs` — exactly what
-/// every test child has to do.
+/// every test child has to do, through the same async-signal-safe
+/// [`add_self_to`].
 fn probe_migration(base: &Path) -> bool {
     let probe = base.join("_probe");
     let _ = std::fs::remove_dir(&probe); // clean up from a crashed prior run
     if std::fs::create_dir(&probe).is_err() {
         return false;
     }
-    let ok = probe_cgroup_procs(&probe);
+    let migrated = procs_cstring(&probe).is_some_and(|procs| {
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            let ok = unsafe { add_self_to(&procs) };
+            unsafe { libc::_exit(i32::from(!ok)) }
+        }
+        let mut status = 0;
+        pid > 0
+            && unsafe { libc::waitpid(pid, &mut status, 0) } == pid
+            && libc::WIFEXITED(status)
+            && libc::WEXITSTATUS(status) == 0
+    });
     let _ = std::fs::remove_dir(&probe);
-    ok
+    migrated
 }
 
 /// The controllers [`TestCgroup::read_stats`] reads from, in the order the
@@ -346,10 +362,8 @@ fn init_base() -> Option<PathBuf> {
         .find_map(|l| l.strip_prefix("0::"))?
         .trim();
     let leaf = PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
-    let pid = std::process::id().to_string();
-
     for ancestor in cgroup_ancestors(leaf) {
-        match try_ancestor(&ancestor, &pid) {
+        match try_ancestor(&ancestor) {
             Attempt::Usable(base) => return Some(base),
             Attempt::TryParent => continue,
             Attempt::GiveUp => break,
@@ -360,52 +374,25 @@ fn init_base() -> Option<PathBuf> {
     None
 }
 
-/// Write the calling process's pid into `procs` (a `cgroup.procs` file).
+/// What a `cgroup.procs` write means by "the process doing the writing": the
+/// kernel reads a pid of `0` as the caller (`cgroup_procs_write_start`), so
+/// nobody has to look up or format their own pid to move themselves.
+const SELF: &[u8] = b"0";
+
+/// Move the calling process into the cgroup whose `cgroup.procs` is `procs`.
 /// Async-signal-safe with no allocation, so it is usable between `fork` and
 /// `exec` even though other threads (e.g. the status-bar ticker) exist in the
 /// parent. Returns whether the write succeeded.
 pub(crate) unsafe fn add_self_to(procs: &CStr) -> bool {
     unsafe {
-        let mut buf = [0u8; 12];
-        let mut n = buf.len();
-        let mut v = libc::getpid() as u64;
-        loop {
-            n -= 1;
-            buf[n] = b'0' + (v % 10) as u8;
-            v /= 10;
-            if v == 0 {
-                break;
-            }
-        }
         let fd = libc::open(procs.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
         if fd < 0 {
             return false;
         }
-        let len = buf.len() - n;
-        let written = libc::write(fd, buf[n..].as_ptr().cast(), len);
+        let written = libc::write(fd, SELF.as_ptr().cast(), SELF.len());
         libc::close(fd);
-        written == len as isize
+        written == SELF.len() as isize
     }
-}
-
-/// Fork a child that writes its own PID to `dir/cgroup.procs` and exits 0 on
-/// success or 1 on failure. Returns true if the child exited with 0. The
-/// forked child uses only the async-signal-safe [`add_self_to`].
-fn probe_cgroup_procs(dir: &Path) -> bool {
-    let Ok(procs) = CString::new(dir.join("cgroup.procs").into_os_string().into_vec()) else {
-        return false;
-    };
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        return false;
-    }
-    if pid == 0 {
-        let ok = unsafe { add_self_to(&procs) };
-        unsafe { libc::_exit(i32::from(!ok)) }
-    }
-    let mut status = 0;
-    unsafe { libc::waitpid(pid, &mut status, 0) };
-    libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
 }
 
 fn read_single_u64(path: impl AsRef<std::path::Path>) -> Option<u64> {
