@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use brush_parser::ast::{
-    Command, CompoundCommand, CompoundList, CompoundListItem, FunctionDefinition, Program,
-    SeparatorOperator, SourceLocation,
+    Command, CommandPrefixOrSuffixItem, CompoundCommand, CompoundList, CompoundListItem,
+    FunctionDefinition, IoFileRedirectTarget, IoRedirect, Pipeline, Program, SeparatorOperator,
+    SourceLocation,
 };
 use brush_parser::{Parser, ParserOptions};
 use tracing::warn;
@@ -764,9 +765,9 @@ pub(crate) const NEGATION_GUARD: &str = " || (exit 1) 2>/dev/null";
 /// run in the foreground: `! a && b` already fails on `b`, and a background
 /// job's status is nobody's assertion. The conditions of `if`, `while` and
 /// `until` are left alone — `set -e` is off in them, so the guard would only
-/// cost a fork. So is a statement holding a here-document,
-/// whose span ends after the body, where the guard would land past the
-/// delimiter; it keeps the shell's own behaviour.
+/// cost a fork. A statement holding a here-document is guarded where its
+/// last word ends rather than where its span does ([`heredoc_statement_end`]),
+/// and left to the shell's own behaviour where that cannot be told.
 fn negated_statements(func: &FunctionDefinition, src_lines: &[&str]) -> Vec<(usize, usize)> {
     let mut found = Vec::new();
     let walk = Walk {
@@ -778,10 +779,9 @@ fn negated_statements(func: &FunctionDefinition, src_lines: &[&str]) -> Vec<(usi
         if and_or.first.bang
             && and_or.additional.is_empty()
             && matches!(item.1, SeparatorOperator::Sequence)
-            && let Some(span) = and_or.first.location()
-            && let Some(column) = statement_end(&span, src_lines)
+            && let Some(end) = statement_end(&and_or.first, src_lines)
         {
-            found.push((span.end.line, column));
+            found.push(end);
         }
     });
     found
@@ -858,25 +858,79 @@ fn walk_compound<'a>(
     }
 }
 
-/// The byte offset into line `span.end.line` where the statement `span`
-/// covers ends, or `None` where the guard cannot safely go there.
+/// Where the negated `pipeline` ends: the 1-based line and the byte offset
+/// into it, or `None` where the guard cannot safely go there.
 ///
 /// The parser's columns count characters, 1-based, and the end is exclusive.
 /// A `<<` anywhere on the statement's lines that is not a `<<<` here-string
-/// may be a here-document, whose body the span runs on into; rather than
-/// tell the two apart (a quoted `<<` is not one), the statement is skipped.
-fn statement_end(span: &brush_parser::SourceSpan, src_lines: &[&str]) -> Option<usize> {
+/// may be a here-document, whose body the span runs on into, so there the end
+/// is taken from the words instead ([`heredoc_statement_end`]).
+fn statement_end(pipeline: &Pipeline, src_lines: &[&str]) -> Option<(usize, usize)> {
+    let span = pipeline.location()?;
     let lines = src_lines.get(span.start.line.checked_sub(1)?..span.end.line)?;
-    if lines.iter().any(|l| l.replace("<<<", "").contains("<<")) {
-        return None;
+    let end = if lines.iter().any(|l| l.replace("<<<", "").contains("<<")) {
+        heredoc_statement_end(pipeline)?
+    } else {
+        span.end
+    };
+    let text = src_lines.get(end.line.checked_sub(1)?)?;
+    let column = end.column.checked_sub(1)?;
+    let byte = match text.char_indices().nth(column) {
+        Some((byte, _)) => byte,
+        None if text.chars().count() == column => text.len(),
+        None => return None,
+    };
+    Some((end.line, byte))
+}
+
+/// Where the text of a `pipeline` that may hold a here-document ends: the end
+/// of its last word, here-document bodies aside.
+///
+/// The body of `! grep -q x <<EOF` starts on the line *after* the command, so
+/// the guard has to go before it — `! grep -q x <<EOF || (exit 1)` — and the
+/// span, which ends past the delimiter, cannot say where that is. Every word
+/// of a simple command (its name, its arguments, the targets of its
+/// redirections and a here-document's delimiter) knows where it ends, and the
+/// last of them to end is where the statement does, whichever line the body
+/// lands on. Anything whose end the parser does not record — a compound
+/// command, a process substitution, a `2>&1` whose target is a bare
+/// descriptor — gives `None`: a guard put in front of a redirection would
+/// apply it to the guard instead of the command.
+fn heredoc_statement_end(
+    pipeline: &Pipeline,
+) -> Option<std::sync::Arc<brush_parser::SourcePosition>> {
+    let mut ends = Vec::new();
+    for cmd in &pipeline.seq {
+        let Command::Simple(simple) = cmd else {
+            return None;
+        };
+        if let Some(name) = &simple.word_or_name {
+            ends.push(name.location()?.end);
+        }
+        let prefix = simple.prefix.iter().flat_map(|p| &p.0);
+        let suffix = simple.suffix.iter().flat_map(|s| &s.0);
+        for item in prefix.chain(suffix) {
+            let word = match item {
+                CommandPrefixOrSuffixItem::Word(word)
+                | CommandPrefixOrSuffixItem::AssignmentWord(_, word) => word,
+                CommandPrefixOrSuffixItem::IoRedirect(redirect) => match redirect {
+                    IoRedirect::File(
+                        _,
+                        _,
+                        IoFileRedirectTarget::Filename(word)
+                        | IoFileRedirectTarget::Duplicate(word),
+                    )
+                    | IoRedirect::HereString(_, word)
+                    | IoRedirect::OutputAndError(word, _) => word,
+                    IoRedirect::HereDocument(_, doc) => &doc.here_end,
+                    IoRedirect::File(_, _, _) => return None,
+                },
+                CommandPrefixOrSuffixItem::ProcessSubstitution(..) => return None,
+            };
+            ends.push(word.location()?.end);
+        }
     }
-    let text = lines.last()?;
-    let column = span.end.column.checked_sub(1)?;
-    match text.char_indices().nth(column) {
-        Some((byte, _)) => Some(byte),
-        None if text.chars().count() == column => Some(text.len()),
-        None => None,
-    }
+    ends.into_iter().max_by_key(|end| (end.line, end.column))
 }
 
 /// Every function definition in `program`, in source order, wherever it is
@@ -1180,8 +1234,7 @@ test_x() {
     #[test]
     fn negations_leave_alone_what_set_e_already_judges() {
         // A condition has `set -e` off, an and-or list is judged by its last
-        // pipeline, a background job by nobody, and a here-document's span
-        // ends past its delimiter, where the guard cannot go.
+        // pipeline, a background job by nobody.
         let source = "\
 test_x() {
   if ! a; then :; fi
@@ -1190,7 +1243,59 @@ test_x() {
   ! d && e
   f || ! g
   ! h &
+  ! i
+}
+";
+        assert_eq!(guarded(source), ["! i"]);
+    }
+
+    /// A here-document's body starts on the line after its command, and its
+    /// span ends past the delimiter: the guard goes where the command's last
+    /// word ends, on whichever line that is, and never into the body.
+    #[test]
+    fn negations_with_a_here_document_end_at_their_last_word() {
+        let source = "\
+test_x() {
   ! grep x <<EOF
+<<x
+EOF
+  ! grep -q x <<-'EOF' f > out; echo y
+\tx
+\tEOF
+  ! cat <<A |
+a
+A
+    grep b
+  ! cat <<A <<B
+a
+A
+b
+B
+  ! grep \"<<\" f 2>&1
+}
+";
+        assert_eq!(
+            guarded(source),
+            [
+                "! grep x <<EOF",
+                "! grep -q x <<-'EOF' f > out",
+                "grep b",
+                "! cat <<A <<B",
+                "! grep \"<<\" f 2>&1",
+            ]
+        );
+    }
+
+    /// Where the end of a here-document statement is not known, there is no
+    /// guard rather than one in front of a redirection or past the body.
+    #[test]
+    fn negations_with_a_here_document_and_no_known_end_are_left_alone() {
+        let source = "\
+test_x() {
+  ! { cat <<EOF; }
+x
+EOF
+  ! diff - <(echo y) <<EOF
 x
 EOF
   ! i
