@@ -21,7 +21,7 @@
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 
@@ -136,13 +136,8 @@ impl Spawn {
         let mut envp_ptrs: Vec<*const libc::c_char> = envp.iter().map(|e| e.as_ptr()).collect();
         envp_ptrs.push(std::ptr::null());
 
-        let mut fds = [0 as libc::c_int; 2];
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let [status_rd, status_wr] = fds;
-        let status_rd = unsafe { OwnedFd::from_raw_fd(status_rd) };
-        let status_wr = unsafe { OwnedFd::from_raw_fd(status_wr) };
+        // Both ends close-on-exec, so EOF on the read end is the exec.
+        let (status_rd, status_wr) = io::pipe()?;
 
         let pid = unsafe { libc::fork() };
         if pid < 0 {
@@ -208,7 +203,7 @@ impl Spawn {
         };
         Ok(Spawning {
             child,
-            status_rd: File::from(status_rd),
+            status_rd,
             listener,
         })
     }
@@ -217,7 +212,7 @@ impl Spawn {
 /// A forked child that has not yet been seen to exec.
 pub struct Spawning {
     child: Child,
-    status_rd: File,
+    status_rd: io::PipeReader,
     listener: Option<Listener>,
 }
 

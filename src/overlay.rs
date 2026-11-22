@@ -36,9 +36,8 @@
 //! the hostname does not change the host's.
 
 use std::ffi::{CStr, CString, OsString};
-use std::fs::File;
 use std::io::Read;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
@@ -778,11 +777,9 @@ fn probe_mode(
 /// nothing, on success — back out of a pipe.
 unsafe fn run_probe(plan: &RootOverlay) -> Result<(), ProbeFailure> {
     unsafe {
-        let mut fds = [0 as libc::c_int; 2];
-        if libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+        let Ok((mut rd, wr)) = std::io::pipe() else {
             return Err(ProbeFailure::Lost);
-        }
-        let [rd, wr] = fds.map(|fd| OwnedFd::from_raw_fd(fd));
+        };
         let pid = libc::fork();
         if pid < 0 {
             return Err(ProbeFailure::Lost);
@@ -806,7 +803,7 @@ unsafe fn run_probe(plan: &RootOverlay) -> Result<(), ProbeFailure> {
         drop(wr);
         // One `write` of fewer than `PIPE_BUF` bytes, so all of it or nothing.
         let mut buf = [0u8; 8];
-        let reported = File::from(rd).read_exact(&mut buf).is_ok();
+        let reported = rd.read_exact(&mut buf).is_ok();
         let mut status = 0;
         libc::waitpid(pid, &mut status, 0);
         if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {

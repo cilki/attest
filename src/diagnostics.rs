@@ -287,34 +287,23 @@ const MAX_LINE: usize = 64 * 1024;
 /// [`MAX_LINE`] bytes and discarding the rest of an over-long line. Returns
 /// whether anything was read at all (false at EOF).
 ///
-/// `BufRead::read_until` would be this function, minus the cap: it grows the
-/// buffer to hold the whole line however long that is.
+/// `read_until` alone grows the buffer to hold the whole line however long
+/// that is, so it reads through a `take` of the cap, and whatever of an
+/// over-long line is left past it is skipped. The newline is consumed with the
+/// line it ends but kept out of it, the way `str::lines` splits.
 fn read_capped_line(
     reader: &mut impl std::io::BufRead,
     line: &mut Vec<u8>,
 ) -> std::io::Result<bool> {
+    use std::io::{BufRead, Read};
     line.clear();
-    let mut any = false;
-    loop {
-        let buf = reader.fill_buf()?;
-        if buf.is_empty() {
-            return Ok(any);
-        }
-        any = true;
-        // `memchr` rather than `iter().position`: the log is mostly the test's
-        // own output, so finding the end of each line is most of what the scan
-        // does, and the byte-at-a-time loop is not vectorized.
-        let newline = memchr::memchr(b'\n', buf);
-        let len = newline.unwrap_or(buf.len());
-        let room = MAX_LINE.saturating_sub(line.len());
-        line.extend_from_slice(&buf[..room.min(len)]);
-        // The newline itself is consumed with the line it ends but kept out of
-        // it, the way `str::lines` splits.
-        reader.consume(len + usize::from(newline.is_some()));
-        if newline.is_some() {
-            return Ok(true);
-        }
+    let n = reader.by_ref().take(MAX_LINE as u64).read_until(b'\n', line)?;
+    if line.last() == Some(&b'\n') {
+        line.pop();
+    } else if n == MAX_LINE {
+        reader.skip_until(b'\n')?;
     }
+    Ok(n > 0)
 }
 
 /// One line of an xtrace log as its `$LINENO` and command, if it traces a
