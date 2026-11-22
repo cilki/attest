@@ -415,7 +415,7 @@ mod tests {
         let (_tmp, out, err) = logs();
         let spawn =
             Spawn::new("/bin/sh", &["sh", "-c", "kill -PIPE $$; exit 0"], out, err).unwrap();
-        let mut child = spawn.start().unwrap().wait_exec(None).unwrap();
+        let (mut child, _) = spawn.start().unwrap().wait_exec().unwrap();
         assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGPIPE));
     }
 
