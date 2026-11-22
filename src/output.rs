@@ -544,18 +544,16 @@ struct LogField(PathBuf);
 
 impl serde::Serialize for LogField {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(&LogText(&self.0))
+        serializer.collect_str(self)
     }
 }
 
-/// The text of a log, written out a chunk at a time. Lossy so a log holding
+/// The text of the log, written out a chunk at a time. Lossy so a log holding
 /// invalid UTF-8 (a test printing binary) is still reported rather than
 /// silently becoming empty.
-struct LogText<'a>(&'a Path);
-
-impl std::fmt::Display for LogText<'_> {
+impl std::fmt::Display for LogField {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Ok(mut log) = crate::overlay::open_nofollow(self.0) else {
+        let Ok(mut log) = crate::overlay::open_nofollow(&self.0) else {
             return Ok(());
         };
         // Room for one read plus the up-to-three bytes of a character the
@@ -853,17 +851,15 @@ pub fn print_test_list(tests: &[(&Path, &str)]) {
 ///
 /// `--json` reports names verbatim: nothing interprets them there, and
 /// `serde_json` escapes what its own grammar needs.
+///
+/// What is escaped is [`char::is_control`]: the C0 controls, `DEL` and the C1
+/// controls — everything a terminal acts on rather than shows. The C1 block
+/// matters because a terminal in UTF-8 mode decodes those code points and
+/// obeys them — `U+009B` is `CSI`, so `test_lie\u{9b}1G\u{9b}K` reaches back
+/// over the verdict next to it exactly as the `ESC [` spelling does (see
+/// [`C1_LEAD`]).
 pub(crate) fn escape_label(label: &str) -> std::borrow::Cow<'_, str> {
-    /// C0 controls, `DEL` and the C1 controls: everything a terminal acts on
-    /// rather than shows. The C1 block matters because a terminal in UTF-8
-    /// mode decodes those code points and obeys them — `U+009B` is `CSI`, so
-    /// `test_lie\u{9b}1G\u{9b}K` reaches back over the verdict next to it
-    /// exactly as the `ESC [` spelling does (see [`C1_LEAD`]).
-    fn is_control(c: char) -> bool {
-        matches!(c, '\0'..='\u{1f}' | '\u{7f}'..='\u{9f}')
-    }
-
-    escape_chars(label, is_control)
+    escape_chars(label, char::is_control)
 }
 
 /// Spell every character `escape` picks out as `\xNN`, borrowing `s` unchanged

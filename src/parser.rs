@@ -479,9 +479,16 @@ pub fn parse_test_file(path: &Path, scan: &Prescan) -> anyhow::Result<TestFile> 
     // all definitions so the rendered script is unchanged.
     let mut tests = Vec::new();
     let mut seen = HashSet::new();
+    // Where each test's definition starts, for `--add-decorators`. `functions`
+    // is in source order, so a test defined twice ends up at its last
+    // definition — the one the shell runs, and so the one a decorator is for.
+    let mut test_lines = HashMap::new();
     for f in &functions {
         if !f.fname.value.starts_with(TEST_PREFIX) {
             continue;
+        }
+        if let Some(span) = f.location() {
+            test_lines.insert(f.fname.value.clone(), span.start.line);
         }
         if !seen.insert(f.fname.value.as_str()) {
             warn!(
@@ -504,16 +511,6 @@ pub fn parse_test_file(path: &Path, scan: &Prescan) -> anyhow::Result<TestFile> 
         headers,
         negations,
     } = build_functions_source(&functions, &contents, &keep);
-    // A test defined twice is the last definition (the one the shell runs),
-    // so that is where its decorator would go; `starts` is unordered, so
-    // take the greatest line per name.
-    let mut test_lines: HashMap<String, usize> = HashMap::new();
-    for (&line, &name) in &starts {
-        if name.starts_with(TEST_PREFIX) {
-            let entry = test_lines.entry(name.to_string()).or_insert(line);
-            *entry = (*entry).max(line);
-        }
-    }
     Ok(TestFile {
         path: path.to_path_buf(),
         canonical_path: path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),

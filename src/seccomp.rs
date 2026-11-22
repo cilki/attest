@@ -274,11 +274,7 @@ impl Handoff {
             match page.slot.load(Ordering::Acquire) {
                 FAILED => return Ok(None),
                 PENDING => {
-                    let mut pfd = libc::pollfd {
-                        fd: pidfd.as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
+                    let mut pfd = pollin(pidfd.as_raw_fd());
                     // The install takes microseconds; a millisecond's wait
                     // keeps this from spinning beside a child that does.
                     if unsafe { libc::poll(&mut pfd, 1, 1) } < 0 {
@@ -332,10 +328,10 @@ pub struct Listener {
 }
 
 impl Listener {
-    /// The descriptor to poll for `POLLIN`; `None` once the listener is dead
-    /// and there is nothing left to hear.
-    pub fn poll_fd(&self) -> Option<RawFd> {
-        (!self.dead).then(|| self.fd.as_raw_fd())
+    /// The descriptor to poll for `POLLIN`; `-1`, which `poll` ignores, once
+    /// the listener is dead and there is nothing left to hear.
+    pub fn poll_fd(&self) -> RawFd {
+        if self.dead { -1 } else { self.fd.as_raw_fd() }
     }
 
     /// Answer every notification that is pending: record its syscall and
@@ -360,11 +356,7 @@ impl Listener {
 
     /// What the descriptor reports right now, without waiting.
     fn poll_once(&self) -> libc::c_short {
-        let mut pfd = libc::pollfd {
-            fd: self.fd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
+        let mut pfd = pollin(self.fd.as_raw_fd());
         if unsafe { libc::poll(&mut pfd, 1, 0) } > 0 {
             pfd.revents
         } else {
@@ -410,6 +402,16 @@ impl Listener {
     pub fn into_log(mut self) -> SyscallLog {
         self.service();
         self.log
+    }
+}
+
+/// A `poll` entry waiting for `fd` to be readable. A negative `fd` is one
+/// `poll` skips, which is how a dead [`Listener`] stays in a set.
+pub(crate) fn pollin(fd: RawFd) -> libc::pollfd {
+    libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
     }
 }
 
@@ -469,11 +471,7 @@ fn run_watched(
     // until it has exited.
     while !child.has_exited().map_err(|e| format!("waitid: {e}"))? {
         listener.service();
-        let mut pfd = libc::pollfd {
-            fd: listener.poll_fd().unwrap_or(-1),
-            events: libc::POLLIN,
-            revents: 0,
-        };
+        let mut pfd = pollin(listener.poll_fd());
         unsafe { libc::poll(&mut pfd, 1, 10) };
     }
     let status = child.wait().map_err(|e| format!("waitpid: {e}"))?;

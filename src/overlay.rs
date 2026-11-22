@@ -277,15 +277,8 @@ fn plan_submounts(
     invocation_dir: &Path,
     kind: impl Fn(&Path) -> Option<bool>,
 ) -> Vec<Submount> {
-    // mountinfo can list the same mount point twice (a later entry shadowing an
-    // earlier one); only the path matters here, so collapse the repeats. Sorted
-    // shallowest-first in the same pass so parents are planned before children.
-    let mut uniq = mounts;
-    uniq.sort_by_key(|p| (p.components().count(), p.clone()));
-    uniq.dedup();
-
     let root = Path::new("/");
-    let project = mount_of(invocation_dir, &uniq);
+    let project = mount_of(invocation_dir, &mounts);
 
     // Paths that must end up with an ephemeral overlay of their own. The
     // project mount is one by construction (`mount_of` returns a mount point).
@@ -300,7 +293,7 @@ fn plan_submounts(
         // on the root filesystem (the root overlay) or inside a mount that is
         // itself ephemeral; otherwise it is carried by a *live* recursive bind
         // and needs its own overlay even though it is not a mount point.
-        let holder = mount_of(&scratch, &uniq);
+        let holder = mount_of(&scratch, &mounts);
         if holder == root || ephemeral.contains(&holder) || ephemeral.contains(&scratch) {
             continue;
         }
@@ -313,9 +306,11 @@ fn plan_submounts(
     }
 
     // Everything to re-establish: the host's mounts plus the scratch paths that
-    // are not mount points of their own, parents before children. The ones
-    // already in `uniq` are folded back out by the sort/dedup.
-    let mut targets = uniq;
+    // are not mount points of their own, parents before children. mountinfo
+    // can list a mount point twice (a later entry shadowing an earlier one),
+    // and a scratch path may be one already: only the path matters here, so
+    // the sort/dedup folds every repeat back out.
+    let mut targets = mounts;
     targets.extend(ephemeral.iter().cloned());
     targets.sort_by_key(|p| (p.components().count(), p.clone()));
     targets.dedup();

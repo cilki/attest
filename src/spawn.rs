@@ -25,7 +25,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 
-use crate::seccomp::{Filter, Handoff, Listener};
+use crate::seccomp::{Filter, Handoff, Listener, pollin};
 
 /// Something run in the child between `fork` and `exec`. Only
 /// async-signal-safe calls, no allocation: the parent has other threads, and
@@ -225,14 +225,9 @@ impl Spawning {
     /// watched syscall, held until the parent answers it.
     pub fn wait_exec(mut self) -> io::Result<(Child, Option<Listener>)> {
         let mut listener = self.listener.take();
-        let pollfd = |fd| libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
         // A negative descriptor is one `poll` ignores.
-        let listener_fd = listener.as_ref().and_then(|l| l.poll_fd()).unwrap_or(-1);
-        let mut fds = [pollfd(self.status_rd.as_raw_fd()), pollfd(listener_fd)];
+        let listener_fd = listener.as_ref().map_or(-1, Listener::poll_fd);
+        let mut fds = [pollin(self.status_rd.as_raw_fd()), pollin(listener_fd)];
         loop {
             let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
             if n < 0 {
@@ -247,7 +242,7 @@ impl Spawning {
             {
                 l.service();
                 // A listener with nobody left behind it stays in `POLLHUP`.
-                fds[1].fd = l.poll_fd().unwrap_or(-1);
+                fds[1].fd = l.poll_fd();
             }
             if fds[0].revents == 0 {
                 continue;

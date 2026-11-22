@@ -101,19 +101,10 @@ impl ChildWaiter {
     fn wait(&self, timeout: Duration, listeners: &mut [&mut seccomp::Listener]) {
         let deadline = Instant::now() + timeout;
         loop {
-            let mut fds: Vec<libc::pollfd> = Vec::with_capacity(listeners.len() + 1);
             // The signal first, so its slot is known.
-            fds.push(libc::pollfd {
-                fd: self.sigfd.as_ref().map_or(-1, |fd| fd.as_raw_fd()),
-                events: libc::POLLIN,
-                revents: 0,
-            });
-            fds.extend(listeners.iter().map(|l| libc::pollfd {
-                // A dead listener polls as `-1`, which `poll` ignores.
-                fd: l.poll_fd().unwrap_or(-1),
-                events: libc::POLLIN,
-                revents: 0,
-            }));
+            let sigfd = self.sigfd.as_ref().map_or(-1, |fd| fd.as_raw_fd());
+            let fds = std::iter::once(sigfd).chain(listeners.iter().map(|l| l.poll_fd()));
+            let mut fds: Vec<libc::pollfd> = fds.map(seccomp::pollin).collect();
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return;
