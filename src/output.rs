@@ -643,22 +643,24 @@ fn strace_logs(context: &Path) -> BTreeMap<String, LogField> {
 
 /// Whichever resource numbers the cgroup actually reported, or `null` when no
 /// stats were collected for the test at all.
-fn resource_stats_json(stats: Option<&crate::cgroup::ResourceStats>) -> Value {
-    let Some(r) = stats else {
-        return Value::Null;
-    };
-    [
+fn resource_stats_json(
+    stats: Option<&crate::cgroup::ResourceStats>,
+) -> Option<BTreeMap<&'static str, u64>> {
+    let r = stats?;
+    let fields = [
         ("cpu_user_usec", r.cpu_user_usec),
         ("cpu_system_usec", r.cpu_system_usec),
         ("memory_peak", r.memory_peak),
         ("io_read_bytes", r.io_read_bytes),
         ("io_write_bytes", r.io_write_bytes),
         ("pids_peak", r.pids_peak),
-    ]
-    .into_iter()
-    .filter_map(|(key, value)| value.map(|v| (key.to_owned(), v.into())))
-    .collect::<serde_json::Map<String, Value>>()
-    .into()
+    ];
+    Some(
+        fields
+            .into_iter()
+            .filter_map(|(key, value)| Some((key, value?)))
+            .collect(),
+    )
 }
 
 /// One finished test as the JSON object `--json` reports it by.
@@ -696,15 +698,10 @@ impl serde::Serialize for TestResultJson<'_> {
 /// What the seccomp listener heard, as `{"<syscall>": <count>}` — only the
 /// syscalls the test's conditions had the run watching for — or `null` for a
 /// test that was not watched.
-fn syscalls_json(log: Option<&crate::decorator::SyscallLog>) -> Value {
-    let Some(log) = log else {
-        return Value::Null;
-    };
-    log.counts
-        .iter()
-        .map(|(nr, count)| (nr.name().to_owned(), Value::from(*count)))
-        .collect::<serde_json::Map<String, Value>>()
-        .into()
+fn syscalls_json(
+    log: Option<&crate::decorator::SyscallLog>,
+) -> Option<BTreeMap<&'static str, u64>> {
+    log.map(|log| log.counts.iter().map(|(nr, &n)| (nr.name(), n)).collect())
 }
 
 /// The `#attest(...)` conditions a test failed, as `--json` reports them:

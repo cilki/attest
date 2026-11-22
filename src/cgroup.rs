@@ -83,6 +83,7 @@ impl TestCgroup {
     /// child has exited (waitpid returned) but before dropping the handle.
     pub fn read_stats(&self) -> ResourceStats {
         let (cpu_user_usec, cpu_system_usec) = read_cpu_usec(self.path.join("cpu.stat"));
+        let (io_read_bytes, io_write_bytes) = read_io_bytes(self.path.join("io.stat"));
         ResourceStats {
             cpu_user_usec,
             cpu_system_usec,
@@ -90,8 +91,8 @@ impl TestCgroup {
                 trace!("memory.peak unavailable, falling back to memory.current");
                 read_single_u64(self.path.join("memory.current"))
             }),
-            io_read_bytes: read_io_field(&self.path, "rbytes"),
-            io_write_bytes: read_io_field(&self.path, "wbytes"),
+            io_read_bytes,
+            io_write_bytes,
             pids_peak: read_single_u64(self.path.join("pids.peak")),
         }
     }
@@ -384,15 +385,7 @@ const SELF: &[u8] = b"0";
 /// `exec` even though other threads (e.g. the status-bar ticker) exist in the
 /// parent. Returns whether the write succeeded.
 pub(crate) unsafe fn add_self_to(procs: &CStr) -> bool {
-    unsafe {
-        let fd = libc::open(procs.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
-        if fd < 0 {
-            return false;
-        }
-        let written = libc::write(fd, SELF.as_ptr().cast(), SELF.len());
-        libc::close(fd);
-        written == SELF.len() as isize
-    }
+    unsafe { crate::spawn::write_file(procs, SELF) }
 }
 
 fn read_single_u64(path: impl AsRef<std::path::Path>) -> Option<u64> {
@@ -420,18 +413,18 @@ fn read_cpu_usec(path: impl AsRef<std::path::Path>) -> (Option<u64>, Option<u64>
     (user, system)
 }
 
-/// Sum a named field (e.g. `rbytes`) across all device lines in `io.stat`.
-/// Returns `None` when the file is absent or the total is zero.
-fn read_io_field(cgroup_path: &Path, field: &str) -> Option<u64> {
-    let content = std::fs::read_to_string(cgroup_path.join("io.stat")).ok()?;
-    let prefix = format!("{field}=");
-    let total: u64 = content
-        .lines()
-        .flat_map(|line| line.split_whitespace())
-        .filter_map(|tok| tok.strip_prefix(prefix.as_str()))
-        .filter_map(|v| v.parse::<u64>().ok())
-        .sum();
-    if total > 0 { Some(total) } else { None }
+/// Sum `rbytes` and `wbytes` across all device lines of `io.stat` in a single
+/// read. Each total is `None` when the file is absent or the total is zero.
+fn read_io_bytes(path: impl AsRef<std::path::Path>) -> (Option<u64>, Option<u64>) {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let total = |prefix: &str| {
+        let sum: u64 = content
+            .split_whitespace()
+            .filter_map(|tok| tok.strip_prefix(prefix)?.parse::<u64>().ok())
+            .sum();
+        (sum > 0).then_some(sum)
+    };
+    (total("rbytes="), total("wbytes="))
 }
 
 #[cfg(test)]
@@ -555,17 +548,18 @@ mod tests {
     }
 
     #[test]
-    fn read_io_field_sums_every_device() {
+    fn read_io_bytes_sums_every_device() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let stat = tmp.path().join("io.stat");
         std::fs::write(
-            tmp.path().join("io.stat"),
+            &stat,
             "8:0 rbytes=100 wbytes=7 rios=2 wios=1\n8:16 rbytes=23 wbytes=0\n",
         )
         .unwrap();
-        assert_eq!(read_io_field(tmp.path(), "rbytes"), Some(123));
-        assert_eq!(read_io_field(tmp.path(), "wbytes"), Some(7));
-        // A field no device reports sums to zero, which means "unavailable"
-        // rather than a real zero.
-        assert_eq!(read_io_field(tmp.path(), "dbytes"), None);
+        assert_eq!(read_io_bytes(&stat), (Some(123), Some(7)));
+        // A total of zero means "unavailable" rather than a real zero.
+        std::fs::write(&stat, "8:0 rbytes=5 wbytes=0 rios=1\n").unwrap();
+        assert_eq!(read_io_bytes(&stat), (Some(5), None));
+        assert_eq!(read_io_bytes(tmp.path().join("absent")), (None, None));
     }
 }

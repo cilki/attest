@@ -32,6 +32,21 @@ use crate::seccomp::{Filter, Handoff, Listener, pollin};
 /// the child is a copy of the process at a moment one of them may hold a lock.
 pub type Hook = Box<dyn FnMut() -> io::Result<()>>;
 
+/// Write `data` to the file at `path` in one `write(2)`, for a [`Hook`]:
+/// raw libc only, so it is async-signal-safe and allocates nothing. Returns
+/// whether the whole of `data` was written.
+pub(crate) unsafe fn write_file(path: &std::ffi::CStr, data: &[u8]) -> bool {
+    unsafe {
+        let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+        if fd < 0 {
+            return false;
+        }
+        let written = libc::write(fd, data.as_ptr().cast(), data.len());
+        libc::close(fd);
+        written == data.len() as isize
+    }
+}
+
 /// What to run and how.
 pub struct Spawn {
     program: CString,

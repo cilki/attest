@@ -137,7 +137,10 @@ pub fn updatable(v: &Violation) -> bool {
 pub fn plan_updates(results: &[TestResult]) -> Vec<Edit> {
     // Keyed by where the literal is — path, line, start column — so the same
     // condition of the same file collects every sample `--repeat` took of it.
-    let mut by_literal: BTreeMap<(PathBuf, usize, usize), (&Violation, Vec<u64>)> = BTreeMap::new();
+    // The first violation of each literal stands for all of them: they are
+    // the same condition of the same file, so they differ only in `measured`.
+    type Broken<'a> = (&'a Violation, Metric, &'a Bound, bool, Vec<u64>);
+    let mut by_literal: BTreeMap<(PathBuf, usize, usize), Broken> = BTreeMap::new();
     let mut unwritable: BTreeSet<(PathBuf, usize, String)> = BTreeSet::new();
     for result in results {
         for v in &result.violations {
@@ -145,7 +148,10 @@ pub fn plan_updates(results: &[TestResult]) -> Vec<Edit> {
             // paths a test may use is a decision, not a measurement, so the
             // violation is reported and the condition left as written.
             let Detail::Quantity {
-                measured, bound, ..
+                metric,
+                measured,
+                bound,
+                upper,
             } = &v.detail
             else {
                 unwritable.insert((
@@ -162,8 +168,8 @@ pub fn plan_updates(results: &[TestResult]) -> Vec<Edit> {
             );
             by_literal
                 .entry(key)
-                .or_insert_with(|| (v, Vec::new()))
-                .1
+                .or_insert_with(|| (v, *metric, bound, *upper, Vec::new()))
+                .4
                 .push(*measured);
         }
     }
@@ -172,24 +178,15 @@ pub fn plan_updates(results: &[TestResult]) -> Vec<Edit> {
             "warning: {}:{}: `{}` did not hold, and has no number to update",
             path.display(),
             line,
-            condition.split_whitespace().collect::<Vec<_>>().join(" ")
+            one_line(&condition)
         );
     }
 
     by_literal
         .into_iter()
-        .filter_map(|((path, line, _), (v, samples))| {
-            let Detail::Quantity {
-                metric,
-                bound,
-                upper,
-                ..
-            } = &v.detail
-            else {
-                unreachable!("only quantity violations are collected");
-            };
+        .filter_map(|((path, line, _), (v, metric, bound, upper, samples))| {
             let unit = metric.unit();
-            let Some(new_value) = bound_for(unit, *upper, bound.inclusive, &samples) else {
+            let Some(new_value) = bound_for(unit, upper, bound.inclusive, &samples) else {
                 errln!(
                     "warning: {}:{}: no value satisfies `{}` for what was measured; not updated",
                     path.display(),
@@ -200,9 +197,7 @@ pub fn plan_updates(results: &[TestResult]) -> Vec<Edit> {
             };
             let new = unit.literal(new_value);
             let old = bound.literal.text.clone();
-            // A condition written across lines is shown on one in the
-            // summary.
-            let before = v.condition.split_whitespace().collect::<Vec<_>>().join(" ");
+            let before = one_line(&v.condition);
             let after = before.replacen(&old, &new, 1);
             let condition = (before, after);
             Some(Edit {
@@ -217,6 +212,12 @@ pub fn plan_updates(results: &[TestResult]) -> Vec<Edit> {
             })
         })
         .collect()
+}
+
+/// `condition` with every run of whitespace a single space: a condition
+/// written across lines is shown on one in a warning or the summary.
+fn one_line(condition: &str) -> String {
+    condition.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The edits `--add-decorators` makes: a block above every test that has

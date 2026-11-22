@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
 
-use crate::spawn::Spawn;
+use crate::spawn::{Spawn, write_file};
 
 /// How a per-test overlay can be mounted in this environment.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -130,19 +130,6 @@ fn overlay_opts(lower: &Path, upper: &Path, work: &Path, mode: Mode) -> anyhow::
     CString::new(opts).map_err(|_| anyhow!("overlay options contain NUL"))
 }
 
-/// Write `data` to `path` via raw libc (async-signal-safe; no allocation).
-unsafe fn write_proc(path: &CStr, data: &[u8]) -> bool {
-    unsafe {
-        let fd = libc::open(path.as_ptr(), libc::O_WRONLY);
-        if fd < 0 {
-            return false;
-        }
-        let n = libc::write(fd, data.as_ptr().cast(), data.len());
-        libc::close(fd);
-        n == data.len() as isize
-    }
-}
-
 /// Enter the namespace(s) required for `mode`: a mount namespace for the
 /// overlay, plus a UTS namespace so hostname changes made by a (root) test
 /// stay private to it. Returns `true` on success. Only async-signal-safe libc
@@ -158,9 +145,9 @@ unsafe fn enter_namespace(mode: Mode, uid_map: &CStr, gid_map: &CStr) -> bool {
                 }
                 // setgroups must be denied before writing gid_map (kernel rule);
                 // the file is absent on some kernels, so ignore its result.
-                write_proc(c"/proc/self/setgroups", b"deny");
-                write_proc(c"/proc/self/uid_map", uid_map.to_bytes())
-                    && write_proc(c"/proc/self/gid_map", gid_map.to_bytes())
+                write_file(c"/proc/self/setgroups", b"deny");
+                write_file(c"/proc/self/uid_map", uid_map.to_bytes())
+                    && write_file(c"/proc/self/gid_map", gid_map.to_bytes())
             }
         }
     }
