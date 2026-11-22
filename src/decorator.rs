@@ -423,11 +423,6 @@ fn list_some(items: &[String]) -> String {
     text
 }
 
-/// Does `path` lie under `root` — or at it?
-fn under(path: &Path, root: &Path) -> bool {
-    path.starts_with(root)
-}
-
 /// The absolute path a `writes` item stands for: `./x` is `x` under the
 /// invocation dir, anything else is already absolute (the parse admits no
 /// other spelling).
@@ -526,7 +521,8 @@ impl Condition {
                     .collect();
                 let offenders: Vec<String> = writes
                     .iter()
-                    .filter(|path| !roots.iter().any(|root| under(path, root)))
+                    // A path at a root, or anywhere under one.
+                    .filter(|path| !roots.iter().any(|root| path.starts_with(root)))
                     .map(|path| path.display().to_string())
                     .collect();
                 if offenders.is_empty() {
@@ -742,23 +738,6 @@ fn parse_conditions(segments: &[Segment]) -> Result<Vec<Condition>, Error> {
     };
     let first_line = segments[0].line;
 
-    // Split at the commas outside braces.
-    let mut pieces: Vec<Range<usize>> = Vec::new();
-    let mut depth = 0usize;
-    let mut start = 0;
-    for (k, b) in text.bytes().enumerate() {
-        match b {
-            b'{' => depth += 1,
-            b'}' => depth = depth.saturating_sub(1),
-            b',' if depth == 0 => {
-                pieces.push(start..k);
-                start = k + 1;
-            }
-            _ => {}
-        }
-    }
-    pieces.push(start..text.len());
-
     // A block with nothing in it at all is a mistake of its own.
     if text.trim().is_empty() {
         return Err(Error {
@@ -766,11 +745,7 @@ fn parse_conditions(segments: &[Segment]) -> Result<Vec<Condition>, Error> {
             message: "`#attest()` asserts nothing".to_string(),
         });
     }
-    // A trailing comma leaves an empty last piece, which is allowed; an empty
-    // piece anywhere else (`,,`, a leading comma) is not.
-    if pieces.len() > 1 && text[pieces.last().unwrap().clone()].trim().is_empty() {
-        pieces.pop();
-    }
+    let pieces = split_list(&text);
     let mut conditions = Vec::with_capacity(pieces.len());
     for piece in pieces {
         let raw = &text[piece.clone()];
@@ -889,14 +864,42 @@ fn parse_set(text: &str) -> Result<Vec<String>, String> {
     if inner.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let mut items: Vec<&str> = inner.split(',').map(str::trim).collect();
-    if items.len() > 1 && items.last().unwrap().is_empty() {
-        items.pop();
-    }
+    let items: Vec<&str> = split_list(inner)
+        .into_iter()
+        .map(|piece| inner[piece].trim())
+        .collect();
     if items.iter().any(|item| item.is_empty()) {
         return Err("empty item in set".to_string());
     }
     Ok(items.into_iter().map(str::to_string).collect())
+}
+
+/// Split a comma-separated list — a block's conditions, a set's items — at
+/// the commas outside braces, as byte ranges of `text`.
+///
+/// A trailing comma leaves an empty last piece, which is dropped: it is
+/// allowed in both. An empty piece anywhere else (`,,`, a leading comma) is
+/// kept, for the caller to reject in its own words.
+fn split_list(text: &str) -> Vec<Range<usize>> {
+    let mut pieces = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (k, b) in text.bytes().enumerate() {
+        match b {
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                pieces.push(start..k);
+                start = k + 1;
+            }
+            _ => {}
+        }
+    }
+    pieces.push(start..text.len());
+    if pieces.len() > 1 && text[pieces[pieces.len() - 1].clone()].trim().is_empty() {
+        pieces.pop();
+    }
+    pieces
 }
 
 /// One side of a comparison.
