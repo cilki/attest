@@ -333,10 +333,10 @@ enum Cores {
 /// parses share, the `PATH` lookup behind [`discovery::script_shell`], is
 /// already answered once per shell name under a lock.
 ///
-/// Order is restored afterwards rather than preserved by the scheduling:
-/// files are claimed one at a time as workers come free, since a tree's
+/// Files are claimed one at a time as workers come free, since a tree's
 /// scripts differ in length by orders of magnitude and a fixed split would
-/// leave whoever drew the big ones parsing alone.
+/// leave whoever drew the big ones parsing alone; each answer goes into the
+/// slot of the file it is for, so the order comes out as discovered.
 fn parse_each(
     files: &[PathBuf],
     cores: Cores,
@@ -355,45 +355,33 @@ fn parse_each(
             .collect();
     }
 
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let mut parsed: Vec<(usize, anyhow::Result<parser::TestFile>)> =
-        Vec::with_capacity(files.len());
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let slots: Vec<OnceLock<anyhow::Result<parser::TestFile>>> =
+        files.iter().map(|_| OnceLock::new()).collect();
+    let work = || {
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let Some(file) = files.get(i) else { return };
+            let _ = slots[i].set(parser::parse_test_file(file, scan));
+        }
+    };
+    // A worker panicking is this parse panicking: `scope` re-raises it once
+    // every worker is joined, so there is no partial set of files to go on
+    // with and no run that silently covers less.
     std::thread::scope(|scope| {
-        let handles: Vec<_> = (1..workers)
-            .map(|_| scope.spawn(|| parse_claimed(files, &next, scan)))
-            .collect();
+        for _ in 1..workers {
+            scope.spawn(work);
+        }
         // This thread is one of the workers: spawning `workers` of them and
         // then only waiting would leave a core to the scheduler's discretion.
-        parsed.extend(parse_claimed(files, &next, scan));
-        for handle in handles {
-            match handle.join() {
-                Ok(done) => parsed.extend(done),
-                // A worker panicking is this parse panicking: there is no
-                // partial set of files to go on with, and swallowing it would
-                // turn a bug into a run that silently covers less.
-                Err(payload) => std::panic::resume_unwind(payload),
-            }
-        }
+        work();
     });
-    parsed.sort_by_key(|&(i, _)| i);
-    parsed.into_iter().map(|(_, result)| result).collect()
-}
-
-/// Parse files out of `files` until they run out, each tagged with its index
-/// so the caller can put the answers back in discovery order.
-fn parse_claimed(
-    files: &[PathBuf],
-    next: &std::sync::atomic::AtomicUsize,
-    scan: &parser::Prescan,
-) -> Vec<(usize, anyhow::Result<parser::TestFile>)> {
-    let mut done = Vec::new();
-    loop {
-        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let Some(file) = files.get(i) else {
-            return done;
-        };
-        done.push((i, parser::parse_test_file(file, scan)));
-    }
+    slots
+        .into_iter()
+        .map(|slot| slot.into_inner().expect("every file is claimed once"))
+        .collect()
 }
 
 /// What a positional target plus an optional `--filter` select.
