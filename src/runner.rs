@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Seek, SeekFrom};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -1479,36 +1479,25 @@ fn signal_tree_member(pid: u32, tree: &[u32], want_stopped: bool, signal: libc::
 /// one either reach the process it was opened for or fail with `ESRCH`. That is
 /// what makes it safe to act on a pid read out of `/proc`: the number may be
 /// recycled in the meantime, but this descriptor does not follow it.
-struct PinnedProcess(libc::c_int);
+struct PinnedProcess(std::os::fd::OwnedFd);
 
 impl PinnedProcess {
     /// Pin `pid`. `None` if it is already gone (or never existed).
     fn open(pid: u32) -> Option<Self> {
-        let path = std::ffi::CString::new(format!("/proc/{pid}")).ok()?;
-        let fd = unsafe {
-            libc::open(
-                path.as_ptr(),
-                libc::O_DIRECTORY | libc::O_RDONLY | libc::O_CLOEXEC,
-            )
-        };
-        (fd >= 0).then_some(Self(fd))
+        // `File::open` is `O_RDONLY | O_CLOEXEC`, and a directory opens that
+        // way like anything else.
+        let dir = std::fs::File::open(format!("/proc/{pid}")).ok()?;
+        Some(Self(dir.into()))
     }
 
     /// This process's `stat` line, or `None` once it is gone (reading anything
     /// under the directory of a dead task fails with `ESRCH`).
+    ///
+    /// Read through `/proc/self/fd/<fd>`, which is `openat` on the descriptor
+    /// by another name: that magic link resolves to the very directory the
+    /// descriptor holds, never to whatever `/proc/<pid>` names by now.
     fn stat(&self) -> Option<String> {
-        use std::os::fd::FromRawFd;
-
-        let fd =
-            unsafe { libc::openat(self.0, c"stat".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-        if fd < 0 {
-            return None;
-        }
-        let mut stat = String::new();
-        unsafe { std::fs::File::from_raw_fd(fd) }
-            .read_to_string(&mut stat)
-            .ok()?;
-        Some(stat)
+        std::fs::read_to_string(format!("/proc/self/fd/{}/stat", self.0.as_raw_fd())).ok()
     }
 
     /// Deliver `signal` to the pinned process via `pidfd_send_signal(2)`.
@@ -1516,18 +1505,12 @@ impl PinnedProcess {
         unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal,
-                self.0,
+                self.0.as_raw_fd(),
                 signal,
                 std::ptr::null_mut::<libc::siginfo_t>(),
                 0,
             ) == 0
         }
-    }
-}
-
-impl Drop for PinnedProcess {
-    fn drop(&mut self) {
-        unsafe { libc::close(self.0) };
     }
 }
 
