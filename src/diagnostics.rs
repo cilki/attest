@@ -95,34 +95,44 @@ pub fn print_failure_snippet(result: &TestResult) {
 /// the definition of the test it decorates ([`violation_window`]), so the
 /// test's name is in view too.
 pub fn print_violations(result: &TestResult) {
+    crate::output::write_out(violations_report(result, out_palette().is_colored()).as_bytes());
+}
+
+/// The text [`print_violations`] writes, built whole so it can be checked.
+fn violations_report(result: &TestResult, colored: bool) -> String {
+    use std::fmt::Write as _;
+
     let file = result.file;
     let lines: Vec<&str> = file.script.lines().collect();
+    let mut out = String::new();
     for violation in &result.violations {
+        // A `writes` message and its offenders are paths the test itself
+        // created, so they are whatever bytes it chose: `touch $'\e[2K…'`
+        // must not get to rewrite the report it is named in. The label is
+        // not measured against the source, so escaping it moves no span.
+        let message = crate::output::escape_label(&violation.message);
         let line_idx = violation.line - 1;
         if line_idx >= lines.len() {
-            outln!(
+            let _ = writeln!(
+                out,
                 "error: {} (asserted `{}` at line {})",
-                violation.message,
-                violation.condition,
-                violation.line
+                message, violation.condition, violation.line
             );
             continue;
         }
-        outln!(
-            "{}",
-            render_snippet(
-                "assertion on the run failed",
-                &result.file.path,
-                &lines,
-                Highlight {
-                    line: line_idx,
-                    span: Some(violation.span.clone()),
-                    label: Some(&violation.message),
-                },
-                violation_window(&file.functions, line_idx, lines.len()),
-                out_palette().is_colored(),
-            )
+        let snippet = render_snippet(
+            "assertion on the run failed",
+            &result.file.path,
+            &lines,
+            Highlight {
+                line: line_idx,
+                span: Some(violation.span.clone()),
+                label: Some(message.as_ref()),
+            },
+            violation_window(&file.functions, line_idx, lines.len()),
+            colored,
         );
+        let _ = writeln!(out, "{snippet}");
         // A set violation's label spells its first few offenders; the rest
         // follow the snippet, one per line, so a test that wrote to twenty
         // places is told all twenty.
@@ -130,11 +140,12 @@ pub fn print_violations(result: &TestResult) {
             && offenders.len() > crate::decorator::SHOWN_OFFENDERS
         {
             for offender in offenders {
-                outln!("  {offender}");
+                let _ = writeln!(out, "  {}", crate::output::escape_label(offender));
             }
-            outln!("");
+            out.push('\n');
         }
     }
+    out
 }
 
 /// The lines a violation's snippet shows: from the condition on `line` down to
@@ -1342,6 +1353,57 @@ mod tests {
         assert_eq!(violation_window(&functions, 4, lines.len()), 4..8);
         assert_eq!(violation_window(&functions, 5, lines.len()), 5..9);
         assert_eq!(violation_window(&[(6, 7), (8, 9)], 5, 10), 5..8);
+    }
+
+    #[test]
+    fn a_violation_report_defuses_the_paths_a_test_wrote() {
+        // A `writes` violation names paths the test created, and a file name
+        // is any bytes but `/` and NUL: one spelled with `ESC [2K` and `CSI`
+        // must reach the terminal as text, both in the snippet's label and
+        // in the full list of offenders under it.
+        let erase = "/tmp/a\x1b[2K\u{9b}1Gb";
+        let offenders: Vec<String> = (1..=4).map(|i| format!("{erase}{i}")).collect();
+        let message = format!("wrote {} (+3 more)", offenders[0]);
+        let file = test_file(
+            "#!/bin/bash\n# attest(writes in {./ok})\ntest_x() {\n    :\n}\n",
+            vec![(2, 4)],
+        );
+        let violation = crate::decorator::Violation {
+            line: 2,
+            span: 9..26,
+            condition: "writes in {./ok}".into(),
+            message,
+            detail: crate::decorator::Detail::Set { offenders },
+        };
+        let result = TestResult {
+            name: "test_x".into(),
+            test: "test_x",
+            file: &file,
+            outcome: Outcome::Fail,
+            duration: std::time::Duration::ZERO,
+            context: std::path::PathBuf::new(),
+            resources: None,
+            syscalls: None,
+            violations: vec![violation],
+        };
+
+        let hostile = |c: char| c.is_control() && c != '\n';
+        let report = violations_report(&result, false);
+        assert!(
+            !report.contains(hostile),
+            "a control character reached the report:\n{report:?}"
+        );
+        assert!(report.contains(r"wrote /tmp/a\x1b[2K\x9b1Gb1 (+3 more)"));
+        for i in 1..=4 {
+            assert!(report.contains(&format!(r"  /tmp/a\x1b[2K\x9b1Gb{i}")));
+        }
+
+        // The fallback for a condition the script has no line for is
+        // escaped the same way.
+        let mut result = result;
+        result.violations[0].line = 99;
+        let report = violations_report(&result, false);
+        assert!(!report.contains(hostile), "{report:?}");
     }
 
     /// Drop the SGR sequences `Renderer::styled` wraps the snippet in, so a
