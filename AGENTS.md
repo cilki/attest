@@ -557,8 +557,12 @@ foreground statement that is nothing but a negated pipeline gets
 because neither it nor its stderr-discarded `exit` shows up in the xtrace, and
 instrumentation must not appear in what the user is shown. `build_functions_source` records those
 offsets (`TestFile::negations`, found by `negated_statements` outside
-`if`/`while`/`until` conditions, skipping a statement whose lines hold a
-`<<`, since a here-document's span ends past its delimiter) and
+`if`/`while`/`until` conditions; a statement whose lines hold a `<<` is
+guarded where its last word ends rather than where its span does, since a
+here-document's span ends past its delimiter and the guard has to go before
+the body — `heredoc_statement_end`, which gives up, leaving the statement
+unguarded, on anything whose end the parser does not record: a compound
+command or a process substitution) and
 `build_runner_script` splices them in; `TestFile::script` stays as written
 because it is also what a failure snippet renders. The guard never adds a
 line, so the trace still indexes the source.

@@ -2334,6 +2334,42 @@ test_absent() {
         assert_eq!(absent.outcome, Outcome::Pass);
     }
 
+    /// A negated command fed a here-document is guarded too: before the body,
+    /// where the command ends, so the body is still the command's input and
+    /// the guard is not taken for part of it.
+    #[test]
+    fn a_negated_command_reading_a_here_document_that_fails_fails_the_test() {
+        let tmp = TempDir::new().unwrap();
+        let script = "\
+test_found() {
+  ! grep -q foo <<EOF
+foo
+EOF
+  echo unreachable
+}
+test_absent() {
+  ! grep -q bar <<EOF
+foo
+EOF
+  ! cat <<EOF | grep -q foo
+bar
+EOF
+}
+";
+        let Some(found) = run_script(tmp.path(), script, "test_found", &RunConfig::default())
+        else {
+            return;
+        };
+        assert_eq!(found.outcome, Outcome::Fail);
+        let stdout = fs::read_to_string(found.context.join("stdout.log")).unwrap();
+        assert!(!stdout.contains("unreachable"), "{stdout}");
+        let xtrace = fs::read_to_string(found.context.join("xtrace.log")).unwrap();
+        assert!(xtrace.trim_end().ends_with("+2: grep -q foo"), "{xtrace}");
+
+        let absent = run_script(tmp.path(), script, "test_absent", &RunConfig::default()).unwrap();
+        assert_eq!(absent.outcome, Outcome::Pass);
+    }
+
     /// The guard goes after each negated statement and adds no line, so the
     /// trace still indexes the source.
     #[test]
