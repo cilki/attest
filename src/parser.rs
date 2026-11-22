@@ -506,23 +506,14 @@ pub fn parse_test_file(path: &Path, scan: &Prescan) -> anyhow::Result<TestFile> 
     // spans it is cut with, the bounds a snippet clamps to and the shell that
     // runs it can never be out of step: the file is read once and all of them
     // come from that one read.
-    let Rendered {
-        script,
-        bounds,
-        headers,
-        negations,
-    } = build_functions_source(&functions, &contents, &keep);
     Ok(TestFile {
         path: path.to_path_buf(),
         canonical_path: path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
         tests,
-        script,
-        functions: bounds,
-        headers,
-        negations,
         shell: crate::discovery::script_shell(&contents),
         decorators,
         test_lines,
+        ..build_functions_source(&functions, &contents, &keep)
     })
 }
 
@@ -611,11 +602,13 @@ fn attach_decorators(
 /// alignment is lost, but the script still defines and runs the same
 /// functions.
 ///
-/// Returns the script; for each function, the 0-based inclusive range of
-/// lines it occupies *in that script* — exact whichever way the function was
-/// rendered, since this is where it was put; the lines of each in front of its
-/// first command ([`TestFile::headers`]); and the byte offsets in the script
-/// that end a negated statement ([`TestFile::negations`]). Only a function
+/// Returns a [`TestFile`] with only the fields laid out here set: the
+/// [`TestFile::script`]; for each function, the 0-based inclusive range of
+/// lines it occupies *in that script* ([`TestFile::functions`]) — exact
+/// whichever way the function was rendered, since this is where it was put;
+/// the lines of each in front of its first command ([`TestFile::headers`]);
+/// and the byte offsets in the script that end a negated statement
+/// ([`TestFile::negations`]). Only a function
 /// copied from its source lines has headers or negations: both are found from
 /// source positions, and a re-rendered function is not where the source has
 /// it.
@@ -623,7 +616,7 @@ pub(crate) fn build_functions_source(
     functions: &[FunctionDefinition],
     source: &str,
     keep: &HashSet<usize>,
-) -> Rendered {
+) -> TestFile {
     let src_lines: Vec<&str> = source.lines().collect();
     let mut out = String::new();
     let mut bounds = Vec::with_capacity(functions.len());
@@ -638,14 +631,14 @@ pub(crate) fn build_functions_source(
         } else {
             func.location()
         };
-        // Where each negated statement of this function ends, by the 1-based
-        // line it ends on, as byte offsets into that line.
-        let mut ends: HashMap<usize, Vec<usize>> = HashMap::new();
-        if located.is_some() {
-            for (end_line, column) in negated_statements(func, &src_lines) {
-                ends.entry(end_line).or_default().push(column);
-            }
-        }
+        // Where each negated statement of this function ends: the 1-based
+        // line it ends on and the byte offset into that line, in source order.
+        let mut ends = match located {
+            Some(_) => negated_statements(func, &src_lines),
+            None => Vec::new(),
+        };
+        ends.sort_unstable();
+        let mut ends = ends.into_iter().peekable();
         // Where this function's first line lands, whichever way it is rendered.
         let first = match located {
             None => {
@@ -680,9 +673,8 @@ pub(crate) fn build_functions_source(
                 // `end.line` is the line of the closing brace (inclusive here).
                 let last = span.end.line.min(src_lines.len());
                 for idx in span.start.line..=last {
-                    if let Some(columns) = ends.get_mut(&idx) {
-                        columns.sort_unstable();
-                        negations.extend(columns.iter().map(|c| out.len() + c));
+                    while let Some((_, column)) = ends.next_if(|&(end_line, _)| end_line == idx) {
+                        negations.push(out.len() + column);
                     }
                     if let Some(text) = src_lines.get(idx - 1) {
                         out.push_str(text);
@@ -698,21 +690,13 @@ pub(crate) fn build_functions_source(
         }
     }
 
-    Rendered {
+    TestFile {
         script: out,
-        bounds,
+        functions: bounds,
         headers,
         negations,
+        ..TestFile::default()
     }
-}
-
-/// What [`build_functions_source`] lays out: the [`TestFile`] fields of the
-/// same names (`bounds` is [`TestFile::functions`]).
-pub(crate) struct Rendered {
-    pub script: String,
-    pub bounds: Vec<(usize, usize)>,
-    pub headers: Vec<usize>,
-    pub negations: Vec<usize>,
 }
 
 /// The 1-based source line the first command of `func`'s body starts on, if
@@ -1313,9 +1297,9 @@ EOF
         let source = "helper() {\n  echo 42\n}\n\ntest_foo() {\n  test \"$(helper)\" = 42\n}\n";
         let functions = parse_functions(source).unwrap();
 
-        let Rendered {
+        let TestFile {
             script: generated,
-            bounds,
+            functions: bounds,
             ..
         } = build_functions_source(&functions, "", &HashSet::new());
         // Even so, where each function landed is known exactly: the two are
