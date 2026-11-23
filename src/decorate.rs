@@ -65,17 +65,22 @@ pub fn bound_for(unit: Unit, upper: bool, inclusive: bool, samples: &[u64]) -> O
     }
     .expect("at least one sample");
 
-    let candidate = if unit == Unit::Count {
-        exact_past(extreme, upper, inclusive)
-    } else if upper {
-        round_sig(extreme as f64 * 1.25, true)
-    } else {
-        round_sig(extreme as f64 * 0.8, false)
+    // The tightest bound on `extreme`: itself when inclusive, one base unit
+    // beyond it when not.
+    let exact = match (inclusive, upper) {
+        (true, _) => extreme,
+        (false, true) => extreme + 1,
+        (false, false) => extreme.saturating_sub(1),
+    };
+    let candidate = match (unit, upper) {
+        (Unit::Count, _) => exact,
+        (_, true) => round_sig(extreme as f64 * 1.25, true),
+        (_, false) => round_sig(extreme as f64 * 0.8, false),
     };
 
     // Rounding cannot move a bound back onto the samples, and headroom on
     // zero is still zero: whatever came out, every sample has to pass it.
-    let admits = |value: u64| {
+    let admits = |&value: &u64| {
         let b = Bound {
             value,
             inclusive,
@@ -83,21 +88,7 @@ pub fn bound_for(unit: Unit, upper: bool, inclusive: bool, samples: &[u64]) -> O
         };
         samples.iter().all(|&s| b.admits(s, upper))
     };
-    if admits(candidate) {
-        return Some(candidate);
-    }
-    let exact = exact_past(extreme, upper, inclusive);
-    admits(exact).then_some(exact)
-}
-
-/// The tightest bound on `extreme`: itself when inclusive, one base unit
-/// beyond it when not.
-fn exact_past(extreme: u64, upper: bool, inclusive: bool) -> u64 {
-    match (inclusive, upper) {
-        (true, _) => extreme,
-        (false, true) => extreme + 1,
-        (false, false) => extreme.saturating_sub(1),
-    }
+    [candidate, exact].into_iter().find(admits)
 }
 
 /// `value` rounded to two significant figures, up or down.

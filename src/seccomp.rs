@@ -385,7 +385,7 @@ impl Listener {
             return;
         }
         if let Some(nr) = Sysno::new(notif.data.nr as usize) {
-            self.log.record(nr);
+            *self.log.entry(nr).or_default() += 1;
         }
         let resp = libc::seccomp_notif_resp {
             id: notif.id,
@@ -429,8 +429,8 @@ pub fn probe() -> Result<(), String> {
     if !status.success() {
         return Err(format!("the child ended with {status}"));
     }
-    if log.counts.get(&Sysno::execve) != Some(&1) {
-        return Err(format!("expected one execve, heard {:?}", log.counts));
+    if log.get(&Sysno::execve) != Some(&1) {
+        return Err(format!("expected one execve, heard {log:?}"));
     }
     Ok(())
 }
@@ -520,10 +520,7 @@ mod tests {
             return;
         }
         let log = exec_under(&[Sysno::execve, Sysno::getppid]);
-        assert!(
-            log.counts.get(&Sysno::execve).is_some_and(|&n| n >= 1),
-            "{log:?}"
-        );
+        assert!(log.get(&Sysno::execve).is_some_and(|&n| n >= 1), "{log:?}");
     }
 
     /// Every syscall watched — what an `in` set comes close to: whatever the
@@ -538,10 +535,7 @@ mod tests {
         }
         let all: Vec<Sysno> = Sysno::iter().collect();
         let log = exec_under(&all);
-        assert!(
-            log.counts.get(&Sysno::execve).is_some_and(|&n| n >= 1),
-            "{log:?}"
-        );
+        assert!(log.get(&Sysno::execve).is_some_and(|&n| n >= 1), "{log:?}");
     }
 
     /// A child that ends before installing anything (an earlier hook failed)
@@ -592,7 +586,7 @@ mod tests {
         }
         assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
         let log = listener.into_log();
-        assert_eq!(log.counts.get(&Sysno::getpid), Some(&2));
-        assert_eq!(log.counts.get(&Sysno::getppid), Some(&1));
+        assert_eq!(log.get(&Sysno::getpid), Some(&2));
+        assert_eq!(log.get(&Sysno::getppid), Some(&1));
     }
 }

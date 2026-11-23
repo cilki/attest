@@ -701,7 +701,7 @@ impl serde::Serialize for TestResultJson<'_> {
 fn syscalls_json(
     log: Option<&crate::decorator::SyscallLog>,
 ) -> Option<BTreeMap<&'static str, u64>> {
-    log.map(|log| log.counts.iter().map(|(nr, &n)| (nr.name(), n)).collect())
+    log.map(|log| log.iter().map(|(nr, &n)| (nr.name(), n)).collect())
 }
 
 /// The `#attest(...)` conditions a test failed, as `--json` reports them:
@@ -1141,10 +1141,7 @@ mod tests {
                 offenders: vec!["socket".into()],
             },
         }];
-        let mut log = crate::decorator::SyscallLog::default();
-        log.record(crate::decorator::Sysno::socket);
-        log.record(crate::decorator::Sysno::socket);
-        result.syscalls = Some(log);
+        result.syscalls = Some([(crate::decorator::Sysno::socket, 2)].into());
         let parsed = test_result_json(&result);
         assert_eq!(
             parsed["violations"],

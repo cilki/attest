@@ -1850,12 +1850,8 @@ mod tests {
         assert_eq!(r.violations.len(), 1, "{:?}", r.violations);
         assert_eq!(r.violations[0].message, "made chdir");
         let log = r.syscalls.as_ref().expect("the test was watched");
-        assert!(
-            log.counts
-                .get(&decorator::Sysno::chdir)
-                .is_some_and(|&n| n >= 1)
-        );
-        assert!(!log.counts.contains_key(&decorator::Sysno::mknodat));
+        assert!(log.get(&decorator::Sysno::chdir).is_some_and(|&n| n >= 1));
+        assert!(!log.contains_key(&decorator::Sysno::mknodat));
 
         let Some(r) = run_inline(
             "#attest(syscalls not in {mknodat})\ntest_x() {\n  true\n}\n",
@@ -1864,7 +1860,7 @@ mod tests {
             return;
         };
         assert_eq!(r.outcome, Outcome::Pass, "{:?}", r.violations);
-        assert_eq!(r.syscalls.as_ref().unwrap().counts.len(), 0);
+        assert_eq!(r.syscalls.as_ref().unwrap().len(), 0);
 
         // The exec of the shell is itself a watched syscall here, and the
         // spawn must not wait for it in a way that stops it being answered.
@@ -1884,7 +1880,6 @@ mod tests {
             r.syscalls
                 .as_ref()
                 .unwrap()
-                .counts
                 .contains_key(&decorator::Sysno::execve)
         );
     }

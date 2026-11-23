@@ -91,16 +91,26 @@ impl Metric {
         self.unit() == Unit::Count
     }
 
+    /// Every metric, in the order the grammar's error messages list them.
+    const ALL: [Metric; 6] = [
+        Metric::Cpu,
+        Metric::Wall,
+        Metric::Mem,
+        Metric::IoRead,
+        Metric::IoWrite,
+        Metric::Pids,
+    ];
+
+    /// The metric spelled `word`: [`Metric::name`] read backwards, so the
+    /// two cannot disagree.
     fn parse(word: &str) -> Option<Self> {
-        Some(match word {
-            "cpu" => Metric::Cpu,
-            "wall" => Metric::Wall,
-            "mem" => Metric::Mem,
-            "io_read" => Metric::IoRead,
-            "io_write" => Metric::IoWrite,
-            "pids" => Metric::Pids,
-            _ => return None,
-        })
+        Self::ALL.into_iter().find(|m| m.name() == word)
+    }
+
+    /// Every metric's name, as the error for a missing or unknown one lists
+    /// them: `cpu, wall, mem, io_read, io_write, pids`.
+    fn names() -> String {
+        Self::ALL.map(Metric::name).join(", ")
     }
 
     pub fn name(self) -> &'static str {
@@ -177,16 +187,7 @@ pub struct Sample<'a> {
 /// times it was seen. Only the syscalls the test's conditions name (or, for
 /// an allow-list, everything they do not) are ever counted — nothing watches
 /// a test that has no `syscalls` condition.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub struct SyscallLog {
-    pub counts: BTreeMap<Sysno, u64>,
-}
-
-impl SyscallLog {
-    pub fn record(&mut self, nr: Sysno) {
-        *self.counts.entry(nr).or_insert(0) += 1;
-    }
-}
+pub type SyscallLog = BTreeMap<Sysno, u64>;
 
 /// Where a condition's measurement comes from, for the "could not be
 /// measured" warning: the quantity metrics each from their own counter, and
@@ -293,18 +294,11 @@ impl Unit {
             return format!("{value}{suffix}");
         }
         // Two decimals are as many as a value rounded to two significant
-        // figures needs below its unit's next step; the trailing zeros go.
-        let mut text = format!("{scaled:.2}");
-        if text.contains('.') {
-            while text.ends_with('0') {
-                text.pop();
-            }
-            if text.ends_with('.') {
-                text.pop();
-            }
-        }
-        text.push_str(suffix);
-        text
+        // figures needs below its unit's next step; the trailing zeros go,
+        // and the point with them when nothing is left after it.
+        let text = format!("{scaled:.2}");
+        let text = text.trim_end_matches('0').trim_end_matches('.');
+        format!("{text}{suffix}")
     }
 }
 
@@ -496,7 +490,6 @@ impl Condition {
                 // block with several `syscalls` conditions it holds the union
                 // of their watch sets, so each one still filters for its own.
                 let offenders: Vec<String> = log
-                    .counts
                     .keys()
                     .filter(|nr| set.contains(nr) != *allow)
                     .map(|nr| nr.name().to_string())
@@ -970,11 +963,13 @@ fn parse_quantity_condition(text: &str) -> Result<Kind, String> {
         _ => {
             return Err(
                 match operands.iter().filter(|o| matches!(o, M(_))).count() {
-                    0 => "a condition compares a metric (cpu, wall, mem, io_read, io_write, pids) against a value",
-                    1 => "expected `cpu < 10ms`, `2ms < cpu` or `2ms < cpu < 10ms` (one metric, at most two values)",
-                    _ => "a condition compares only one metric",
-                }
-                .to_string(),
+                    0 => format!(
+                        "a condition compares a metric ({}) against a value",
+                        Metric::names()
+                    ),
+                    1 => "expected `cpu < 10ms`, `2ms < cpu` or `2ms < cpu < 10ms` (one metric, at most two values)".to_string(),
+                    _ => "a condition compares only one metric".to_string(),
+                },
             );
         }
     };
@@ -1063,9 +1058,7 @@ fn parse_operand(text: &str, at: usize) -> Result<(Operand, &str), String> {
     }
     match Metric::parse(word) {
         Some(metric) => Ok((Operand::Metric(metric), rest)),
-        None => Err(format!(
-            "`{word}` is not a metric (cpu, wall, mem, io_read, io_write, pids)"
-        )),
+        None => Err(format!("`{word}` is not a metric ({})", Metric::names())),
     }
 }
 
@@ -1527,7 +1520,7 @@ testX() {
     fn syscalls_condition_is_checked_against_the_log() {
         let mut log = SyscallLog::default();
         for nr in [Sysno::read, Sysno::read, Sysno::socket, Sysno::connect] {
-            log.record(nr);
+            *log.entry(nr).or_default() += 1;
         }
         let mut s = sample_of(Duration::ZERO, None);
         s.syscalls = Some(&log);
