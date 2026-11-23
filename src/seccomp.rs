@@ -60,39 +60,18 @@ const NATIVE_ARCH: u32 = 0xc00000f3;
 const NATIVE_ARCH: u32 = 0;
 
 /// A classic BPF program for the kernel's seccomp filter.
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Filter {
-    prog: Vec<Instruction>,
+    prog: Vec<libc::sock_filter>,
 }
 
-/// One `sock_filter` as plain data, so a program can be compared and built
-/// without `libc`'s struct in the way. `repr(C)` because the kernel reads
-/// it as that struct.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Instruction {
-    code: u16,
-    jt: u8,
-    jf: u8,
-    k: u32,
+// libc's constructors are `unsafe` for no reason beyond being macros in C:
+// they only fill in the four fields.
+fn stmt(code: u32, k: u32) -> libc::sock_filter {
+    unsafe { libc::BPF_STMT(code as u16, k) }
 }
 
-const fn stmt(code: u32, k: u32) -> Instruction {
-    Instruction {
-        code: code as u16,
-        jt: 0,
-        jf: 0,
-        k,
-    }
-}
-
-const fn jump(code: u32, k: u32, jt: u8, jf: u8) -> Instruction {
-    Instruction {
-        code: code as u16,
-        jt,
-        jf,
-        k,
-    }
+fn jump(code: u32, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
+    unsafe { libc::BPF_JUMP(code as u16, k, jt, jf) }
 }
 
 impl Filter {
@@ -155,8 +134,8 @@ impl Filter {
         let page = handoff.page();
         let mut fprog = libc::sock_fprog {
             len: self.prog.len() as libc::c_ushort,
-            // Same layout, by construction.
-            filter: self.prog.as_ptr() as *mut libc::sock_filter,
+            // The kernel only reads the program.
+            filter: self.prog.as_ptr().cast_mut(),
         };
         let seccomp = |fprog: &mut libc::sock_fprog| unsafe {
             libc::syscall(
