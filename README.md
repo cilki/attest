@@ -50,7 +50,9 @@ wanted to. Don't try that with Bats :).
 There are only three implicit pieces of knowledge that you need for writing
 tests:
 
-- All test functions are named starting with `test`
+- All test functions are named `test` followed by a capital letter
+  (`testHello`); any other function — `testing`, `test_setup` — is a helper
+  your tests can call
 - If any command in your function exits nonzero, the whole test fails
 - Each test starts in its own clean, empty temporary working directory, and
   runs in its own copy-on-write view of the filesystem: it sees the real

@@ -308,7 +308,10 @@ fn read_capped_line(
 ) -> std::io::Result<bool> {
     use std::io::{BufRead, Read};
     line.clear();
-    let n = reader.by_ref().take(MAX_LINE as u64).read_until(b'\n', line)?;
+    let n = reader
+        .by_ref()
+        .take(MAX_LINE as u64)
+        .read_until(b'\n', line)?;
     if line.last() == Some(&b'\n') {
         line.pop();
     } else if n == MAX_LINE {

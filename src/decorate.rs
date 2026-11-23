@@ -638,9 +638,9 @@ mod tests {
             ..Default::default()
         };
         let results = vec![
-            violated(&tf, "test_x", 3, "cpu < 10ms", 12_200),
-            violated(&tf, "test_x", 3, "cpu < 10ms", 14_000),
-            violated(&tf, "test_x", 3, "cpu < 10ms", 11_000),
+            violated(&tf, "testX", 3, "cpu < 10ms", 12_200),
+            violated(&tf, "testX", 3, "cpu < 10ms", 14_000),
+            violated(&tf, "testX", 3, "cpu < 10ms", 11_000),
         ];
         let edits = plan_updates(&results);
         assert_eq!(edits.len(), 1);
@@ -665,7 +665,7 @@ mod tests {
     fn only_a_violation_with_a_number_to_rewrite_is_updatable() {
         let tf = TestFile::default();
         let quantity = |condition, measured| {
-            violated(&tf, "test_x", 1, condition, measured)
+            violated(&tf, "testX", 1, condition, measured)
                 .violations
                 .pop()
                 .unwrap()
@@ -686,7 +686,7 @@ mod tests {
     fn apply_rewrites_in_place_and_keeps_the_rest_of_the_line() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("a.test");
-        let source = "#!/bin/sh\n\n# attest(cpu < 10ms, 2 <= pids)\ntest_x() {\n\ttrue\n}\n";
+        let source = "#!/bin/sh\n\n# attest(cpu < 10ms, 2 <= pids)\ntestX() {\n\ttrue\n}\n";
         std::fs::write(&path, source).unwrap();
         #[cfg(unix)]
         {
@@ -724,7 +724,7 @@ mod tests {
         let after = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             after,
-            "#!/bin/sh\n\n# attest(cpu < 16ms, 1 <= pids)\ntest_x() {\n\ttrue\n}\n"
+            "#!/bin/sh\n\n# attest(cpu < 16ms, 1 <= pids)\ntestX() {\n\ttrue\n}\n"
         );
         #[cfg(unix)]
         {
@@ -738,7 +738,7 @@ mod tests {
     fn apply_leaves_a_file_that_changed_alone() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("a.test");
-        let source = "# attest(cpu < 99ms)\ntest_x() {\n\ttrue\n}\n";
+        let source = "# attest(cpu < 99ms)\ntestX() {\n\ttrue\n}\n";
         std::fs::write(&path, source).unwrap();
         let edits = vec![Edit {
             path: path.clone(),
@@ -758,7 +758,7 @@ mod tests {
     fn inserts_and_replaces_in_one_file_do_not_move_each_other() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("a.test");
-        let source = "test_a() {\n\ttrue\n}\n\n# attest(cpu < 10ms)\ntest_b() {\n\ttrue\n}\n\n  test_c() {\n\ttrue\n}\n";
+        let source = "testA() {\n\ttrue\n}\n\n# attest(cpu < 10ms)\ntestB() {\n\ttrue\n}\n\n  testC() {\n\ttrue\n}\n";
         std::fs::write(&path, source).unwrap();
         let edits = vec![
             Edit {
@@ -790,7 +790,7 @@ mod tests {
         assert_eq!(applied.len(), 3);
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "# attest(cpu < 2ms)\ntest_a() {\n\ttrue\n}\n\n# attest(cpu < 16ms)\ntest_b() {\n\ttrue\n}\n\n  # attest(pids <= 2)\n  test_c() {\n\ttrue\n}\n"
+            "# attest(cpu < 2ms)\ntestA() {\n\ttrue\n}\n\n# attest(cpu < 16ms)\ntestB() {\n\ttrue\n}\n\n  # attest(pids <= 2)\n  testC() {\n\ttrue\n}\n"
         );
         // Reported top-down, at the line numbers of the file as it was.
         let lines: Vec<usize> = applied.iter().map(|a| a.line).collect();
@@ -809,7 +809,7 @@ mod tests {
         let tf = parsed(
             tmp.path(),
             "a.test",
-            "#!/bin/sh\n\n# attest(cpu < 10ms)\ntest_has() {\n\ttrue\n}\n\n## documented\ntest_none() {\n\ttrue\n}\n\ntest_failed() {\n\tfalse\n}\n\ntest_unmeasured() {\n\ttrue\n}\n",
+            "#!/bin/sh\n\n# attest(cpu < 10ms)\ntestHas() {\n\ttrue\n}\n\n## documented\ntestNone() {\n\ttrue\n}\n\ntestFailed() {\n\tfalse\n}\n\ntestUnmeasured() {\n\ttrue\n}\n",
         );
         let stats = ResourceStats {
             cpu_user_usec: Some(8_000),
@@ -826,14 +826,14 @@ mod tests {
             });
             r
         };
-        let mut failed = with("test_failed", 1);
+        let mut failed = with("testFailed", 1);
         failed.outcome = Outcome::Fail;
         let results = vec![
-            with("test_has", 1),
-            with("test_none", 4),
-            with("test_none", 6),
+            with("testHas", 1),
+            with("testNone", 4),
+            with("testNone", 6),
             failed,
-            result(&tf, "test_unmeasured"),
+            result(&tf, "testUnmeasured"),
         ];
         let edits = plan_additions(&results);
         assert_eq!(edits.len(), 1, "{edits:?}");
@@ -856,7 +856,7 @@ mod tests {
         let tf = parsed(
             tmp.path(),
             "a.test",
-            "#!/bin/sh\n\n## documented\ntest_a() {\n\ttrue\n}\n\nif true; then\n  test_b() {\n    true\n  }\nfi\n",
+            "#!/bin/sh\n\n## documented\ntestA() {\n\ttrue\n}\n\nif true; then\n  testB() {\n    true\n  }\nfi\n",
         );
         let stats = ResourceStats {
             cpu_user_usec: Some(1_000),
@@ -864,7 +864,7 @@ mod tests {
             pids_peak: Some(2),
             ..Default::default()
         };
-        let results: Vec<TestResult> = ["test_a", "test_b"]
+        let results: Vec<TestResult> = ["testA", "testB"]
             .into_iter()
             .map(|t| {
                 let mut r = result(&tf, t);
@@ -884,11 +884,11 @@ mod tests {
         let after = std::fs::read_to_string(&tf.path).unwrap();
         assert_eq!(
             after,
-            "#!/bin/sh\n\n## documented\n# attest(cpu < 2.5ms, pids <= 2)\ntest_a() {\n\ttrue\n}\n\nif true; then\n  # attest(cpu < 2.5ms, pids <= 2)\n  test_b() {\n    true\n  }\nfi\n"
+            "#!/bin/sh\n\n## documented\n# attest(cpu < 2.5ms, pids <= 2)\ntestA() {\n\ttrue\n}\n\nif true; then\n  # attest(cpu < 2.5ms, pids <= 2)\n  testB() {\n    true\n  }\nfi\n"
         );
         let reparsed =
             crate::parser::parse_test_file(&tf.path, &crate::parser::Prescan::default()).unwrap();
-        for test in ["test_a", "test_b"] {
+        for test in ["testA", "testB"] {
             let texts: Vec<&str> = reparsed
                 .conditions_of(test)
                 .map(|c| c.text.as_str())
@@ -900,8 +900,8 @@ mod tests {
     #[test]
     fn additions_skip_metrics_the_run_did_not_measure() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let tf = parsed(tmp.path(), "a.test", "test_x() {\n\ttrue\n}\n");
-        let mut r = result(&tf, "test_x");
+        let tf = parsed(tmp.path(), "a.test", "testX() {\n\ttrue\n}\n");
+        let mut r = result(&tf, "testX");
         r.resources = Some(ResourceStats {
             pids_peak: Some(2),
             ..Default::default()

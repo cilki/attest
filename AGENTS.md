@@ -98,7 +98,8 @@
   prefix the definition's name must carry — everything in front of the first
   `*`, or all of a `*`-less pattern, since that matches as a prefix. One of
   that and `test` has to contain the other, so the longer is the whole
-  constraint and a name half that extends neither (`--filter overlay`) means
+  constraint and a name half that extends neither (`--filter overlay`), or
+  that runs past `test` without the capital (`--filter test_`), means
   no file in the tree holds a selectable test at all. The price of a
   rejection is the same one the bare `test…` scan already pays: an
   unparseable script the filter excludes is no longer named on stderr, and
@@ -112,10 +113,10 @@
   everything after it as the file, however many components that is
   (`./a/x.test` == `a/x.test/`). The marker wins over the last-`/` split rather
   than only applying when there is nothing to split, so a name is attached by
-  spelling the selector without the `./` (`a/x.test/test_foo`, the form `list`
+  spelling the selector without the `./` (`a/x.test/testFoo`, the form `list`
   prints). `split_path_arg` therefore drops a `./` from the filter it
   synthesizes for a positional target: there the split is decided by the
-  filesystem, so `./a/x.test/test_foo` is a file plus a name, and carrying the
+  filesystem, so `./a/x.test/testFoo` is a file plus a name, and carrying the
   marker into the filter would turn the name back into a path component.
   `selector` is the other direction — the single spelling of the join, used by
   `list` and by completion — and drops the `./` for the same reason:
@@ -532,7 +533,8 @@
 ## Test file format
 
 Standalone test files (`.test`) have any shell shebang and contain functions
-prefixed with `test`. Test functions can also be inline in any regular shell
+named `test` followed by a capital letter (`testHello`; `parser::is_test_name`
+— `testing`, `test_foo` and `test` itself are helpers). Test functions can also be inline in any regular shell
 script. When scanning directories, all shell scripts (identified by extension or
 shebang) are checked for test functions; the walk is recursive, skips hidden
 files and directories, and never follows symlinks (a symlinked directory would

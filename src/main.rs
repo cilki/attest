@@ -748,7 +748,7 @@ mod tests {
     // function, so the file is one the parser is asked about at all (a script
     // that spells no test function is never parsed — see
     // `parser::Prescan` and the test below).
-    const BROKEN: &str = "#!/bin/bash\ntest_broken() {\n\techo \"unterminated\n}\n";
+    const BROKEN: &str = "#!/bin/bash\ntestBroken() {\n\techo \"unterminated\n}\n";
     // The same syntax error in the kind of script a tree can contain without
     // it having anything to do with the tests.
     const BROKEN_WITHOUT_TESTS: &str = "#!/bin/bash\nfoo() {\n\techo \"unterminated\n}\n";

@@ -1749,8 +1749,8 @@ mod tests {
     /// on being checked wherever the tests run.
     #[test]
     fn a_decorator_the_run_breaks_fails_the_test() {
-        let script = "#attest(wall < 1us)\ntest_x() {\n  true\n}\n";
-        let Some(r) = run_inline(script, "test_x") else {
+        let script = "#attest(wall < 1us)\ntestX() {\n  true\n}\n";
+        let Some(r) = run_inline(script, "testX") else {
             return;
         };
         assert_eq!(r.outcome, Outcome::Fail);
@@ -1765,8 +1765,8 @@ mod tests {
 
     #[test]
     fn a_decorator_the_run_meets_leaves_the_test_passing() {
-        let script = "# attest(\n#   wall < 60s,\n# )\ntest_x() {\n  true\n}\n";
-        let Some(r) = run_inline(script, "test_x") else {
+        let script = "# attest(\n#   wall < 60s,\n# )\ntestX() {\n  true\n}\n";
+        let Some(r) = run_inline(script, "testX") else {
             return;
         };
         assert_eq!(r.outcome, Outcome::Pass);
@@ -1775,18 +1775,18 @@ mod tests {
 
     #[test]
     fn under_update_decorators_a_violation_is_recorded_but_does_not_fail() {
-        let script = "#attest(wall < 1us)\ntest_x() {\n  true\n}\n";
+        let script = "#attest(wall < 1us)\ntestX() {\n  true\n}\n";
         let tmp = TempDir::new().unwrap();
         let config = RunConfig {
             update_decorators: true,
             ..Default::default()
         };
-        let Some(r) = run_script(tmp.path(), script, "test_x", &config) else {
+        let Some(r) = run_script(tmp.path(), script, "testX", &config) else {
             return;
         };
         assert_eq!(r.outcome, Outcome::Pass);
         assert_eq!(r.violations.len(), 1);
-        assert_eq!(r.test, "test_x");
+        assert_eq!(r.test, "testX");
         // The literal to rewrite is where the file has it.
         let decorator::Detail::Quantity { bound, .. } = &r.violations[0].detail else {
             panic!("expected a quantity");
@@ -1802,13 +1802,13 @@ mod tests {
         // test on it would report success for a condition that is still
         // broken. The quantity beside it is excused as usual.
         let script =
-            "#attest(wall < 1us, writes in {/var})\ntest_x() {\n  echo x > /tmp/attest_upd\n}\n";
+            "#attest(wall < 1us, writes in {/var})\ntestX() {\n  echo x > /tmp/attest_upd\n}\n";
         let tmp = TempDir::new().unwrap();
         let config = RunConfig {
             update_decorators: true,
             ..Default::default()
         };
-        let Some(r) = run_script(tmp.path(), script, "test_x", &config) else {
+        let Some(r) = run_script(tmp.path(), script, "testX", &config) else {
             return;
         };
         assert_eq!(r.violations.len(), 2, "{:?}", r.violations);
@@ -1821,8 +1821,8 @@ mod tests {
         // The numbers are those of a run that never got to the end, so the
         // only verdict is the command's — and the report stays the command's
         // too.
-        let script = "#attest(wall < 1us)\ntest_x() {\n  false\n}\n";
-        let Some(r) = run_inline(script, "test_x") else {
+        let script = "#attest(wall < 1us)\ntestX() {\n  false\n}\n";
+        let Some(r) = run_inline(script, "testX") else {
             return;
         };
         assert_eq!(r.outcome, Outcome::Fail);
@@ -1841,8 +1841,8 @@ mod tests {
             return;
         }
         let Some(r) = run_inline(
-            "#attest(syscalls not in {chdir, mknodat})\ntest_x() {\n  true\n}\n",
-            "test_x",
+            "#attest(syscalls not in {chdir, mknodat})\ntestX() {\n  true\n}\n",
+            "testX",
         ) else {
             return;
         };
@@ -1858,8 +1858,8 @@ mod tests {
         assert!(!log.counts.contains_key(&decorator::Sysno::mknodat));
 
         let Some(r) = run_inline(
-            "#attest(syscalls not in {mknodat})\ntest_x() {\n  true\n}\n",
-            "test_x",
+            "#attest(syscalls not in {mknodat})\ntestX() {\n  true\n}\n",
+            "testX",
         ) else {
             return;
         };
@@ -1869,8 +1869,8 @@ mod tests {
         // The exec of the shell is itself a watched syscall here, and the
         // spawn must not wait for it in a way that stops it being answered.
         let Some(r) = run_inline(
-            "#attest(syscalls in {read})\ntest_x() {\n  true\n}\n",
-            "test_x",
+            "#attest(syscalls in {read})\ntestX() {\n  true\n}\n",
+            "testX",
         ) else {
             return;
         };
@@ -1892,7 +1892,7 @@ mod tests {
     /// A test with no `syscalls` condition is not watched at all.
     #[test]
     fn a_test_without_a_syscalls_condition_is_not_watched() {
-        let Some(r) = run_inline("#attest(wall < 60s)\ntest_x() {\n  true\n}\n", "test_x") else {
+        let Some(r) = run_inline("#attest(wall < 60s)\ntestX() {\n  true\n}\n", "testX") else {
             return;
         };
         assert_eq!(r.outcome, Outcome::Pass);
@@ -1904,8 +1904,8 @@ mod tests {
     #[test]
     fn a_writes_condition_is_checked_against_the_delta() {
         let Some(r) = run_inline(
-            "#attest(writes in {/tmp})\ntest_x() {\n  echo x > /tmp/attest_writes_ok\n  echo y > ./in_cwd\n}\n",
-            "test_x",
+            "#attest(writes in {/tmp})\ntestX() {\n  echo x > /tmp/attest_writes_ok\n  echo y > ./in_cwd\n}\n",
+            "testX",
         ) else {
             return;
         };
@@ -1913,8 +1913,8 @@ mod tests {
         assert!(!Path::new("/tmp/attest_writes_ok").exists());
 
         let Some(r) = run_inline(
-            "#attest(writes in {/tmp})\ntest_x() {\n  echo x > /attest_writes_marker\n  mkdir -p /var/attest_writes_dir/deep\n}\n",
-            "test_x",
+            "#attest(writes in {/tmp})\ntestX() {\n  echo x > /attest_writes_marker\n  mkdir -p /var/attest_writes_dir/deep\n}\n",
+            "testX",
         ) else {
             return;
         };
@@ -1987,21 +1987,21 @@ mod tests {
             return;
         }
         let tmp = TempDir::new().unwrap();
-        let tf = parse_script(tmp.path(), "test_escape() {\n  echo hi > marker\n}\n");
+        let tf = parse_script(tmp.path(), "testEscape() {\n  echo hi > marker\n}\n");
 
         let outside = tmp.path().join("outside");
         fs::create_dir(&outside).unwrap();
         fs::write(outside.join("precious"), "keep me").unwrap();
 
         let save_dir = tmp.path().join("save/inner");
-        let display = "test_escape/../../../outside";
+        let display = "testEscape/../../../outside";
         let config = RunConfig {
             parallel: 1,
             save_context: Some(save_dir.clone()),
             ..RunConfig::default()
         };
 
-        let results = run_all_tests(vec![spec(&tf, "test_escape", display)], &config).unwrap();
+        let results = run_all_tests(vec![spec(&tf, "testEscape", display)], &config).unwrap();
         assert!(results[0].outcome.passed());
         // The display name is untouched; only the directory derived from it is.
         assert_eq!(results[0].name, display);
@@ -2039,7 +2039,7 @@ mod tests {
             return;
         }
         let tmp = TempDir::new().unwrap();
-        let tf = parse_script(tmp.path(), "test_ok() {\n  true\n}\n");
+        let tf = parse_script(tmp.path(), "testOk() {\n  true\n}\n");
         let save_dir = tmp.path().join("a-file");
         fs::write(&save_dir, "").unwrap();
         let config = RunConfig {
@@ -2047,7 +2047,7 @@ mod tests {
             ..RunConfig::default()
         };
 
-        let err = run_all_tests(vec![spec(&tf, "test_ok", "test_ok")], &config)
+        let err = run_all_tests(vec![spec(&tf, "testOk", "testOk")], &config)
             .err()
             .expect("a save dir that is a file must fail the run")
             .to_string();
@@ -2106,7 +2106,7 @@ mod tests {
         let _waiter = ChildWaiter::new();
         assert!(sigchld_blocked(), "SIGCHLD was not blocked for the run");
         let Some(result) = run_inline(
-            r#"test_mask() {
+            r#"testMask() {
   blocked=
   while read -r key value rest; do
     if [ "$key" = SigBlk: ]; then blocked=$value; fi
@@ -2114,7 +2114,7 @@ mod tests {
   [ "$blocked" = 0000000000000000 ]
 }
 "#,
-            "test_mask",
+            "testMask",
         ) else {
             return;
         };
@@ -2145,9 +2145,9 @@ mod tests {
         shell
     }
 
-    /// A script defining `test_x` and asking to be run under `shell`.
+    /// A script defining `testX` and asking to be run under `shell`.
     fn script_with_shebang(shell: &Path) -> String {
-        format!("#!{}\ntest_x() {{\n  :\n}}\n", shell.display())
+        format!("#!{}\ntestX() {{\n  :\n}}\n", shell.display())
     }
 
     /// A spawn execs the shell its file was *parsed* with, rather than reading
@@ -2175,7 +2175,7 @@ mod tests {
 
         let ctx = private_temp_dir().unwrap();
         let mut pending = spawn_test(
-            &spec(&tf, "test_x", "test_x"),
+            &spec(&tf, "testX", "testX"),
             ctx.path().to_path_buf(),
             &RunConfig::default(),
             &env,
@@ -2226,9 +2226,9 @@ mod tests {
         let Some(r) = run_script(
             tmp.path(),
             &format!(
-                "{shebang}helper() {{\n  echo 42\n}}\ntest_x() {{\n  [ \"$(helper)\" = 42 ]\n}}\n"
+                "{shebang}helper() {{\n  echo 42\n}}\ntestX() {{\n  [ \"$(helper)\" = 42 ]\n}}\n"
             ),
-            "test_x",
+            "testX",
             &RunConfig::default(),
         ) else {
             return;
@@ -2243,8 +2243,8 @@ mod tests {
         // asking for no sourcing rather than `enable -n` quietly doing nothing.
         let sourcing = run_script(
             tmp.path(),
-            &format!("{shebang}test_dot() {{\n  . /dev/null\n}}\n"),
-            "test_dot",
+            &format!("{shebang}testDot() {{\n  . /dev/null\n}}\n"),
+            "testDot",
             &RunConfig::default(),
         )
         .unwrap();
@@ -2274,8 +2274,8 @@ mod tests {
 
         let Some(r) = run_script(
             tmp.path(),
-            &format!("#!{}\ntest_x() {{\n  :\n}}\n", shell.display()),
-            "test_x",
+            &format!("#!{}\ntestX() {{\n  :\n}}\n", shell.display()),
+            "testX",
             &RunConfig::default(),
         ) else {
             return;
@@ -2295,12 +2295,12 @@ mod tests {
     fn a_negated_command_that_fails_fails_the_test() {
         let tmp = TempDir::new().unwrap();
         let script = "\
-test_found() {
+testFound() {
   echo foo > f
   ! grep -q foo f
   echo unreachable
 }
-test_absent() {
+testAbsent() {
   echo foo > f
   ! grep -q bar f
   if ! grep -q foo f; then false; fi
@@ -2308,8 +2308,7 @@ test_absent() {
   { ! false; }
 }
 ";
-        let Some(found) = run_script(tmp.path(), script, "test_found", &RunConfig::default())
-        else {
+        let Some(found) = run_script(tmp.path(), script, "testFound", &RunConfig::default()) else {
             return;
         };
         assert_eq!(found.outcome, Outcome::Fail);
@@ -2321,7 +2320,7 @@ test_absent() {
         assert!(xtrace.trim_end().ends_with("+3: grep -q foo f"), "{xtrace}");
         assert!(!xtrace.contains("exit"), "{xtrace}");
 
-        let absent = run_script(tmp.path(), script, "test_absent", &RunConfig::default()).unwrap();
+        let absent = run_script(tmp.path(), script, "testAbsent", &RunConfig::default()).unwrap();
         assert_eq!(absent.outcome, Outcome::Pass);
     }
 
@@ -2332,13 +2331,13 @@ test_absent() {
     fn a_negated_command_reading_a_here_document_that_fails_fails_the_test() {
         let tmp = TempDir::new().unwrap();
         let script = "\
-test_found() {
+testFound() {
   ! grep -q foo <<EOF
 foo
 EOF
   echo unreachable
 }
-test_absent() {
+testAbsent() {
   ! grep -q bar <<EOF
 foo
 EOF
@@ -2347,8 +2346,7 @@ bar
 EOF
 }
 ";
-        let Some(found) = run_script(tmp.path(), script, "test_found", &RunConfig::default())
-        else {
+        let Some(found) = run_script(tmp.path(), script, "testFound", &RunConfig::default()) else {
             return;
         };
         assert_eq!(found.outcome, Outcome::Fail);
@@ -2357,7 +2355,7 @@ EOF
         let xtrace = fs::read_to_string(found.context.join("xtrace.log")).unwrap();
         assert!(xtrace.trim_end().ends_with("+2: grep -q foo"), "{xtrace}");
 
-        let absent = run_script(tmp.path(), script, "test_absent", &RunConfig::default()).unwrap();
+        let absent = run_script(tmp.path(), script, "testAbsent", &RunConfig::default()).unwrap();
         assert_eq!(absent.outcome, Outcome::Pass);
     }
 
@@ -2365,16 +2363,16 @@ EOF
     /// trace still indexes the source.
     #[test]
     fn the_runner_script_guards_each_negation_in_place() {
-        let functions = "test_x() {\n  ! a; ! b\n}\n";
+        let functions = "testX() {\n  ! a; ! b\n}\n";
         let negations = [
             functions.find("a;").unwrap() + 1,
             functions.find(" b").unwrap() + 2,
         ];
         let script =
-            build_runner_script("test_x", functions, &negations, Path::new("/ctx"), &[], &[]);
+            build_runner_script("testX", functions, &negations, Path::new("/ctx"), &[], &[]);
         assert!(
             script.starts_with(
-                "test_x() {\n  ! a || (exit 1) 2>/dev/null; ! b || (exit 1) 2>/dev/null\n}\n"
+                "testX() {\n  ! a || (exit 1) 2>/dev/null; ! b || (exit 1) 2>/dev/null\n}\n"
             ),
             "{script}"
         );
@@ -2389,9 +2387,9 @@ EOF
     /// failure is mapped back to the source with.
     #[test]
     fn the_runner_script_starts_at_the_definitions() {
-        let functions = "helper() {\n  :\n}\n\ntest_x() {\n  false\n}\n";
+        let functions = "helper() {\n  :\n}\n\ntestX() {\n  false\n}\n";
         let script = build_runner_script(
-            "test_x",
+            "testX",
             functions,
             &[],
             Path::new("/ctx"),
@@ -2413,7 +2411,7 @@ EOF
 
     #[test]
     fn execute_passing_test() {
-        let Some(r) = run_inline("test_pass() {\n  true\n}\n", "test_pass") else {
+        let Some(r) = run_inline("testPass() {\n  true\n}\n", "testPass") else {
             return;
         };
         assert_eq!(r.outcome, Outcome::Pass);
@@ -2423,7 +2421,7 @@ EOF
     fn execute_failing_test() {
         // A command that exits nonzero fails the test, and does so as a
         // failure rather than as a timeout.
-        let Some(r) = run_inline("test_fail() {\n  false\n}\n", "test_fail") else {
+        let Some(r) = run_inline("testFail() {\n  false\n}\n", "testFail") else {
             return;
         };
         assert_eq!(r.outcome, Outcome::Fail);
@@ -2432,8 +2430,8 @@ EOF
     #[test]
     fn execute_test_with_helper() {
         let Some(r) = run_inline(
-            "get_value() {\n  echo 42\n}\ntest_helper() {\n  val=$(get_value)\n  test \"$val\" = \"42\"\n}\n",
-            "test_helper",
+            "get_value() {\n  echo 42\n}\ntestHelper() {\n  val=$(get_value)\n  test \"$val\" = \"42\"\n}\n",
+            "testHelper",
         ) else {
             return;
         };
@@ -2443,8 +2441,8 @@ EOF
     #[test]
     fn test_starts_in_clean_cwd() {
         let Some(r) = run_inline(
-            "test_cwd() {\n  test -z \"$(ls -A .)\"\n  echo data > f.txt\n}\n",
-            "test_cwd",
+            "testCwd() {\n  test -z \"$(ls -A .)\"\n  echo data > f.txt\n}\n",
+            "testCwd",
         ) else {
             return;
         };
@@ -2454,10 +2452,8 @@ EOF
 
     #[test]
     fn background_process_killed_after_normal_exit() {
-        let Some(r) = run_inline(
-            "test_bg() {\n  sleep 300 &\n  echo $! > pid\n}\n",
-            "test_bg",
-        ) else {
+        let Some(r) = run_inline("testBg() {\n  sleep 300 &\n  echo $! > pid\n}\n", "testBg")
+        else {
             return;
         };
         assert!(r.outcome.passed());
@@ -2510,12 +2506,12 @@ EOF
         };
         let tf = parse_script(
             tmp.path(),
-            "test_bg() {\n  sleep 300 &\n  echo $! > pid\n}\n",
+            "testBg() {\n  sleep 300 &\n  echo $! > pid\n}\n",
         );
         let ctx = private_temp_dir().unwrap();
         let config = RunConfig::default();
         let mut pending = spawn_test(
-            &spec(&tf, "test_bg", "test_bg"),
+            &spec(&tf, "testBg", "testBg"),
             ctx.path().to_path_buf(),
             &config,
             &env,
@@ -2542,7 +2538,7 @@ EOF
 
     #[test]
     fn execute_test_stdout_captured() {
-        let Some(r) = run_inline("test_echo() {\n  echo captured_output\n}\n", "test_echo") else {
+        let Some(r) = run_inline("testEcho() {\n  echo captured_output\n}\n", "testEcho") else {
             return;
         };
         let stdout = fs::read_to_string(r.context.join("stdout.log")).unwrap();
@@ -2562,8 +2558,8 @@ EOF
         };
         let Some(result) = run_script(
             tmp.path(),
-            "test_override() {\n  true\n}\n",
-            "test_override",
+            "testOverride() {\n  true\n}\n",
+            "testOverride",
             &config,
         ) else {
             return;
@@ -2589,8 +2585,8 @@ EOF
         };
         let Some(result) = run_script(
             tmp.path(),
-            "test_bin_dir() {\n  out=$(mytool)\n  test \"$out\" = \"mytool_ran\"\n}\n",
-            "test_bin_dir",
+            "testBinDir() {\n  out=$(mytool)\n  test \"$out\" = \"mytool_ran\"\n}\n",
+            "testBinDir",
             &config,
         ) else {
             return;
@@ -2605,8 +2601,8 @@ EOF
         // The test sees the real root (reads /usr) but its write to a system path
         // must land in the ephemeral upper layer, not on the host filesystem.
         let Some(result) = run_inline(
-            "test_o() {\n  test -d /usr\n  echo made > /attest_root_marker.txt\n}\n",
-            "test_o",
+            "testO() {\n  test -d /usr\n  echo made > /attest_root_marker.txt\n}\n",
+            "testO",
         ) else {
             return; // overlays unavailable here
         };
@@ -2627,8 +2623,8 @@ EOF
         let marker = "attest_unit_tmp_marker";
         let _ = fs::remove_file(Path::new("/tmp").join(marker));
         let Some(result) = run_inline(
-            &format!("test_t() {{\n  echo made > /tmp/{marker}\n}}\n"),
-            "test_t",
+            &format!("testT() {{\n  echo made > /tmp/{marker}\n}}\n"),
+            "testT",
         ) else {
             return; // overlays unavailable here
         };
@@ -2727,17 +2723,17 @@ EOF
         let contexts = TempDir::new().unwrap();
         // Contexts are named after the test (sanitized; see context_dir_name)
         // and save_test_context reuses that name under the save dir.
-        let ctx = contexts.path().join("test_traced");
+        let ctx = contexts.path().join("testTraced");
         fs::create_dir_all(ctx.join("strace")).unwrap();
         fs::write(ctx.join("strace/ls.log"), "execve(\"/bin/ls\")\n").unwrap();
         fs::write(ctx.join("xtrace.log"), "+1: ls\n").unwrap();
 
-        let result = result_in(ctx, "test_traced");
+        let result = result_in(ctx, "testTraced");
 
         let save = TempDir::new().unwrap();
         save_test_context(&result, save.path(), &[]);
 
-        let saved = save.path().join("test_traced");
+        let saved = save.path().join("testTraced");
         assert_eq!(
             fs::read_to_string(saved.join("strace/ls.log")).unwrap(),
             "execve(\"/bin/ls\")\n"
@@ -2759,7 +2755,7 @@ EOF
         fs::write(&secret, "SECRET").unwrap();
 
         let contexts = TempDir::new().unwrap();
-        let ctx = contexts.path().join("test_leak");
+        let ctx = contexts.path().join("testLeak");
         fs::create_dir_all(&ctx).unwrap();
         for log in ["stdout.log", "xtrace.log"] {
             std::os::unix::fs::symlink(&secret, ctx.join(log)).unwrap();
@@ -2770,14 +2766,14 @@ EOF
         std::os::unix::fs::symlink(outside.path(), cwd_dir(&ctx)).unwrap();
         std::os::unix::fs::symlink(outside.path(), ctx.join("strace")).unwrap();
 
-        let result = result_in(ctx, "test_leak");
+        let result = result_in(ctx, "testLeak");
 
         let save = TempDir::new().unwrap();
         save_test_context(&result, save.path(), &[]);
 
         // Nothing read through a link: no copy of the secret anywhere, under
         // any of the names it was linked from.
-        let saved = save.path().join("test_leak");
+        let saved = save.path().join("testLeak");
         for name in ["stdout.log", "xtrace.log", "cwd/secret", "strace/secret"] {
             assert!(
                 !saved.join(name).exists(),
@@ -2796,7 +2792,7 @@ EOF
         // `open(2)` for good — after the FAIL line, with `^C` no help and the
         // context dirs it was still holding left behind in the temp dir.
         let contexts = TempDir::new().unwrap();
-        let ctx = contexts.path().join("test_wedge");
+        let ctx = contexts.path().join("testWedge");
         fs::create_dir_all(cwd_dir(&ctx)).unwrap();
         for log in ["stdout.log", "xtrace.log"] {
             use std::os::unix::ffi::OsStrExt;
@@ -2804,9 +2800,9 @@ EOF
             assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0);
         }
 
-        let mut result = result_in(ctx, "test_wedge");
+        let mut result = result_in(ctx, "testWedge");
         let srcdir = TempDir::new().unwrap();
-        let tf = parse_script(srcdir.path(), "test_wedge() {\n  false\n}\n");
+        let tf = parse_script(srcdir.path(), "testWedge() {\n  false\n}\n");
         result.file = Box::leak(Box::new(tf));
 
         // Every place a finished test's logs are read back, on a deadline: a
@@ -2829,8 +2825,8 @@ EOF
         );
 
         // Nothing was invented for a log that is no longer a file either.
-        assert!(!save.path().join("test_wedge/xtrace.log").exists());
-        assert!(!save.path().join("test_wedge/stdout.log").exists());
+        assert!(!save.path().join("testWedge/xtrace.log").exists());
+        assert!(!save.path().join("testWedge/stdout.log").exists());
     }
 
     #[test]
@@ -2846,7 +2842,7 @@ EOF
         fs::write(&log, b"+1: payload\xc2").unwrap();
 
         let mut tailed = Tailed {
-            name: "test_split".to_string(),
+            name: "testSplit".to_string(),
             file: overlay::open_nofollow(&log).unwrap(),
             offset: 0,
             interrupted: false,
@@ -2887,7 +2883,7 @@ EOF
         let other = TempDir::new().unwrap();
 
         let mut tailed = Some(Tailed {
-            name: "test_holder".to_string(),
+            name: "testHolder".to_string(),
             file: overlay::open_nofollow(&log).unwrap(),
             offset: 0,
             interrupted: false,
@@ -2895,7 +2891,7 @@ EOF
         let mut out = Vec::new();
         tailed.as_mut().unwrap().flush_into(&mut out, false);
 
-        finish_xtrace(&mut tailed, "test_other", other.path());
+        finish_xtrace(&mut tailed, "testOther", other.path());
         let holder = tailed.as_mut().expect("the holder keeps the tail");
         assert!(holder.interrupted, "another test's output went unnoticed");
 
@@ -2909,7 +2905,7 @@ EOF
         assert_eq!(out, b"+1: first\n+2: second\n");
 
         // The holder finishing releases the tail rather than dumping itself.
-        finish_xtrace(&mut tailed, "test_holder", tmp.path());
+        finish_xtrace(&mut tailed, "testHolder", tmp.path());
         assert!(tailed.is_none());
     }
 
@@ -2927,7 +2923,7 @@ EOF
         fs::create_dir(&victim_dir).unwrap();
 
         let contexts = TempDir::new().unwrap();
-        let ctx = contexts.path().join("test_evil");
+        let ctx = contexts.path().join("testEvil");
         let upper = overlay::upper_dir(&ctx);
         fs::create_dir_all(&upper).unwrap();
         // The delta of a test that ran `ln -s <host path> /stdout.log` etc.
@@ -2944,7 +2940,7 @@ EOF
         fs::create_dir_all(&sub_upper).unwrap();
         fs::write(sub_upper.join("scratch"), "submount artifact").unwrap();
 
-        let result = result_in(ctx, "test_evil");
+        let result = result_in(ctx, "testEvil");
         let submounts = [overlay::Submount {
             source: PathBuf::from("/var/tmp"),
             is_dir: true,
@@ -2963,7 +2959,7 @@ EOF
         );
 
         // ...and everything still landed inside it, as real files.
-        let saved = save.path().join("test_evil");
+        let saved = save.path().join("testEvil");
         assert_eq!(
             fs::read_to_string(saved.join("stdout.log")).unwrap(),
             "attacker controlled"
@@ -2989,7 +2985,7 @@ EOF
             return;
         }
         let tmp = TempDir::new().unwrap();
-        let tf = parse_script(tmp.path(), "test_a() {\n  true\n}\ntest_b() {\n  true\n}\n");
+        let tf = parse_script(tmp.path(), "testA() {\n  true\n}\ntestB() {\n  true\n}\n");
         let config = RunConfig {
             parallel: 1,
             ..RunConfig::default()
@@ -3006,10 +3002,10 @@ EOF
             return;
         }
         let tmp = TempDir::new().unwrap();
-        // test_fail comes first alphabetically, test_pass second
+        // testFail comes first alphabetically, testPass second
         let tf = parse_script(
             tmp.path(),
-            "test_fail() {\n  false\n}\ntest_pass() {\n  true\n}\n",
+            "testFail() {\n  false\n}\ntestPass() {\n  true\n}\n",
         );
         let config = RunConfig {
             parallel: 1,
@@ -3029,10 +3025,7 @@ EOF
             return;
         }
         let tmp = TempDir::new().unwrap();
-        let tf = parse_script(
-            tmp.path(),
-            "test_x() {\n  true\n}\ntest_y() {\n  false\n}\n",
-        );
+        let tf = parse_script(tmp.path(), "testX() {\n  true\n}\ntestY() {\n  false\n}\n");
         let config = RunConfig {
             parallel: 0,
             ..RunConfig::default()
@@ -3050,7 +3043,7 @@ EOF
             return;
         }
         let tmp = TempDir::new().unwrap();
-        let tf = parse_script(tmp.path(), "test_slow() {\n  sleep 60\n}\n");
+        let tf = parse_script(tmp.path(), "testSlow() {\n  sleep 60\n}\n");
         let config = RunConfig {
             parallel: 1,
             timeout: Some(std::time::Duration::from_millis(200)),
@@ -3231,8 +3224,8 @@ EOF
         // The failing command sits on source line 7 (1-based). With the
         // definitions at the head of the runner script, at the line numbers
         // they have in the file, the xtrace PS4 must report `+7:`.
-        let source = "helper() {\n  echo setup\n}\n\ntest_foo() {\n  echo a\n  false\n}\n";
-        let Some(r) = run_inline(source, "test_foo") else {
+        let source = "helper() {\n  echo setup\n}\n\ntestFoo() {\n  echo a\n  false\n}\n";
+        let Some(r) = run_inline(source, "testFoo") else {
             return;
         };
         assert!(!r.outcome.passed());
@@ -3257,8 +3250,8 @@ EOF
         // own error, which names line 4 and starts with the `$0` the runner
         // passed — the file's canonical path. This is the whole chain, from
         // a real shell to the line the snippet points at.
-        let source = "test_foo() {\n  set -u\n  echo before\n  echo \"$NOPE\"\n}\n";
-        let Some(r) = run_inline(source, "test_foo") else {
+        let source = "testFoo() {\n  set -u\n  echo before\n  echo \"$NOPE\"\n}\n";
+        let Some(r) = run_inline(source, "testFoo") else {
             return;
         };
         assert!(!r.outcome.passed());
