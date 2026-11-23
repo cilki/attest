@@ -416,6 +416,27 @@ impl PendingTest<'_> {
         self.kill_tree();
         self.child.wait().map(Some)
     }
+
+    /// Kill the test and mark it timed out if it has been running longer than
+    /// `timeout`.
+    ///
+    /// A test whose shell has already exited is left for [`Self::reap`]: it
+    /// finished, it just has not been noticed yet. The poll loop only gets
+    /// here between reports, and a report can take far longer than a tick —
+    /// replaying a failing test's 50MB of stderr does — so the clock alone
+    /// would turn every test that ended while it was busy into a `TIME`.
+    fn enforce_timeout(&mut self, timeout: Duration) {
+        if self.timed_out || self.start.elapsed() <= timeout {
+            return;
+        }
+        // An error here is not this check's to report: `reap` asks the same
+        // question next and fails the run on it.
+        if matches!(self.child.has_exited(), Ok(true)) {
+            return;
+        }
+        self.kill_tree();
+        self.timed_out = true;
+    }
 }
 
 impl Drop for PendingTest<'_> {
@@ -655,10 +676,7 @@ pub fn run_all_tests<'a>(
         // Kill any tests that have exceeded the wall-clock timeout.
         if let Some(timeout) = config.timeout {
             for pending in pending_list.iter_mut() {
-                if !pending.timed_out && pending.start.elapsed() > timeout {
-                    pending.kill_tree();
-                    pending.timed_out = true;
-                }
+                pending.enforce_timeout(timeout);
             }
         }
 
@@ -3060,6 +3078,41 @@ EOF
         let results = run_all_tests(test_refs(&tf), &config).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].outcome, Outcome::Timeout);
+    }
+
+    #[test]
+    fn timeout_spares_a_test_that_finished_before_it_was_noticed() {
+        // The poll loop checks the clock before it reaps, and it can be busy
+        // reporting for longer than the timeout. A test that exited in the
+        // meantime is over the clock by the time it is looked at, and must
+        // still come out as the pass it was.
+        let tmp = TempDir::new().unwrap();
+        let Some(env) = overlay_env(tmp.path()) else {
+            return;
+        };
+        let tf = parse_script(tmp.path(), "test_quick() {\n  true\n}\n");
+        let config = RunConfig::default();
+        let ctx = private_temp_dir().unwrap();
+        let mut pending = spawn_test(
+            &spec(&tf, "test_quick", "test_quick"),
+            ctx.path().to_path_buf(),
+            &config,
+            &env,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !pending.child.has_exited().unwrap() {
+            assert!(Instant::now() < deadline, "test never exited");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+
+        pending.enforce_timeout(Duration::from_millis(1));
+        assert!(!pending.timed_out);
+
+        let status = pending.reap().unwrap().expect("exited above");
+        let result = build_result(pending, status, &config, &env);
+        assert_eq!(result.outcome, Outcome::Pass);
     }
 
     /// Wait (up to `secs`) for `pid` to reach process state `want`.
