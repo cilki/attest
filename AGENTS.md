@@ -21,7 +21,10 @@
   user named directly is
   fatal, while one in a file the directory walk turned up is reported on stderr
   and the file skipped, so an unparseable script elsewhere in the tree cannot
-  abort the run. A file that spells no test function is never parsed at all,
+  abort the run. A malformed `#attest(...)` block (`parser::DecoratorError`)
+  is fatal wherever the file came from: it is attest's own syntax, so the
+  file is a test file, and skipping it would pass a run in which none of its
+  tests ran. A file that spells no test function is never parsed at all,
   so it is never reported either — named or walked, it holds no test and that
   is the answer the run gives, and a `--filter` narrows that the same way:
   `Selection::resolve` builds the pattern before discovery, drops the files

@@ -267,7 +267,10 @@ fn split_path_arg(arg: &str) -> (PathBuf, Option<String>) {
 /// which were never meant to hold tests, so one script the parser cannot
 /// handle — zsh-only syntax, a generated or templated file, a genuine syntax
 /// error in something unrelated — must not abort a run it contributes no tests
-/// to. Those are reported on stderr and skipped.
+/// to. Those are reported on stderr and skipped. A malformed `#attest(...)`
+/// block is fatal either way ([`parser::DecoratorError`]): that file was
+/// written for attest, and skipping it would pass a run none of its tests ran
+/// in.
 fn parse_discovered(
     files: Vec<PathBuf>,
     explicit_file: bool,
@@ -282,6 +285,11 @@ fn parse_discovered(
         match result {
             Ok(test_file) => parsed.push(test_file),
             Err(e) if explicit_file => return Err(e),
+            // A malformed `#attest(...)` block is not one of those scripts:
+            // nobody writes attest's syntax into a file they do not mean as a
+            // test file, and skipping it would leave every test in it unrun
+            // under a run that still passes.
+            Err(e) if e.is::<parser::DecoratorError>() => return Err(e),
             // Printed directly rather than logged: dropping a file changes
             // what the run covers, so it must show up whatever the log level
             // happens to be. Escaped because the message carries the path the
@@ -875,6 +883,42 @@ mod tests {
             panic!("a file the user named must not be skipped silently");
         };
         assert!(err.to_string().starts_with("parse error in "), "{err}");
+    }
+
+    /// A shell syntax error in a walked file is skipped, but a malformed
+    /// decorator is not: the file is unmistakably a test file, and dropping it
+    /// would let the run pass with none of its tests having run.
+    #[test]
+    fn parse_discovered_is_fatal_for_a_malformed_decorator_found_by_a_walk() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let good = script(tmp.path(), "good.test", GOOD);
+        for (name, body) in [
+            // The block itself does not parse: a duration with no unit.
+            (
+                "unit.test",
+                "#!/bin/bash\n# attest(cpu < 10)\ntestA() {\n  true\n}\n",
+            ),
+            // The block parses but decorates nothing.
+            (
+                "orphan.test",
+                "#!/bin/bash\ntestA() {\n  true\n}\n# attest(cpu < 1s)\n",
+            ),
+        ] {
+            let bad = script(tmp.path(), name, body);
+            let Err(err) = parse_discovered(
+                vec![good.clone(), bad],
+                false,
+                Cores::One,
+                &parser::Prescan::default(),
+            ) else {
+                panic!("{name}: a malformed decorator must not be skipped");
+            };
+            let message = err.to_string();
+            assert!(
+                message.starts_with("parse error in ") && message.contains(name),
+                "{message}"
+            );
+        }
     }
 
     /// Spreading the parse over the cores may change how long it takes and

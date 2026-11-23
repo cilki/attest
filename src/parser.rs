@@ -425,6 +425,31 @@ fn is_name_byte(b: u8) -> bool {
         )
 }
 
+/// A malformed `#attest(...)` block in the file at `path`.
+///
+/// Its own type, where a shell syntax error is only a message, because the
+/// two are not equally likely to be somebody else's file: a script the
+/// parser cannot read may be zsh, or generated, or unrelated to the tests,
+/// but `#attest(` is attest's own syntax, written above a function by
+/// someone who meant it to be a test. So a directory walk skips the first
+/// and stops at this one (see `parse_discovered` in `main.rs`): skipped, the
+/// file's tests would all go unrun behind a green run, which is a worse
+/// outcome than the unchecked assertion that makes a malformed block an
+/// error in the first place.
+#[derive(Debug)]
+pub struct DecoratorError {
+    path: PathBuf,
+    error: decorator::Error,
+}
+
+impl std::fmt::Display for DecoratorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "parse error in {}: {}", self.path.display(), self.error)
+    }
+}
+
+impl std::error::Error for DecoratorError {}
+
 /// Parse `path` for the tests `scan` can select out of it.
 ///
 /// `scan` decides only whether the parse happens at all, never what it finds:
@@ -456,7 +481,11 @@ pub fn parse_test_file(path: &Path, scan: &Prescan) -> anyhow::Result<TestFile> 
     // multi-line block whose continuation lines lack their `#`, is a shell
     // syntax error too, and "`#attest(` is not closed" names it better than
     // "syntax error at line 3" does.
-    let blocks = decorator::scan(&contents).map_err(|e| parse_error(&e))?;
+    let decorator_error = |error| DecoratorError {
+        path: path.to_path_buf(),
+        error,
+    };
+    let blocks = decorator::scan(&contents).map_err(decorator_error)?;
 
     let functions = parse_functions(&contents).map_err(|e| parse_error(&e))?;
 
@@ -470,7 +499,7 @@ pub fn parse_test_file(path: &Path, scan: &Prescan) -> anyhow::Result<TestFile> 
 
     let mut keep = HashSet::new();
     let decorators =
-        attach_decorators(blocks, &starts, &contents, &mut keep).map_err(|e| parse_error(&e))?;
+        attach_decorators(blocks, &starts, &contents, &mut keep).map_err(decorator_error)?;
 
     // A shell function defined more than once in the same file is shadowed:
     // when the runner defines them all and calls the name, only the last

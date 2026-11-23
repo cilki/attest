@@ -230,10 +230,12 @@ beneath the snippet.
 A decorator that isn't directly above a test function (a blank line between
 the two, or a helper underneath it), a condition that doesn't parse, or a
 `#attest(` whose continuation lines lack their `#` (the shell would read them
-as code) is a parse error of the file, reported like any other: fatal when
-the file was named on the command line, a warning that skips the file when a
-directory walk found it. An assertion that is written down and silently never
-checked would be worse. Note that exactly one `#` opens a block — `## attest(…)`
+as code) is a parse error of the file, and it is fatal whether the file was
+named on the command line or turned up in a directory walk. A walk skips only
+scripts whose shell it can't parse, since those may not be test files at all
+(see [Running tests](#running-tests)). `#attest(` shows that the file is a test file, and
+skipping it would leave a green run in which none of its tests ran. An
+assertion that is written down and silently never checked would be worse. Note that exactly one `#` opens a block — `## attest(…)`
 is a doc comment, whatever it goes on to say.
 
 #### Generating and updating decorators
@@ -512,7 +514,8 @@ therefore costs about what running that one file costs.
 Not every script in a tree is shell `attest` can parse — zsh-only syntax, a
 generated or templated file, or just a script with a syntax error in it. Those
 are reported on stderr and skipped, so one unrelated file can't take down a run
-it has no tests in. Point `attest` straight at such a file, though, and the
+it has no tests in. A malformed `#attest(...)` block is the exception: it is
+attest's own syntax, so the file is a test file, and the error is fatal. Point `attest` straight at such a file, though, and the
 parse error is fatal: you asked for that file specifically — unless it spells
 no test function at all, in which case it is never parsed, and the answer is
 that it holds no tests. A `--filter` that excludes the file has the same
