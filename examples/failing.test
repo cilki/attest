@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 
-testWhoami() {
+TestWhoami() {
 	whoami
 }
 
-testWhoamiFailing() {
+TestWhoamiFailing() {
 	whoami 1
 }

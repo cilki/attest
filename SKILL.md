@@ -14,7 +14,7 @@ methods. Do NOT use syntax from other test frameworks (no `assert_eq`, no
 
 ## Test functions
 
-- Test functions MUST be prefixed with `test` (e.g., `testFoo`, `testVersion`)
+- Test functions MUST be named starting with `Test`, capital T (e.g., `TestFoo`, `TestVersion`); `testFoo` or `test_foo` is a helper, not a test
 - Every command in a test function is an implicit assertion: if it exits
   nonzero, the test fails immediately (`set -e` semantics)
 - Only function definitions are used: attest extracts the functions out of the
@@ -51,11 +51,11 @@ who_sanity_check() {
 	grep '.'
 }
 
-testBasic() {
+TestBasic() {
 	who | who_sanity_check
 }
 
-testHeading() {
+TestHeading() {
 	who --heading | who_sanity_check
 }
 ```
@@ -111,7 +111,7 @@ everything the test spawned when it ends, and the test's working directory and
 filesystem writes are discarded automatically.
 
 ```sh
-testWithBackgroundServer() {
+TestWithBackgroundServer() {
 	background_server &
 
 	# ... test logic ...
@@ -125,7 +125,7 @@ setup() {
 	echo "hello" > input.txt
 }
 
-testReadInput() {
+TestReadInput() {
 	setup
 	result=$(cat input.txt)
 	[ "$result" = "hello" ]
@@ -146,7 +146,7 @@ testReadInput() {
   Always feed input explicitly
 
 ```sh
-testStdinInput() {
+TestStdinInput() {
 	printf 'a\nb\n' > input.txt
 
 	# Feed the command from a file or a pipe, never from the test's own stdin
@@ -159,16 +159,16 @@ testStdinInput() {
 ```sh
 #!/usr/bin/env bash
 
-testHelp() {
+TestHelp() {
 	md5sum --help
 }
 
-testVersion() {
+TestVersion() {
 	md5sum --version
 }
 
 ## Test known input/output
-testHello() {
+TestHello() {
 	result=$(echo hello | md5sum)
 
 	[ "${result}" = "b1946ac92492d2347c6235b4d2611184  -" ]
@@ -177,7 +177,7 @@ testHello() {
 
 ## Style guidelines
 
-- Prefer `camelCase` for function names (`testMyFeature`), but underscores are
+- Prefer `camelCase` for function names (`TestMyFeature`), but underscores are
   OK too
 - Use tabs for indentation
 - Group related tests in the same `.test` file

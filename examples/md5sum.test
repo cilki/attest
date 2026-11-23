@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 #attest(2ms < cpu < 10ms)
-testHelp() {
+TestHelp() {
 	md5sum --help
 }
 
@@ -9,13 +9,13 @@ testHelp() {
 #   wall < 1s,
 #   pids <= 3,
 # )
-testVersion() {
+TestVersion() {
 	md5sum --version
 }
 
 ## Known input, known output.
 # attest(mem < 20MiB)
-testHello() {
+TestHello() {
 	result=$(echo hello | md5sum)
 
 	[ "${result}" = "b1946ac92492d2347c6235b4d2611184  -" ]

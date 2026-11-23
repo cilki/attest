@@ -4,7 +4,7 @@
 ## tree, md5sum included, and on the shell's own startup — which makes no
 ## sockets either.
 # attest(syscalls not in {socket, connect})
-testOffline() {
+TestOffline() {
 	echo hello | md5sum
 }
 
@@ -12,7 +12,7 @@ testOffline() {
 ## under /tmp is admitted, and nothing else was written anywhere. (The
 ## working directory is not part of the delta, so writes there never count.)
 # attest(writes in {/tmp})
-testScratchOnly() {
+TestScratchOnly() {
 	echo scratch > /tmp/attest-sandbox-example
 	[ -f /tmp/attest-sandbox-example ]
 }
@@ -20,7 +20,7 @@ testScratchOnly() {
 ## A path spelled `./x` is relative to the directory attest was invoked
 ## from — run this one from the repository root. `$0` is the test file.
 # attest(writes in {./examples/build})
-testBuildDir() {
+TestBuildDir() {
 	mkdir -p "$(dirname "$0")/build"
 	echo artifact > "$(dirname "$0")/build/out"
 }

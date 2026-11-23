@@ -244,7 +244,7 @@ pub(crate) fn selector(file: &Path, name: &str) -> String {
 /// Both halves of a [`TestPattern`] narrow the candidates without a parse: the
 /// file half is a path suffix, and the name half says what the name of the
 /// definition in the text has to start with, which is the same question the
-/// bare `test…` scan already answers.
+/// bare `Test…` scan already answers.
 ///
 /// It may only ever err towards the parse, exactly as that scan may: a file it
 /// admits but that holds nothing selectable costs a parse that would have
@@ -252,7 +252,7 @@ pub(crate) fn selector(file: &Path, name: &str) -> String {
 /// rejection is that nothing is reported about the file either — an
 /// unparseable script the filter excludes is no longer named on stderr, and
 /// neither is a test such a file defines twice. That is the bargain the
-/// `test…` scan already makes: a file no selected test can come out of is a
+/// `Test…` scan already makes: a file no selected test can come out of is a
 /// file the run has nothing to say about.
 pub struct Prescan {
     /// The pattern's file half: the file's path must end with it (whole
@@ -261,7 +261,7 @@ pub struct Prescan {
     /// The literal prefix a definition's name has to start with for this
     /// selection to be able to pick it.
     ///
-    /// `None` when the filter's name half and the `test…` rule exclude one
+    /// `None` when the filter's name half and the `Test…` rule exclude one
     /// another (`--filter overlay`): no name satisfies both, so no file in the
     /// tree is worth parsing.
     name_prefix: Option<String>,
@@ -269,7 +269,7 @@ pub struct Prescan {
 
 impl Default for Prescan {
     /// Unconstrained — every test in every file is selectable, which is what
-    /// `list` without a filter and shell completion ask for. The `test…` rule
+    /// `list` without a filter and shell completion ask for. The `Test…` rule
     /// still applies: it is a property of what a test *is*, not of the
     /// selection.
     fn default() -> Self {
@@ -290,14 +290,10 @@ impl Prescan {
             .name
             .as_deref()
             .map_or("", |n| n.split('*').next().unwrap_or(""));
-        // That prefix and `test` are both prefixes of the same name, so one
+        // That prefix and `Test` are both prefixes of the same name, so one
         // has to contain the other and the longer of the two is the whole
-        // constraint. If neither extends the other, no name can carry both —
-        // nor can it when the literal runs past `test` without the capital a
-        // test name has there (`--filter test_`).
-        let name_prefix = if literal.len() > TEST_PREFIX.len() && literal.starts_with(TEST_PREFIX) {
-            is_test_name(literal).then(|| literal.to_string())
-        } else if literal.starts_with(TEST_PREFIX) {
+        // constraint. If neither extends the other, no name can carry both.
+        let name_prefix = if literal.starts_with(TEST_PREFIX) {
             Some(literal.to_string())
         } else if TEST_PREFIX.starts_with(literal) {
             Some(TEST_PREFIX.to_string())
@@ -336,7 +332,7 @@ impl Prescan {
     /// there. Hence the deliberate crudeness — the name bytes are "not a
     /// blank, not a metacharacter", the word head is "not preceded by a name
     /// byte", and anything may sit between the name and its brace. A name the
-    /// shell only spells `test…` after quote removal (`te'st'_foo`) is not a
+    /// shell only spells `Test…` after quote removal (`Te'st'Foo`) is not a
     /// false negative: brush keeps the quotes in the name, so such a function
     /// is not a test today either.
     fn may_define(&self, source: &str) -> bool {
@@ -347,11 +343,6 @@ impl Prescan {
         for (i, _) in source.match_indices(prefix) {
             // The tail of a longer word, as in `latest_release() {`.
             if i > 0 && is_name_byte(b[i - 1]) {
-                continue;
-            }
-            // `testing() {` — a helper, not a test. The prefix already starts
-            // with `test`, so this only looks at the character after it.
-            if !is_test_name(&source[i..]) {
                 continue;
             }
             let mut j = i + prefix.len();
@@ -402,22 +393,20 @@ fn parse_functions(source: &str) -> anyhow::Result<Vec<FunctionDefinition>> {
     Ok(extract_functions(&program))
 }
 
-/// What a function's name has to start with for it to be a test — followed by
-/// a capital letter (see [`is_test_name`]).
-const TEST_PREFIX: &str = "test";
+/// What a function's name has to start with for it to be a test: `Test`,
+/// capital and all (see [`is_test_name`]).
+const TEST_PREFIX: &str = "Test";
 
 /// Is a function called `name` a test?
 ///
-/// `test` and then a capital letter: `testHello`, `testX`. The capital is what
-/// tells a test from a helper that merely begins with the same four letters —
-/// `testing()`, `tests_setup()`, `test_fixture()`, or plain `test()`, which
-/// would shadow the builtin — none of which the run should call on its own.
-/// One rule, shared by the scan that decides whether a file is worth parsing,
-/// the walk over what the parse found, and the decorator check.
+/// Its name starts with `Test`, literally: `TestHello`, `TestX`. The case is
+/// what tells a test from a helper — `testing()`, `test_fixture()`, or plain
+/// `test()`, which would shadow the builtin — none of which the run should
+/// call on its own. One rule, shared by the scan that decides whether a file
+/// is worth parsing (through [`TEST_PREFIX`]), the walk over what the parse
+/// found, and the decorator check.
 fn is_test_name(name: &str) -> bool {
-    name.strip_prefix(TEST_PREFIX)
-        .and_then(|rest| rest.chars().next())
-        .is_some_and(char::is_uppercase)
+    name.starts_with(TEST_PREFIX)
 }
 
 /// Is `b` a byte a function name can be spelled with?
@@ -590,7 +579,7 @@ fn attach_decorators(
             return Err(decorator::Error {
                 line: block.first_line,
                 message: format!(
-                    "`#attest(...)` decorates `{name}`, which is not a test (its name is not `test` followed by a capital letter)"
+                    "`#attest(...)` decorates `{name}`, which is not a test (its name does not start with `Test`)"
                 ),
             });
         }
@@ -1099,7 +1088,7 @@ mod tests {
     fn functions_source_preserves_line_numbers() {
         // A helper, a blank line, then a test: every function line must land on
         // the same line number it has in the source, with the gaps blanked.
-        let source = "helper() {\n  echo setup\n}\n\ntestFoo() {\n  echo a\n  false\n}\n";
+        let source = "helper() {\n  echo setup\n}\n\nTestFoo() {\n  echo a\n  false\n}\n";
         let tmp = TempDir::new().unwrap();
         let path = write_script(tmp.path(), "lines.test", source);
 
@@ -1127,8 +1116,8 @@ mod tests {
     #[test]
     fn enclosing_bounds_finds_containing_function() {
         // 0-based lines: 0            1              2   3  4              5            6       7
-        let source = "helper() {\n  echo setup\n}\n\ntestFoo() {\n  echo hello\n  false\n}\n";
-        // Line 6 (`false`) is inside testFoo (lines 4..=7).
+        let source = "helper() {\n  echo setup\n}\n\nTestFoo() {\n  echo hello\n  false\n}\n";
+        // Line 6 (`false`) is inside TestFoo (lines 4..=7).
         assert_eq!(enclosing_function_bounds(source, 6), Some((4, 7)));
         // Line 1 (`echo setup`) is inside helper (lines 0..=2).
         assert_eq!(enclosing_function_bounds(source, 1), Some((0, 2)));
@@ -1139,7 +1128,7 @@ mod tests {
     #[test]
     fn enclosing_bounds_handles_brace_on_next_line() {
         assert_eq!(
-            enclosing_function_bounds("testFoo ()\n{\n  false\n}\n", 2),
+            enclosing_function_bounds("TestFoo ()\n{\n  false\n}\n", 2),
             Some((0, 3))
         );
     }
@@ -1149,7 +1138,7 @@ mod tests {
         // Braces that are part of a string, a parameter expansion or a comment
         // are not block delimiters; a line-by-line brace count would close the
         // function early and lose the context window around the failing line.
-        let source = "testFoo() {\n  echo \"}\"\n  echo \"${x}\"\n  # }\n  false\n}\n";
+        let source = "TestFoo() {\n  echo \"}\"\n  echo \"${x}\"\n  # }\n  false\n}\n";
         assert_eq!(enclosing_function_bounds(source, 4), Some((0, 5)));
     }
 
@@ -1157,7 +1146,7 @@ mod tests {
     fn enclosing_bounds_ignores_non_function_blocks() {
         // A subshell or a brace group at top level is not a function, so a
         // failure inside one gets no function clamp.
-        let source = "(\n  false\n)\n\ntestFoo() {\n  false\n}\n";
+        let source = "(\n  false\n)\n\nTestFoo() {\n  false\n}\n";
         assert_eq!(enclosing_function_bounds(source, 1), None);
         assert_eq!(enclosing_function_bounds(source, 5), Some((4, 6)));
     }
@@ -1170,18 +1159,18 @@ mod tests {
 
     #[test]
     fn headers_are_the_lines_in_front_of_a_body() {
-        // 0-based: `testA() {` on 0, the brace-on-its-own-line `testB` on 3
+        // 0-based: `TestA() {` on 0, the brace-on-its-own-line `TestB` on 3
         // and 4, a subshell body on 8. The body lines are not headers, nor is
         // the line of a one-line function, whose header is also its body.
-        let source = "testA() {\n  true\n}\ntestB()\n{\n  if true; then :; fi\n}\n\
-                      testC() { false; }\ntestD() (\n  cd /\n)\n";
+        let source = "TestA() {\n  true\n}\nTestB()\n{\n  if true; then :; fi\n}\n\
+                      TestC() { false; }\nTestD() (\n  cd /\n)\n";
         assert_eq!(headers_of(source), [0, 3, 4, 8]);
     }
 
     #[test]
     fn running_function_skips_headers() {
         let tmp = TempDir::new().unwrap();
-        let path = write_script(tmp.path(), "r.test", "testA() {\n  false\n}\n");
+        let path = write_script(tmp.path(), "r.test", "TestA() {\n  false\n}\n");
         let tf = parse_test_file(&path, &Prescan::default()).unwrap();
         assert_eq!(tf.enclosing_function(0), Some((0, 2)));
         assert_eq!(tf.running_function(0), None);
@@ -1206,7 +1195,7 @@ mod tests {
     #[test]
     fn negations_end_each_negated_statement() {
         let source = "\
-testX() {
+TestX() {
   ! grep -q x f # a comment
   é; ! a | b; ! c
   ! e \\
@@ -1242,7 +1231,7 @@ testX() {
         // A condition has `set -e` off, an and-or list is judged by its last
         // pipeline, a background job by nobody.
         let source = "\
-testX() {
+TestX() {
   if ! a; then :; fi
   while ! b; do :; done
   until ! c; do :; done
@@ -1261,7 +1250,7 @@ testX() {
     #[test]
     fn negations_with_a_here_document_end_at_their_last_word() {
         let source = "\
-testX() {
+TestX() {
   ! grep x <<EOF
 <<x
 EOF
@@ -1297,7 +1286,7 @@ B
     #[test]
     fn negations_with_a_here_document_and_no_known_end_are_left_alone() {
         let source = "\
-testX() {
+TestX() {
   ! { cat <<EOF; }
 x
 EOF
@@ -1316,7 +1305,7 @@ EOF
         // every function is re-rendered from the AST. Line alignment is lost
         // (and with it the diagnostic snippet), but the script must still be
         // valid shell that defines and runs each function.
-        let source = "helper() {\n  echo 42\n}\n\ntestFoo() {\n  test \"$(helper)\" = 42\n}\n";
+        let source = "helper() {\n  echo 42\n}\n\nTestFoo() {\n  test \"$(helper)\" = 42\n}\n";
         let functions = parse_functions(source).unwrap();
 
         let TestFile {
@@ -1325,7 +1314,7 @@ EOF
             ..
         } = build_functions_source(&functions, "", &HashSet::new());
         // Even so, where each function landed is known exactly: the two are
-        // re-rendered back to back, `helper` as three lines and `testFoo` as
+        // re-rendered back to back, `helper` as three lines and `TestFoo` as
         // the three after it.
         assert_eq!(bounds.len(), 2, "{generated}");
         assert_eq!(bounds[0].0, 0);
@@ -1335,7 +1324,7 @@ EOF
         let script = write_script(tmp.path(), "fallback.sh", &generated);
 
         let status = std::process::Command::new("/bin/sh")
-            .args(["-c", &format!(". '{}'\ntestFoo\n", script.display())])
+            .args(["-c", &format!(". '{}'\nTestFoo\n", script.display())])
             .status()
             .unwrap();
         assert!(status.success(), "generated script failed:\n{generated}");
@@ -1344,11 +1333,11 @@ EOF
     #[test]
     fn parse_file_with_test_functions() {
         let tmp = TempDir::new().unwrap();
-        let source = "testHello() {\n  echo hello\n}\n\ntestWorld() {\n  echo world\n}\n";
+        let source = "TestHello() {\n  echo hello\n}\n\nTestWorld() {\n  echo world\n}\n";
         let path = write_script(tmp.path(), "example.test", source);
 
         let result = parse_test_file(&path, &Prescan::default()).unwrap();
-        assert_eq!(result.tests, ["testHello", "testWorld"]);
+        assert_eq!(result.tests, ["TestHello", "TestWorld"]);
         // Nothing but function definitions here, so the script the runner
         // sources is the file itself, line for line.
         assert_eq!(result.script, source);
@@ -1357,11 +1346,11 @@ EOF
     #[test]
     fn parse_file_with_helpers_and_tests() {
         let tmp = TempDir::new().unwrap();
-        let source = "setup() {\n  mkdir -p /tmp/test\n}\n\ntestFoo() {\n  setup\n  echo foo\n}\n";
+        let source = "setup() {\n  mkdir -p /tmp/test\n}\n\nTestFoo() {\n  setup\n  echo foo\n}\n";
         let path = write_script(tmp.path(), "example.test", source);
 
         let result = parse_test_file(&path, &Prescan::default()).unwrap();
-        assert_eq!(result.tests, ["testFoo"]);
+        assert_eq!(result.tests, ["TestFoo"]);
         // The helper is not a test but is still defined for the tests to call.
         assert_eq!(result.script, source);
     }
@@ -1396,26 +1385,27 @@ EOF
     #[test]
     fn the_scan_keeps_every_test_the_parser_would_find() {
         let spellings = [
-            ("testPlain() {\n  true\n}\n", "testPlain"),
-            ("testSpaced ( ) {\n  true\n}\n", "testSpaced"),
-            ("function testKeyword {\n  true\n}\n", "testKeyword"),
-            ("function testBoth() {\n  true\n}\n", "testBoth"),
+            ("TestPlain() {\n  true\n}\n", "TestPlain"),
+            ("TestSpaced ( ) {\n  true\n}\n", "TestSpaced"),
+            ("function TestKeyword {\n  true\n}\n", "TestKeyword"),
+            ("function TestBoth() {\n  true\n}\n", "TestBoth"),
             // The brace on the line after the name.
-            ("function testNextline\n{\n  true\n}\n", "testNextline"),
+            ("function TestNextline\n{\n  true\n}\n", "TestNextline"),
             // A subshell body instead of a brace group.
-            ("testSubshell() (\n  true\n)\n", "testSubshell"),
+            ("TestSubshell() (\n  true\n)\n", "TestSubshell"),
             // Shells take far more than `[A-Za-z0-9_]` in a function name.
-            ("testDash-x() {\n  true\n}\n", "testDash-x"),
-            ("testDot.x() {\n  true\n}\n", "testDot.x"),
-            // The capital need not be ASCII.
-            ("testÉclair() {\n  true\n}\n", "testÉclair"),
+            ("TestDash-x() {\n  true\n}\n", "TestDash-x"),
+            ("TestDot.x() {\n  true\n}\n", "TestDot.x"),
+            // Nothing is asked of what follows the prefix.
+            ("TestÉclair() {\n  true\n}\n", "TestÉclair"),
+            ("Test_snake() {\n  true\n}\n", "Test_snake"),
             // Indented, and after another command on the same line.
-            ("  testIndented() {\n  true\n}\n", "testIndented"),
-            ("true; testAfter() {\n  true\n}\n", "testAfter"),
+            ("  TestIndented() {\n  true\n}\n", "TestIndented"),
+            ("true; TestAfter() {\n  true\n}\n", "TestAfter"),
             // Nested inside a compound command.
             (
-                "if true; then\n  testNested() {\n    true\n  }\nfi\n",
-                "testNested",
+                "if true; then\n  TestNested() {\n    true\n  }\nfi\n",
+                "TestNested",
             ),
         ];
 
@@ -1445,15 +1435,16 @@ EOF
             "my_test() {\n  true\n}\n",
             "contest=1\n",
             "# the tests live in t/\n",
-            // `test` without the capital after it is a helper's name.
+            // A lowercase `test` is a helper's name, whatever follows it.
             "testing() {\n  true\n}\n",
             "test_helper() {\n  true\n}\n",
+            "testFoo() {\n  true\n}\n",
             "test() {\n  true\n}\n",
             "test2() {\n  true\n}\n",
-            // Quoting that only spells `test…` after the shell removes it is
+            // Quoting that only spells `Test…` after the shell removes it is
             // not a test today either: brush keeps the quotes in the name, so
             // the scan and the parser agree about it.
-            "te'st'_quoted() {\n  true\n}\n",
+            "Te'st'Quoted() {\n  true\n}\n",
         ] {
             assert!(
                 !Prescan::default().may_define(source),
@@ -1475,7 +1466,7 @@ EOF
     /// tree and a longer one narrows it.
     #[test]
     fn the_prescan_admits_exactly_the_files_the_filter_names() {
-        let scan = Prescan::of(&TestPattern::parse("tests/foo.sh/testX"));
+        let scan = Prescan::of(&TestPattern::parse("tests/foo.sh/TestX"));
         assert!(scan.admits(Path::new("/repo/tests/foo.sh")));
         // Same name, wrong directory; and the right directory is matched by
         // whole components, not by a string suffix.
@@ -1486,7 +1477,7 @@ EOF
         // No file half, so the path constrains nothing — every file is a
         // candidate, which is also what no filter at all means.
         for scan in [
-            Prescan::of(&TestPattern::parse("testX")),
+            Prescan::of(&TestPattern::parse("TestX")),
             Prescan::default(),
         ] {
             assert!(scan.admits(Path::new("/repo/tests/foo.sh")));
@@ -1499,49 +1490,49 @@ EOF
     /// spells no such name holds nothing the filter can select.
     #[test]
     fn the_prescan_reads_the_filter_as_a_name_prefix() {
-        let scan = Prescan::of(&TestPattern::parse("testAlpha"));
-        assert!(scan.may_define("testAlpha() {\n  true\n}\n"));
+        let scan = Prescan::of(&TestPattern::parse("TestAlpha"));
+        assert!(scan.may_define("TestAlpha() {\n  true\n}\n"));
         // A longer name still starts with the pattern, since a pattern
         // without a `*` matches as a prefix.
-        assert!(scan.may_define("testAlphaAndMore() {\n  true\n}\n"));
+        assert!(scan.may_define("TestAlphaAndMore() {\n  true\n}\n"));
         // A test, but not one this filter can ever pick.
-        assert!(!scan.may_define("testBeta() {\n  true\n}\n"));
+        assert!(!scan.may_define("TestBeta() {\n  true\n}\n"));
 
         // Everything in front of the first `*` is literal; the rest cannot
         // narrow the prefix.
-        let scan = Prescan::of(&TestPattern::parse("testAl*ha"));
-        assert!(scan.may_define("testAlpha() {\n  true\n}\n"));
-        assert!(!scan.may_define("testBeta() {\n  true\n}\n"));
+        let scan = Prescan::of(&TestPattern::parse("TestAl*ha"));
+        assert!(scan.may_define("TestAlpha() {\n  true\n}\n"));
+        assert!(!scan.may_define("TestBeta() {\n  true\n}\n"));
 
-        // A name half shorter than `test` leaves the `test…` rule in charge:
+        // A name half shorter than `Test` leaves the `Test…` rule in charge:
         // it is the stronger of the two constraints.
-        let scan = Prescan::of(&TestPattern::parse("te"));
-        assert!(scan.may_define("testAlpha() {\n  true\n}\n"));
-        assert!(!scan.may_define("telescope() {\n  true\n}\n"));
+        let scan = Prescan::of(&TestPattern::parse("Te"));
+        assert!(scan.may_define("TestAlpha() {\n  true\n}\n"));
+        assert!(!scan.may_define("Telescope() {\n  true\n}\n"));
 
         // A file-only filter constrains no name at all.
         let scan = Prescan::of(&TestPattern::parse("foo.sh/"));
-        assert!(scan.may_define("testAnything() {\n  true\n}\n"));
+        assert!(scan.may_define("TestAnything() {\n  true\n}\n"));
         assert!(!scan.may_define("helper() {\n  true\n}\n"));
     }
 
-    /// A name half that is not `test…` and is not a prefix of it selects
+    /// A name half that is not `Test…` and is not a prefix of it selects
     /// nothing, whatever any file holds — so no file is worth parsing.
     #[test]
     fn the_prescan_rejects_everything_for_an_unsatisfiable_filter() {
         let scan = Prescan::of(&TestPattern::parse("overlay"));
-        assert!(!scan.may_define("testOverlay() {\n  true\n}\n"));
+        assert!(!scan.may_define("TestOverlay() {\n  true\n}\n"));
         // And the pattern itself agrees that nothing was lost.
         let pattern = TestPattern::parse("overlay");
-        assert!(!pattern.matches(Path::new("a.test"), "testOverlay"));
+        assert!(!pattern.matches(Path::new("a.test"), "TestOverlay"));
     }
 
     /// The scan is allowed to be wrong in the direction that only costs a
-    /// parse: `test` followed by something brace-shaped is handed over, and
+    /// parse: `Test` followed by something brace-shaped is handed over, and
     /// the parser has the final say about whether it defines anything.
     #[test]
     fn a_false_positive_only_costs_the_parse() {
-        let source = "testLikeThisButNotADefinition=(a b)\n";
+        let source = "TestLikeThisButNotADefinition=(a b)\n";
         assert!(Prescan::default().may_define(source));
 
         let tmp = TempDir::new().unwrap();
@@ -1557,7 +1548,7 @@ EOF
     #[test]
     fn parse_file_preserves_path() {
         let tmp = TempDir::new().unwrap();
-        let path = write_script(tmp.path(), "my.test", "testA() {\n  true\n}\n");
+        let path = write_script(tmp.path(), "my.test", "TestA() {\n  true\n}\n");
 
         let result = parse_test_file(&path, &Prescan::default()).unwrap();
         assert_eq!(result.path, path);
@@ -1576,47 +1567,46 @@ EOF
             tmp.path(),
             "example.test",
             "testing() {\n  echo nope\n}\n\ntest_helper() {\n  echo nope\n}\n\n\
-             testReal() {\n  testing\n  test_helper\n}\n\nmy_test() {\n  echo no\n}\n",
+             TestReal() {\n  testing\n  test_helper\n}\n\nmy_test() {\n  echo no\n}\n",
         );
 
         let result = parse_test_file(&path, &Prescan::default()).unwrap();
-        // Only `test` followed by a capital letter is a test: `testing` and
+        // Only a name starting with `Test` is a test: `testing` and
         // `test_helper` are helpers (still defined for the test to call),
-        // and `my_test` does not start with `test` at all.
-        assert_eq!(result.tests, ["testReal"]);
+        // and `my_test` does not start with `Test` at all.
+        assert_eq!(result.tests, ["TestReal"]);
         assert!(result.script.contains("testing() {"));
         assert!(result.script.contains("test_helper() {"));
     }
 
     #[test]
-    fn is_test_name_wants_a_capital_after_the_prefix() {
-        for name in ["testA", "testHello", "testX_y", "testÉclair"] {
+    fn is_test_name_wants_a_literal_capital_test() {
+        for name in ["TestA", "TestHello", "Test_y", "Testing", "TestÉclair"] {
             assert!(is_test_name(name), "{name}");
         }
         for name in [
             "test",
             "testing",
             "test_foo",
-            "test1",
-            "test-x",
-            "Test",
-            "TestFoo",
-            "mytestFoo",
+            "testFoo",
+            "TESTFoo",
+            "tEstFoo",
+            "myTestFoo",
         ] {
             assert!(!is_test_name(name), "{name}");
         }
     }
 
-    /// A filter that runs past `test` without the capital can select nothing,
-    /// so no file is worth parsing for it.
+    /// The name half of a filter is matched case-sensitively, so one spelled
+    /// in lowercase can select nothing and no file is worth parsing for it.
     #[test]
-    fn the_prescan_rejects_a_filter_no_test_name_can_match() {
-        let scan = Prescan::of(&TestPattern::parse("test_"));
-        assert!(!scan.may_define("test_foo() {\n  true\n}\n"));
-        assert!(!scan.may_define("testFoo() {\n  true\n}\n"));
-        // `test` itself is the rule's own prefix and admits every test.
+    fn the_prescan_rejects_a_lowercase_filter() {
         let scan = Prescan::of(&TestPattern::parse("test"));
-        assert!(scan.may_define("testFoo() {\n  true\n}\n"));
+        assert!(!scan.may_define("TestFoo() {\n  true\n}\n"));
+        assert!(!scan.may_define("testFoo() {\n  true\n}\n"));
+        // `Test` itself is the rule's own prefix and admits every test.
+        let scan = Prescan::of(&TestPattern::parse("Test"));
+        assert!(scan.may_define("TestFoo() {\n  true\n}\n"));
         assert!(!scan.may_define("testing() {\n  true\n}\n"));
     }
 
@@ -1626,22 +1616,22 @@ EOF
         // in a condition — but one nested in another function is part of that
         // function, not a definition of its own.
         let source = "\
-if testInCondition() { true; }; then
-  testInsideIf() {
+if TestInCondition() { true; }; then
+  TestInsideIf() {
     true
   }
 fi
 
 for x in 1; do
-  testInsideFor() {
-    testNested() { true; }
-    testNested
+  TestInsideFor() {
+    TestNested() { true; }
+    TestNested
   }
 done
 ";
         let functions = parse_functions(source).unwrap();
         let names: Vec<&str> = functions.iter().map(|f| f.fname.value.as_str()).collect();
-        assert_eq!(names, ["testInCondition", "testInsideIf", "testInsideFor"]);
+        assert_eq!(names, ["TestInCondition", "TestInsideIf", "TestInsideFor"]);
     }
 
     #[test]
@@ -1651,11 +1641,11 @@ done
         // only the last definition can ever run. Exactly one test is emitted,
         // but both definitions stay in the sourced script, which is therefore
         // unchanged.
-        let source = "testDup() {\n  echo first\n}\n\ntestDup() {\n  echo second\n}\n";
+        let source = "TestDup() {\n  echo first\n}\n\nTestDup() {\n  echo second\n}\n";
         let path = write_script(tmp.path(), "dup.test", source);
 
         let result = parse_test_file(&path, &Prescan::default()).unwrap();
-        assert_eq!(result.tests, ["testDup"]);
+        assert_eq!(result.tests, ["TestDup"]);
         assert_eq!(result.script, source);
     }
 
@@ -1671,11 +1661,11 @@ done
 #!/bin/sh
 
 # attest(cpu < 10ms)
-testA() {
+TestA() {
   true
 }
 
-testB() {
+TestB() {
   true
 }
 
@@ -1684,16 +1674,16 @@ testB() {
 #  wall < 1s,
 #)
 ## And a doc comment in between is fine.
-testC() {
+TestC() {
   true
 }
 ";
         let path = write_script(tmp.path(), "deco.test", source);
         let tf = parse_test_file(&path, &Prescan::default()).unwrap();
-        assert_eq!(tf.tests, ["testA", "testB", "testC"]);
-        assert_eq!(condition_texts(&tf, "testA"), ["cpu < 10ms"]);
-        assert!(condition_texts(&tf, "testB").is_empty());
-        assert_eq!(condition_texts(&tf, "testC"), ["pids <= 3", "wall < 1s"]);
+        assert_eq!(tf.tests, ["TestA", "TestB", "TestC"]);
+        assert_eq!(condition_texts(&tf, "TestA"), ["cpu < 10ms"]);
+        assert!(condition_texts(&tf, "TestB").is_empty());
+        assert_eq!(condition_texts(&tf, "TestC"), ["pids <= 3", "wall < 1s"]);
 
         // Every line of a block is in the script at its own line number, so
         // a snippet can point at it, and so is the doc comment between a
@@ -1713,40 +1703,40 @@ testC() {
     #[test]
     fn test_lines_say_where_each_definition_starts() {
         let tmp = TempDir::new().unwrap();
-        let source = "#!/bin/sh\n\n# attest(cpu < 1s)\ntestA() {\n  true\n}\n\nhelper() {\n  true\n}\n\n## doc\nfunction testB {\n  true\n}\n\ntestA() {\n  echo shadowed\n}\n";
+        let source = "#!/bin/sh\n\n# attest(cpu < 1s)\nTestA() {\n  true\n}\n\nhelper() {\n  true\n}\n\n## doc\nfunction TestB {\n  true\n}\n\nTestA() {\n  echo shadowed\n}\n";
         let path = write_script(tmp.path(), "lines.test", source);
         let tf = parse_test_file(&path, &Prescan::default()).unwrap();
         // The last definition of a shadowed name is the one that runs, so it
         // is the one a generated block would sit above.
-        assert_eq!(tf.test_lines["testA"], 17);
-        assert_eq!(tf.test_lines["testB"], 13);
+        assert_eq!(tf.test_lines["TestA"], 17);
+        assert_eq!(tf.test_lines["TestB"], 13);
         assert!(!tf.test_lines.contains_key("helper"));
-        assert!(tf.has_decorator("testA"));
-        assert!(!tf.has_decorator("testB"));
+        assert!(tf.has_decorator("TestA"));
+        assert!(!tf.has_decorator("TestB"));
     }
 
     #[test]
     fn several_blocks_on_one_test_add_up() {
         let tmp = TempDir::new().unwrap();
-        let source = "#attest(cpu < 10ms)\n# attest(pids <= 2)\ntestA() {\n  true\n}\n";
+        let source = "#attest(cpu < 10ms)\n# attest(pids <= 2)\nTestA() {\n  true\n}\n";
         let path = write_script(tmp.path(), "stack.test", source);
         let tf = parse_test_file(&path, &Prescan::default()).unwrap();
-        assert_eq!(condition_texts(&tf, "testA"), ["cpu < 10ms", "pids <= 2"]);
+        assert_eq!(condition_texts(&tf, "TestA"), ["cpu < 10ms", "pids <= 2"]);
     }
 
     #[test]
     fn decorator_recognizes_every_spelling_of_a_definition() {
         let tmp = TempDir::new().unwrap();
         for source in [
-            "#attest(cpu < 1s)\ntestX() {\n  true\n}\n",
-            "#attest(cpu < 1s)\nfunction testX {\n  true\n}\n",
-            "#attest(cpu < 1s)\nfunction testX() {\n  true\n}\n",
-            "#attest(cpu < 1s)\ntestX ()\n{\n  true\n}\n",
-            "#attest(cpu < 1s)\n  testX() {\n  true\n}\n",
+            "#attest(cpu < 1s)\nTestX() {\n  true\n}\n",
+            "#attest(cpu < 1s)\nfunction TestX {\n  true\n}\n",
+            "#attest(cpu < 1s)\nfunction TestX() {\n  true\n}\n",
+            "#attest(cpu < 1s)\nTestX ()\n{\n  true\n}\n",
+            "#attest(cpu < 1s)\n  TestX() {\n  true\n}\n",
         ] {
             let path = write_script(tmp.path(), "spelling.test", source);
             let tf = parse_test_file(&path, &Prescan::default()).expect(source);
-            assert_eq!(condition_texts(&tf, "testX"), ["cpu < 1s"], "{source:?}");
+            assert_eq!(condition_texts(&tf, "TestX"), ["cpu < 1s"], "{source:?}");
         }
     }
 
@@ -1755,22 +1745,22 @@ testC() {
         let tmp = TempDir::new().unwrap();
         for (source, what) in [
             // A blank line between the block and the function.
-            ("#attest(cpu < 1s)\n\ntestX() {\n  true\n}\n", "blank"),
+            ("#attest(cpu < 1s)\n\nTestX() {\n  true\n}\n", "blank"),
             // Code in between.
-            ("#attest(cpu < 1s)\nx=1\ntestX() {\n  true\n}\n", "code"),
+            ("#attest(cpu < 1s)\nx=1\nTestX() {\n  true\n}\n", "code"),
             // Nothing below at all.
-            ("testX() {\n  true\n}\n#attest(cpu < 1s)\n", "eof"),
+            ("TestX() {\n  true\n}\n#attest(cpu < 1s)\n", "eof"),
             // Inside a function body.
-            ("testX() {\n  #attest(cpu < 1s)\n  true\n}\n", "body"),
+            ("TestX() {\n  #attest(cpu < 1s)\n  true\n}\n", "body"),
             // Above a helper rather than a test.
             (
-                "#attest(cpu < 1s)\nhelper() {\n  true\n}\n\ntestX() {\n  helper\n}\n",
+                "#attest(cpu < 1s)\nhelper() {\n  true\n}\n\nTestX() {\n  helper\n}\n",
                 "helper",
             ),
             // Malformed.
-            ("#attest(cpu < 1 s)\ntestX() {\n  true\n}\n", "unit"),
+            ("#attest(cpu < 1 s)\nTestX() {\n  true\n}\n", "unit"),
             // Not enforced yet.
-            ("#attest(hosts in {})\ntestX() {\n  true\n}\n", "hosts"),
+            ("#attest(hosts in {})\nTestX() {\n  true\n}\n", "hosts"),
         ] {
             let path = write_script(tmp.path(), "bad.test", source);
             let err = parse_test_file(&path, &Prescan::default())
@@ -1785,7 +1775,7 @@ testC() {
     #[test]
     fn a_doc_comment_mentioning_attest_is_not_a_decorator() {
         let tmp = TempDir::new().unwrap();
-        let source = "## attest(cpu < 1s) is the syntax, but this is prose\ntestX() {\n  true\n}\n";
+        let source = "## attest(cpu < 1s) is the syntax, but this is prose\nTestX() {\n  true\n}\n";
         let path = write_script(tmp.path(), "doc.test", source);
         let tf = parse_test_file(&path, &Prescan::default()).unwrap();
         assert!(tf.decorators.is_empty());

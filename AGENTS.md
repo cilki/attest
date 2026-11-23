@@ -11,8 +11,8 @@
   where its left half is an existing file, so a base-name-only listing is both
   ambiguous between same-named files and unusable as a target. A listed
   selector is not promised to select only its own test: its name half matches
-  as a prefix like any filter's, so `x.test/testKw` also selects
-  `x.test/testKwParen`. That is deliberate (issue #140) — filters always
+  as a prefix like any filter's, so `x.test/TestKw` also selects
+  `x.test/TestKwParen`. That is deliberate (issue #140) — filters always
   prefix-match, and there is no exact-match special case for `list` output.
   `parse_discovered` parses every discovered file out of which the selection
   could pick a test (`parser::Prescan` settles that from the file's path and
@@ -93,15 +93,15 @@
   parse: a false positive costs what would have been paid anyway, while a
   false negative loses a test. A `Prescan` is the whole of what a selection
   rules out before a parse, so it carries the `--filter` as well as the
-  `test…` rule: the pattern's file half is a path suffix (`admits`, the same
+  `Test…` rule: the pattern's file half is a path suffix (`admits`, the same
   `Path::ends_with` the match itself uses) and its name half fixes the literal
   prefix the definition's name must carry — everything in front of the first
   `*`, or all of a `*`-less pattern, since that matches as a prefix. One of
-  that and `test` has to contain the other, so the longer is the whole
-  constraint and a name half that extends neither (`--filter overlay`), or
-  that runs past `test` without the capital (`--filter test_`), means
+  that and `Test` has to contain the other, so the longer is the whole
+  constraint and a name half that extends neither (`--filter overlay`, or a
+  lowercase `--filter test`, since the match is case-sensitive) means
   no file in the tree holds a selectable test at all. The price of a
-  rejection is the same one the bare `test…` scan already pays: an
+  rejection is the same one the bare `Test…` scan already pays: an
   unparseable script the filter excludes is no longer named on stderr, and
   neither is a test such a file defines twice. Also holds `TestPattern`, the `[<file>/]<name>` selector behind
   `--filter` and the positional target: the file half is a `Path::ends_with`
@@ -113,10 +113,10 @@
   everything after it as the file, however many components that is
   (`./a/x.test` == `a/x.test/`). The marker wins over the last-`/` split rather
   than only applying when there is nothing to split, so a name is attached by
-  spelling the selector without the `./` (`a/x.test/testFoo`, the form `list`
+  spelling the selector without the `./` (`a/x.test/TestFoo`, the form `list`
   prints). `split_path_arg` therefore drops a `./` from the filter it
   synthesizes for a positional target: there the split is decided by the
-  filesystem, so `./a/x.test/testFoo` is a file plus a name, and carrying the
+  filesystem, so `./a/x.test/TestFoo` is a file plus a name, and carrying the
   marker into the filter would turn the name back into a path component.
   `selector` is the other direction — the single spelling of the join, used by
   `list` and by completion — and drops the `./` for the same reason:
@@ -533,8 +533,9 @@
 ## Test file format
 
 Standalone test files (`.test`) have any shell shebang and contain functions
-named `test` followed by a capital letter (`testHello`; `parser::is_test_name`
-— `testing`, `test_foo` and `test` itself are helpers). Test functions can also be inline in any regular shell
+whose names start with `Test`, capital `T` and all (`TestHello`;
+`parser::is_test_name` — `testFoo`, `testing`, `test_foo` and `test` itself
+are helpers). Test functions can also be inline in any regular shell
 script. When scanning directories, all shell scripts (identified by extension or
 shebang) are checked for test functions; the walk is recursive, skips hidden
 files and directories, and never follows symlinks (a symlinked directory would

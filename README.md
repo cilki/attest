@@ -36,7 +36,7 @@ Here's an illustrative example of a test for the `md5sum` command:
 
 ```sh
 ## Test the md5sum command with known input/output
-testHello() {
+TestHello() {
 	result=$(echo hello | md5sum) # Test fails if nonzero exit
 
 	[ "${result}" = "b1946ac92492d2347c6235b4d2611184  -" ] # Test fails if output changes
@@ -50,8 +50,8 @@ wanted to. Don't try that with Bats :).
 There are only three implicit pieces of knowledge that you need for writing
 tests:
 
-- All test functions are named `test` followed by a capital letter
-  (`testHello`); any other function — `testing`, `test_setup` — is a helper
+- All test functions are named starting with `Test`, capital `T` included
+  (`TestHello`); any other function — `testHello`, `test_setup` — is a helper
   your tests can call
 - If any command in your function exits nonzero, the whole test fails
 - Each test starts in its own clean, empty temporary working directory, and
@@ -89,7 +89,7 @@ consequences:
   `examples/race_condition.test` does:
 
   ```sh
-  testGrepQ() {
+  TestGrepQ() {
   	set -o pipefail
 
   	produce | consume
@@ -120,7 +120,7 @@ as a comment directly above the test function:
 
 ```sh
 # attest(2ms < cpu < 10ms, mem < 50MiB)
-testHello() {
+TestHello() {
 	result=$(echo hello | md5sum)
 
 	[ "${result}" = "b1946ac92492d2347c6235b4d2611184  -" ]
@@ -133,13 +133,13 @@ succeed, each condition is checked against what the run measured, and one that
 doesn't hold fails the test with a report that points at the condition:
 
 ```
-FAIL  testHello                                (5ms)
+FAIL  TestHello                                (5ms)
 error: assertion on the run failed
  --> md5sum.test:3:10
   |
 3 | # attest(2ms < cpu < 10ms, mem < 50MiB)
   |          ^^^^^^^^^^^^^^^^ cpu was 12.2ms
-4 | testHello() {
+4 | TestHello() {
 5 |     result=$(echo hello | md5sum)
   |
 ```
@@ -154,7 +154,7 @@ around `attest`:
 #   pids <= 3,
 # )
 ## Doc comments may still sit between the block and the test.
-testHello() {
+TestHello() {
 ```
 
 Each condition compares one metric against a value, from either side, or
@@ -193,7 +193,7 @@ Two more conditions assert on *what* the run did rather than how much:
 
 ```sh
 # attest(syscalls not in {socket, connect}, writes in {/tmp, ./build})
-testOffline() {
+TestOffline() {
 	echo hello | md5sum
 }
 ```
@@ -297,21 +297,21 @@ your tests inline with the script.
 ## Inline tests can be placed anywhere in the script. You can use $0 to call
 ## the script we're embedded in.
 
-testGoodInput() {
+TestGoodInput() {
 	result=$($0 1 2)
 
 	[ ${result} -eq 3 ]
 }
 
-testNoInput() {
+TestNoInput() {
 	! $0
 }
 
-testBadInput() {
+TestBadInput() {
 	! $0 1 1.2
 }
 
-testTooManyArgs() {
+TestTooManyArgs() {
 	! $0 1 2 3
 }
 
@@ -380,34 +380,34 @@ is pre-tuned to produce good tests. Here's an example prompt:
 #!/usr/bin/env bash
 
 ## Basic functionality - reverse lines from a file
-testBasicFile() {
+TestBasicFile() {
 	echo -e "line1\nline2\nline3" > input.txt
 	result=$(tac input.txt)
 	[ "$result" = "$(echo -e "line3\nline2\nline1")" ]
 }
 
 ## Reverse lines from stdin
-testStdin() {
+TestStdin() {
 	result=$(echo -e "first\nsecond\nthird" | tac)
 	[ "$result" = "$(echo -e "third\nsecond\nfirst")" ]
 }
 
 ## Single line should remain unchanged
-testSingleLine() {
+TestSingleLine() {
 	echo "only line" > input.txt
 	result=$(tac input.txt)
 	[ "$result" = "only line" ]
 }
 
 ## Empty file produces no output
-testEmptyFile() {
+TestEmptyFile() {
 	touch empty.txt
 	result=$(tac empty.txt)
 	[ -z "$result" ]
 }
 
 ## Multiple files are concatenated and reversed
-testMultipleFiles() {
+TestMultipleFiles() {
 	echo -e "a\nb" > file1.txt
 	echo -e "c\nd" > file2.txt
 	result=$(tac file1.txt file2.txt)
@@ -415,29 +415,29 @@ testMultipleFiles() {
 }
 
 ## Non-existent file produces error
-testNonExistentFile() {
+TestNonExistentFile() {
 	! tac nonexistent.txt 2>/dev/null
 }
 
 ## Trailing newline handling
-testTrailingNewline() {
+TestTrailingNewline() {
 	printf "line1\nline2\nline3" > input.txt
 	result=$(tac input.txt)
 	[ "$result" = "$(echo -e "line3\nline2\nline1")" ]
 }
 
 ## Help flag works
-testHelp() {
+TestHelp() {
 	tac --help || tac -h
 }
 
 ## Version flag works
-testVersion() {
+TestVersion() {
 	tac --version || tac -v
 }
 
 ## Lines with special characters
-testSpecialCharacters() {
+TestSpecialCharacters() {
 	echo -e "hello\$world\nfoo@bar\n#comment" > input.txt
 	result=$(tac input.txt)
 	echo "$result" | grep -q "^#comment"
@@ -445,14 +445,14 @@ testSpecialCharacters() {
 }
 
 ## File with only whitespace lines
-testWhitespaceLines() {
+TestWhitespaceLines() {
 	printf "line1\n  \nline3\n" > input.txt
 	result=$(tac input.txt)
 	[ "$(echo "$result" | wc -l)" -eq 3 ]
 }
 
 ## Very long lines are handled correctly
-testLongLines() {
+TestLongLines() {
 	long_line=$(printf 'a%.0s' {1..1000})
 	echo -e "$long_line\nshort" > input.txt
 	result=$(tac input.txt)
@@ -460,7 +460,7 @@ testLongLines() {
 }
 
 ## Reads from multiple sources correctly
-testMixedInput() {
+TestMixedInput() {
 	echo "file line" > file.txt
 	echo "stdin line" | tac - file.txt | head -1 | grep -q "file line"
 }
@@ -503,7 +503,7 @@ block the walk waiting for a writer. Pointed at a single file — or a symlink t
 one — it scans that whatever it happens to be called.
 
 Scanning is cheap for the scripts in the tree that aren't tests: a file is only
-parsed as shell once its text actually spells a `test…` function definition, so
+parsed as shell once its text actually spells a `Test…` function definition, so
 a repository full of build and install scripts costs a read apiece rather than
 a parse apiece. A `--filter` narrows that further, before anything is parsed:
 its file half is a path, so a file it can't name is never even read, and its
@@ -561,16 +561,16 @@ spell one out in full:
 
 ```sh
 # Just one test
-attest examples/md5sum.test/testHello
+attest examples/md5sum.test/TestHello
 
 # Every test in one file, wherever that file turns up under the given directory
 attest . --filter 'md5sum.test/'
 
-# Every test whose name starts with "testHel"
-attest . --filter testHel
+# Every test whose name starts with "TestHel"
+attest . --filter TestHel
 
 # `*` is a wildcard
-attest . --filter 'testVer*'
+attest . --filter 'TestVer*'
 ```
 
 A filter is `[<file>/]<name>`, and the `/` is what tells the two halves apart:
@@ -583,7 +583,7 @@ A filter is `[<file>/]<name>`, and the `/` is what tells the two halves apart:
   `--filter ./examples/md5sum.test` mean the same as `'md5sum.test/'` and
   `'examples/md5sum.test/'`. Nothing is left for a name, so one cannot be
   appended behind the marker: as a *filter*,
-  `./examples/md5sum.test/testHello` asks for a file at that whole path. Spell
+  `./examples/md5sum.test/TestHello` asks for a file at that whole path. Spell
   a filter that carries a name without the `./`, the way `list` prints it. As a
   *target* the same string still works — there the split is decided by the
   filesystem, and only where the left half is a file that exists.
@@ -592,7 +592,7 @@ A filter is `[<file>/]<name>`, and the `/` is what tells the two halves apart:
   file, while `um.test/` and `md5*.test/` select nothing. An empty name half
   (`md5sum.test/`) means every test in the file.
 - **The name half is where `*` works.** Without one it matches as a prefix
-  (`testHel` catches `testHelp` and `testHello`); with one it has to match the
+  (`TestHel` catches `TestHelp` and `TestHello`); with one it has to match the
   name in full, so `*Help` is a suffix match and `test*` is everything.
 
 `list` accepts the same targets and `--filter`, so you can check what a
@@ -602,11 +602,11 @@ target or a filter:
 
 ```sh
 ❯ attest list examples/md5sum.test
-examples/md5sum.test/testHelp
-examples/md5sum.test/testVersion
-examples/md5sum.test/testHello
+examples/md5sum.test/TestHelp
+examples/md5sum.test/TestVersion
+examples/md5sum.test/TestHello
 
-❯ attest examples/md5sum.test/testHello
+❯ attest examples/md5sum.test/TestHello
 ```
 
 A selector is still a filter, though, so its name half matches as a prefix like
@@ -615,9 +615,9 @@ whose name starts with it. Where one name extends another, the shorter one's
 line selects both:
 
 ```sh
-❯ attest list examples/failing.test/testWhoami
-examples/failing.test/testWhoami
-examples/failing.test/testWhoamiFailing
+❯ attest list examples/failing.test/TestWhoami
+examples/failing.test/TestWhoami
+examples/failing.test/TestWhoamiFailing
 ```
 
 The directories are part of the selector because the file half is only a
@@ -642,13 +642,13 @@ COMPLETE=fish attest | source
 ```
 
 With that in place, `attest examples/md5<TAB>` completes the file name and
-`attest examples/md5sum.test/<TAB>` offers `testHelp`, `testVersion` and
-`testHello`.
+`attest examples/md5sum.test/<TAB>` offers `TestHelp`, `TestVersion` and
+`TestHello`.
 
 What comes back for a target is the selector form above — the same string
 `attest list` prints. A `./` you typed is dropped on the way, because behind one
 a `--filter` is all file path (see [Selecting tests](#selecting-tests)) and
-`./examples/md5sum.test/testHello` would then name a file rather than a test.
+`./examples/md5sum.test/TestHello` would then name a file rather than a test.
 
 `--filter` completes the same selectors, plus the two shapes that are only a
 filter — because a filter is a pattern and not a path, so what is being typed
@@ -656,7 +656,7 @@ there isn't always the same thing:
 
 - **A bare test name.** With no `/` typed yet, a filter is all name (again, see
   [Selecting tests](#selecting-tests)), so that is what is offered:
-  `--filter testHel<TAB>` gives `testHelp` and `testHello`, the names
+  `--filter TestHel<TAB>` gives `TestHelp` and `TestHello`, the names
   themselves rather than the selectors they appear in.
 - **A file with its trailing `/`.** `--filter examples/md5<TAB>` completes to
   `examples/md5sum.test/`, the file-only form, since without the `/` the same
@@ -699,7 +699,7 @@ one abandons the tests still in flight, the other kills them:
 
   ```
   ❯ attest . --bail --parallel 4
-  FAIL  testAFastFail                            (5ms)
+  FAIL  TestAFastFail                            (5ms)
   ...
 
   Results: 0 passed, 1 failed, 1 total
@@ -815,25 +815,25 @@ this file (`-v` gives us a line per test instead of just the summary):
 
 ```
 ❯ attest -v --parallel 1 --repeat 10 examples/race_condition.test
-PASS  testGrepQ#1                              (1.06s)
+PASS  TestGrepQ#1                              (1.06s)
       cpu=7.8ms+4.8ms  mem=2.8MiB  pids=5
-PASS  testGrepQ#2                              (1.07s)
+PASS  TestGrepQ#2                              (1.07s)
       cpu=6.2ms+6.2ms  mem=3.1MiB  pids=5
-PASS  testGrepQ#3                              (1.07s)
+PASS  TestGrepQ#3                              (1.07s)
       cpu=6.2ms+6.2ms  mem=2.6MiB  pids=5
-PASS  testGrepQ#4                              (1.07s)
+PASS  TestGrepQ#4                              (1.07s)
       cpu=6.2ms+6.2ms  mem=3.4MiB  pids=5
-PASS  testGrepQ#5                              (1.07s)
+PASS  TestGrepQ#5                              (1.07s)
       cpu=6.3ms+6.3ms  mem=3.4MiB  pids=5
-PASS  testGrepQ#6                              (1.06s)
+PASS  TestGrepQ#6                              (1.06s)
       cpu=8.7ms+3.7ms  mem=3.4MiB  pids=5
-PASS  testGrepQ#7                              (1.07s)
+PASS  TestGrepQ#7                              (1.07s)
       cpu=5.9ms+6.9ms  mem=3.0MiB  pids=5
-PASS  testGrepQ#8                              (1.07s)
+PASS  TestGrepQ#8                              (1.07s)
       cpu=6.3ms+6.3ms  mem=3.1MiB  pids=5
-PASS  testGrepQ#9                              (1.06s)
+PASS  TestGrepQ#9                              (1.06s)
       cpu=6.1ms+6.1ms  mem=3.1MiB  pids=5
-PASS  testGrepQ#10                             (1.07s)
+PASS  TestGrepQ#10                             (1.07s)
       cpu=6.2ms+6.2ms  mem=2.8MiB  pids=5
 
 Results: 10 passed, 10 total
@@ -846,25 +846,25 @@ elided here):
 
 ```
 ❯ attest -v --parallel 1 --fuzz 0.9 --repeat 10 examples/race_condition.test
-PASS  testGrepQ#1                              (3.47s)
+PASS  TestGrepQ#1                              (3.47s)
       cpu=5.5ms+7.3ms  mem=2.8MiB  pids=5
-FAIL  testGrepQ#2                              (4.09s)
+FAIL  TestGrepQ#2                              (4.09s)
       cpu=6.7ms+6.0ms  mem=3.2MiB  pids=5
-FAIL  testGrepQ#3                              (5.10s)
+FAIL  TestGrepQ#3                              (5.10s)
       cpu=4.7ms+7.8ms  mem=2.9MiB  pids=5
-PASS  testGrepQ#4                              (3.59s)
+PASS  TestGrepQ#4                              (3.59s)
       cpu=6.3ms+6.3ms  mem=3.5MiB  pids=5
-FAIL  testGrepQ#5                              (2.39s)
+FAIL  TestGrepQ#5                              (2.39s)
       cpu=5.8ms+6.8ms  mem=3.1MiB  pids=5
-PASS  testGrepQ#6                              (6.51s)
+PASS  TestGrepQ#6                              (6.51s)
       cpu=5.3ms+7.4ms  mem=3.1MiB  pids=5
-FAIL  testGrepQ#7                              (3.08s)
+FAIL  TestGrepQ#7                              (3.08s)
       cpu=7.1ms+5.7ms  mem=3.1MiB  pids=5
-FAIL  testGrepQ#8                              (3.34s)
+FAIL  TestGrepQ#8                              (3.34s)
       cpu=4.3ms+8.1ms  mem=3.4MiB  pids=5
-PASS  testGrepQ#9                              (2.68s)
+PASS  TestGrepQ#9                              (2.68s)
       cpu=6.3ms+6.3ms  mem=3.1MiB  pids=5
-FAIL  testGrepQ#10                             (2.08s)
+FAIL  TestGrepQ#10                             (2.08s)
       cpu=6.2ms+6.2ms  mem=2.6MiB  pids=5
 
 Results: 4 passed, 6 failed, 10 total
@@ -925,9 +925,9 @@ the top of this README, with one digit of the expected hash changed:
 
 ```
 ❯ attest md5sum.test
-FAIL  testHello                                (50ms)
---- xtrace: testHello ---
-+8: testHello
+FAIL  TestHello                                (50ms)
+--- xtrace: TestHello ---
++8: TestHello
 ++5: md5sum
 ++5: echo hello
 +5: result='b1946ac92492d2347c6235b4d2611184  -'
@@ -935,7 +935,7 @@ FAIL  testHello                                (50ms)
 error: command failed
  --> md5sum.test:7:2
   |
-4 | testHello() {
+4 | TestHello() {
 5 |     result=$(echo hello | md5sum)
 6 |
 7 |     [ "${result}" = "b1946ac92492d2347c6235b4d2611185  -" ]
@@ -1011,7 +1011,7 @@ Only `xtrace.log` is ever printed — it's what you see under a `FAIL` and what
 reach for `echo` to debug a failure:
 
 ```sh
-testFails() {
+TestFails() {
 	echo "where did this go?"    # stdout.log, which nothing prints
 	echo "this one shows up" >&2 # the FAIL report, right below its own command
 	false
@@ -1020,9 +1020,9 @@ testFails() {
 
 ```
 ❯ attest demo.test
-FAIL  testFails                                (50ms)
---- xtrace: testFails ---
-+8: testFails
+FAIL  TestFails                                (50ms)
+--- xtrace: TestFails ---
++8: TestFails
 +4: echo 'where did this go?'
 +5: echo 'this one shows up'
 this one shows up
@@ -1060,7 +1060,7 @@ Result lines can carry a second line describing what the test actually
 consumed:
 
 ```
-PASS  testGrepQ#1                              (1.06s)
+PASS  TestGrepQ#1                              (1.06s)
       cpu=7.8ms+4.8ms  mem=2.8MiB  pids=5
 ```
 

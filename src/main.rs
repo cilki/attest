@@ -416,7 +416,7 @@ impl Selection {
     ///
     /// Both apply, since `--filter` is documented to narrow whatever the
     /// target selects. It used to *replace* the target's name half instead, so
-    /// `attest a.test/testEcho --filter 'testW*'` ran `testWrites` — a test
+    /// `attest a.test/TestEcho --filter 'TestW*'` ran `TestWrites` — a test
     /// the user had just named another one over.
     ///
     /// `cores` only says how fast to get there, never what is found: the
@@ -525,7 +525,7 @@ enum Completing {
 /// What a completed *selector* means is the same for both, but what anything
 /// shorter means is not (see [`Completing`]), and offering a target's
 /// candidates for a filter handed back filters that select nothing:
-/// `--filter testHel<TAB>` — the bare-name form that is the whole point of
+/// `--filter TestHel<TAB>` — the bare-name form that is the whole point of
 /// `--filter` — offered nothing at all, because every candidate began with a
 /// file path, and `--filter examples/md5<TAB>` completed to
 /// `examples/md5sum.test`, which as a pattern is the *name* `md5sum.test` in
@@ -743,12 +743,12 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    const GOOD: &str = "#!/bin/sh\ntestGood() {\n\ttrue\n}\n";
+    const GOOD: &str = "#!/bin/sh\nTestGood() {\n\ttrue\n}\n";
     // Unterminated double quote: valid for no shell. Spelled inside a test
     // function, so the file is one the parser is asked about at all (a script
     // that spells no test function is never parsed — see
     // `parser::Prescan` and the test below).
-    const BROKEN: &str = "#!/bin/bash\ntestBroken() {\n\techo \"unterminated\n}\n";
+    const BROKEN: &str = "#!/bin/bash\nTestBroken() {\n\techo \"unterminated\n}\n";
     // The same syntax error in the kind of script a tree can contain without
     // it having anything to do with the tests.
     const BROKEN_WITHOUT_TESTS: &str = "#!/bin/bash\nfoo() {\n\techo \"unterminated\n}\n";
@@ -800,16 +800,16 @@ mod tests {
     #[test]
     fn list_reads_a_filter_on_either_side_of_it() {
         for args in [
-            &["--filter", "testFoo", "list", "."][..],
-            &["list", "--filter", "testFoo", "."],
-            &["list", ".", "--filter", "testFoo"],
+            &["--filter", "TestFoo", "list", "."][..],
+            &["list", "--filter", "TestFoo", "."],
+            &["list", ".", "--filter", "TestFoo"],
         ] {
             let parsed = cli(args).unwrap();
             assert!(
                 matches!(&parsed.command, Some(Commands::List { path }) if path == "."),
                 "{args:?}"
             );
-            assert_eq!(parsed.filter.as_deref(), Some("testFoo"), "{args:?}");
+            assert_eq!(parsed.filter.as_deref(), Some("TestFoo"), "{args:?}");
         }
     }
 
@@ -861,7 +861,7 @@ mod tests {
         // Only the file that parsed is kept, and it knows where it came from.
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].path, good);
-        assert_eq!(parsed[0].tests, ["testGood"]);
+        assert_eq!(parsed[0].tests, ["TestGood"]);
     }
 
     #[test]
@@ -953,9 +953,9 @@ mod tests {
         script(
             tmp.path(),
             "a.test",
-            "testAlpha() {\n\ttrue\n}\ntestBeta() {\n\ttrue\n}\n",
+            "TestAlpha() {\n\ttrue\n}\nTestBeta() {\n\ttrue\n}\n",
         );
-        script(tmp.path(), "b.test", "testAlpha() {\n\ttrue\n}\n");
+        script(tmp.path(), "b.test", "TestAlpha() {\n\ttrue\n}\n");
         let dir = tmp.path().to_str().unwrap();
 
         let selected = |filter: Option<&str>| {
@@ -980,25 +980,25 @@ mod tests {
         assert_eq!(
             tests,
             [
-                parser::selector(&tmp.path().join("a.test"), "testAlpha"),
-                parser::selector(&tmp.path().join("a.test"), "testBeta"),
+                parser::selector(&tmp.path().join("a.test"), "TestAlpha"),
+                parser::selector(&tmp.path().join("a.test"), "TestBeta"),
             ]
         );
 
         // The name half leaves both files candidates but only one of them
         // spells a name it can match.
-        let (_, tests) = selected(Some("testBeta"));
+        let (_, tests) = selected(Some("TestBeta"));
         assert_eq!(
             tests,
-            [parser::selector(&tmp.path().join("a.test"), "testBeta")]
+            [parser::selector(&tmp.path().join("a.test"), "TestBeta")]
         );
 
         // Both halves at once.
-        let (parsed, tests) = selected(Some("b.test/testAlpha"));
+        let (parsed, tests) = selected(Some("b.test/TestAlpha"));
         assert_eq!(parsed, 1);
         assert_eq!(
             tests,
-            [parser::selector(&tmp.path().join("b.test"), "testAlpha")]
+            [parser::selector(&tmp.path().join("b.test"), "TestAlpha")]
         );
     }
 
@@ -1011,9 +1011,9 @@ mod tests {
         script(
             tmp.path(),
             "a.test",
-            "testAlpha() {\n\ttrue\n}\ntestBeta() {\n\ttrue\n}\n",
+            "TestAlpha() {\n\ttrue\n}\nTestBeta() {\n\ttrue\n}\n",
         );
-        let target = tmp.path().join("a.test/testAlpha");
+        let target = tmp.path().join("a.test/TestAlpha");
         let target = target.to_str().unwrap();
 
         let selected = |filter: &str| {
@@ -1028,23 +1028,23 @@ mod tests {
         };
 
         // A filter the named test satisfies leaves it selected.
-        let (_, names) = selected("test*");
-        assert_eq!(names, ["testAlpha"]);
-        let (_, names) = selected("a.test/testAl");
-        assert_eq!(names, ["testAlpha"]);
+        let (_, names) = selected("Test*");
+        assert_eq!(names, ["TestAlpha"]);
+        let (_, names) = selected("a.test/TestAl");
+        assert_eq!(names, ["TestAlpha"]);
 
         // One it does not satisfy selects nothing — not the test the filter
         // alone would have picked out of the same file.
-        let (selection, names) = selected("testBeta");
+        let (selection, names) = selected("TestBeta");
         assert!(names.is_empty());
         // And the message names both halves of the contradiction.
         let message = selection.nothing_selected().to_string();
-        assert!(message.contains("'testBeta'"), "{message}");
-        assert!(message.contains("a.test/testAlpha'"), "{message}");
+        assert!(message.contains("'TestBeta'"), "{message}");
+        assert!(message.contains("a.test/TestAlpha'"), "{message}");
     }
 
     /// A file no selected test can come out of is a file the run has nothing
-    /// to say about — the same bargain the bare `test…` scan already makes.
+    /// to say about — the same bargain the bare `Test…` scan already makes.
     /// So an unparseable script a `--filter` excludes is not parsed, by either
     /// half of the pattern, and nothing about it is reported.
     #[test]
@@ -1059,10 +1059,10 @@ mod tests {
         assert_eq!(selection.files.len(), 1);
         assert_eq!(selection.tests().len(), 1);
 
-        // The name half: broken.sh is read but, spelling no `testGood…`, it is
+        // The name half: broken.sh is read but, spelling no `TestGood…`, it is
         // never handed to the parser — so its syntax error is not reported and
         // it contributes nothing.
-        let selection = Selection::resolve(dir, Some("testGood".into()), Cores::One).unwrap();
+        let selection = Selection::resolve(dir, Some("TestGood".into()), Cores::One).unwrap();
         assert_eq!(selection.files.len(), 2);
         assert_eq!(selection.tests().len(), 1);
     }
@@ -1086,28 +1086,28 @@ mod tests {
             "expected to run from the package root"
         );
 
-        let (path, filter) = split_path_arg("./examples/md5sum.test/testHello");
+        let (path, filter) = split_path_arg("./examples/md5sum.test/TestHello");
         assert_eq!(path, Path::new("./examples/md5sum.test"));
-        assert_eq!(filter.as_deref(), Some("examples/md5sum.test/testHello"));
+        assert_eq!(filter.as_deref(), Some("examples/md5sum.test/TestHello"));
 
         // Both spellings of the target select the same test.
-        let (_, bare) = split_path_arg("examples/md5sum.test/testHello");
+        let (_, bare) = split_path_arg("examples/md5sum.test/TestHello");
         assert_eq!(filter, bare);
 
         // So do the spellings `"$dir/…"` gives for a `$dir` of `./` or `./.`:
         // keeping what followed the first `./` made the filter
         // `/examples/…` (absolute) or `./examples/…` (all path).
         for target in [
-            ".//examples/md5sum.test/testHello",
-            "././examples/md5sum.test/testHello",
+            ".//examples/md5sum.test/TestHello",
+            "././examples/md5sum.test/TestHello",
         ] {
             let (_, other) = split_path_arg(target);
             assert_eq!(other, bare, "{target}");
         }
 
         let pattern = parser::TestPattern::parse(&filter.unwrap());
-        assert!(pattern.matches(Path::new("./examples/md5sum.test"), "testHello"));
-        assert!(!pattern.matches(Path::new("./examples/md5sum.test"), "testHelp"));
+        assert!(pattern.matches(Path::new("./examples/md5sum.test"), "TestHello"));
+        assert!(!pattern.matches(Path::new("./examples/md5sum.test"), "TestHelp"));
     }
 
     /// What completion offers for a positional target.
@@ -1156,11 +1156,11 @@ mod tests {
 
         for typed in [
             "",
-            "test",
-            "testHel",
+            "Test",
+            "TestHel",
             "examples/md5",
             "examples/md5sum.test/",
-            "examples/md5sum.test/testHel",
+            "examples/md5sum.test/TestHel",
         ] {
             let candidates = filter_completions(typed);
             assert!(!candidates.is_empty(), "nothing offered for `{typed}`");
@@ -1179,15 +1179,15 @@ mod tests {
     /// starts with a file path.
     #[test]
     fn a_bare_filter_prefix_completes_test_names() {
-        let candidates = filter_completions("testHel");
-        assert_eq!(candidates, ["testHelp", "testHello"]);
+        let candidates = filter_completions("TestHel");
+        assert_eq!(candidates, ["TestHelp", "TestHello"]);
     }
 
     /// A target keeps naming a path: a bare test name is not one, and offering
     /// it would complete to an argument that fails with "path does not exist".
     #[test]
     fn a_target_is_never_completed_to_a_bare_test_name() {
-        assert!(completions("testHel").is_empty());
+        assert!(completions("TestHel").is_empty());
         assert!(
             completions("examples/md5").contains(&"examples/md5sum.test".to_string()),
             "a target still completes to the file path itself"
@@ -1199,7 +1199,7 @@ mod tests {
     ///
     /// Behind a `./` a filter is *all* path (see `parser::TestPattern::parse`),
     /// so a completion that pasted the name onto the path as typed handed back
-    /// `./examples/md5sum.test/testHello`: a file of that name, matching
+    /// `./examples/md5sum.test/TestHello`: a file of that name, matching
     /// nothing. The selector form carries no `./`, so neither may a completion
     /// of it.
     #[test]
@@ -1212,12 +1212,12 @@ mod tests {
             "expected to run from the package root"
         );
 
-        let candidates = completions("./examples/md5sum.test/testHel");
+        let candidates = completions("./examples/md5sum.test/TestHel");
         assert_eq!(
             candidates,
             [
-                "examples/md5sum.test/testHelp",
-                "examples/md5sum.test/testHello"
+                "examples/md5sum.test/TestHelp",
+                "examples/md5sum.test/TestHello"
             ]
         );
         for candidate in &candidates {
@@ -1232,7 +1232,7 @@ mod tests {
         // The `./`-free spelling of the same prefix completes identically: the
         // marker only ever said "this is a path", and the split already
         // established that it is not all of one.
-        assert_eq!(completions("examples/md5sum.test/testHel"), candidates);
+        assert_eq!(completions("examples/md5sum.test/TestHel"), candidates);
     }
 
     /// Only the file named by the left half is consulted once there is one, so

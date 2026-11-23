@@ -1,27 +1,27 @@
 #!/usr/bin/env bash
 ## Useful to simulate long-running tests
 
-testHelp() {
+TestHelp() {
 	sleep --help
 }
 
-testVersion() {
+TestVersion() {
 	sleep --version
 }
 
-testInt() {
+TestInt() {
 	sleep 1
 }
 
-testFloat() {
+TestFloat() {
 	sleep 2.0
 }
 
-testUnits() {
+TestUnits() {
 	sleep 1s
 	sleep 0.1m
 }
 
-testLong() {
+TestLong() {
 	sleep 10
 }

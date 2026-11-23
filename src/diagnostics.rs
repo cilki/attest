@@ -904,7 +904,7 @@ mod tests {
         // A command whose name merely starts with `test` is not the builtin:
         // the test functions themselves are named that way, and the first
         // trace line of every run is the runner calling one of them.
-        assert!(parse_bracket_expr("testEquality").is_none());
+        assert!(parse_bracket_expr("TestEquality").is_none());
         assert!(parse_bracket_expr("tester a = b").is_none());
     }
 
@@ -1327,11 +1327,11 @@ mod tests {
             "#   pids <= 3,",
             "# )",
             "## Doc comments may still sit between the block and the test.",
-            "testHello() {",
+            "TestHello() {",
             "  true",
             "  true",
             "}",
-            "testOther() {",
+            "TestOther() {",
             "  true",
             "}",
         ];
@@ -1349,7 +1349,7 @@ mod tests {
             violation_window(&functions, 2, lines.len()),
             false,
         );
-        assert!(rendered.contains("testHello() {"), "{rendered}");
+        assert!(rendered.contains("TestHello() {"), "{rendered}");
 
         // Close by, the usual context still applies, and nothing reaches
         // past the decorated function into the next one.

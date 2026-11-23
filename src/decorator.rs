@@ -3,7 +3,7 @@
 //!
 //! ```sh
 //! # attest(2ms < cpu < 10ms, mem < 50MiB)
-//! testHello() {
+//! TestHello() {
 //!     ...
 //! }
 //! ```
@@ -1149,7 +1149,7 @@ mod tests {
 
     #[test]
     fn single_condition() {
-        let d = one("#attest(cpu < 10ms)\ntestX() {\n  true\n}\n");
+        let d = one("#attest(cpu < 10ms)\nTestX() {\n  true\n}\n");
         assert_eq!((d.first_line, d.last_line), (1, 1));
         assert_eq!(d.conditions.len(), 1);
         let c = &d.conditions[0];
@@ -1333,7 +1333,7 @@ mod tests {
 #   2ms < cpu < 10ms,
 #   pids <= 3,
 # )
-testX() {
+TestX() {
   true
 }
 ";
@@ -1400,7 +1400,7 @@ testX() {
         // `##` is how a test's description is written; one that mentions
         // attest must stay prose.
         for source in [
-            "## attest(cpu < 1ms)\ntestX() {\n  true\n}\n",
+            "## attest(cpu < 1ms)\nTestX() {\n  true\n}\n",
             "## see attest(1) for details\n",
             "# attestation(cpu < 1ms)\n",
             "# attest\n",
@@ -1418,7 +1418,7 @@ testX() {
         for source in [
             "#attest(cpu < 10ms\ntrue\n",
             "#attest(cpu < 10ms\n\n#)\n",
-            "#attest(cpu < 10ms\ntestX() {\n  true\n}\n",
+            "#attest(cpu < 10ms\nTestX() {\n  true\n}\n",
             "#attest(cpu < 10ms\n",
             "#attest(\n#  cpu < 10ms,\n",
         ] {
@@ -1430,7 +1430,7 @@ testX() {
         assert!(scan("#attest(\n  cpu > 0ms,\n)\n").is_err());
         // Text after the `)` is not the shell's, and not the block's either.
         assert_eq!(
-            scan("#attest(cpu < 10ms) testX() {\n}\n").unwrap_err().line,
+            scan("#attest(cpu < 10ms) TestX() {\n}\n").unwrap_err().line,
             1
         );
         assert_eq!(scan("#attest(\n# cpu < 10ms) x\n").unwrap_err().line, 2);
@@ -1445,7 +1445,7 @@ testX() {
 
     #[test]
     fn several_blocks_in_one_file() {
-        let blocks = scan("#attest(cpu < 10ms)\ntestA() {\n  true\n}\n\n# attest(pids < 2)\ntestB() {\n  true\n}\n").unwrap();
+        let blocks = scan("#attest(cpu < 10ms)\nTestA() {\n  true\n}\n\n# attest(pids < 2)\nTestB() {\n  true\n}\n").unwrap();
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].first_line, 1);
         assert_eq!(blocks[1].first_line, 6);
