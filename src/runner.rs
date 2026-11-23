@@ -1238,6 +1238,19 @@ fn save_test_context(result: &TestResult, save_dir: &Path, submounts: &[overlay:
         );
         return;
     };
+    // The copy below merges into whatever is already at `dst`, so an earlier
+    // run saved into the same DIR would leave its files mixed in with this
+    // one's: a file the test no longer writes would still be there, read as
+    // part of this run's delta. Clear it first — but only when it is one of
+    // ours, since DIR is the user's choice and `--save-context .` puts a test
+    // named `tests` on top of their `./tests`.
+    if let Err(e) = remove_saved_context(&dst) {
+        warn!(
+            "failed to clear the context an earlier run saved for {}: {e}",
+            result.name
+        );
+        return;
+    }
     // Created up front rather than as a side effect of the first copy: a test
     // that wrote nothing has no delta to copy at all, and the logs below
     // still have to land somewhere.
@@ -1278,6 +1291,19 @@ fn save_test_context(result: &TestResult, save_dir: &Path, submounts: &[overlay:
             let _ = std::io::copy(&mut from, &mut out);
         }
     }
+}
+
+/// Remove `dst` when it is a context an earlier `--save-context` run left
+/// there: a real directory (not a symlink to one) holding a regular
+/// `xtrace.log`, which every saved context has, since the runner creates the
+/// log for each test before it starts. Anything else at that name is left
+/// alone — the save then merges into it, as it always has.
+fn remove_saved_context(dst: &Path) -> std::io::Result<()> {
+    let log_is_file = std::fs::symlink_metadata(dst.join("xtrace.log")).is_ok_and(|m| m.is_file());
+    if overlay::is_real_dir(dst) && log_is_file {
+        std::fs::remove_dir_all(dst)?;
+    }
+    Ok(())
 }
 
 /// The clean per-test working directory inside a context dir.
@@ -2743,6 +2769,73 @@ EOF
             "execve(\"/bin/ls\")\n"
         );
         assert!(saved.join("xtrace.log").exists());
+    }
+
+    #[test]
+    fn save_context_replaces_what_an_earlier_run_saved_for_the_test() {
+        // `attest . --save-context ./results`, run again after a change: the
+        // second save must not merge into the first, or a file the test no
+        // longer writes is still in its saved delta, indistinguishable from
+        // one it just wrote.
+        let save = TempDir::new().unwrap();
+        let saved = save.path().join("test_rerun");
+        fs::create_dir_all(saved.join("tmp")).unwrap();
+        fs::write(saved.join("tmp/stale"), "from the earlier run").unwrap();
+        fs::write(saved.join("xtrace.log"), "+1: old\n").unwrap();
+
+        let contexts = TempDir::new().unwrap();
+        let ctx = contexts.path().join("test_rerun");
+        fs::create_dir_all(cwd_dir(&ctx)).unwrap();
+        fs::write(cwd_dir(&ctx).join("fresh"), "this run").unwrap();
+        fs::write(ctx.join("xtrace.log"), "+1: new\n").unwrap();
+
+        save_test_context(&result_in(ctx, "test_rerun"), save.path(), &[]);
+
+        assert!(
+            !saved.join("tmp/stale").exists(),
+            "the earlier run's delta survived"
+        );
+        assert_eq!(
+            fs::read_to_string(saved.join("cwd/fresh")).unwrap(),
+            "this run"
+        );
+        assert_eq!(
+            fs::read_to_string(saved.join("xtrace.log")).unwrap(),
+            "+1: new\n"
+        );
+    }
+
+    #[test]
+    fn save_context_leaves_a_directory_it_did_not_save_alone() {
+        // DIR is the user's: `--save-context .` lands a test named `tests` on
+        // `./tests`. Only a directory that looks like a saved context (it holds
+        // an `xtrace.log`) is cleared; anything else is merged into, untouched.
+        let save = TempDir::new().unwrap();
+        let theirs = save.path().join("tests");
+        fs::create_dir_all(&theirs).unwrap();
+        fs::write(theirs.join("keep.sh"), "precious").unwrap();
+
+        let contexts = TempDir::new().unwrap();
+        let ctx = contexts.path().join("tests");
+        fs::create_dir_all(&ctx).unwrap();
+        fs::write(ctx.join("xtrace.log"), "+1: tests\n").unwrap();
+
+        save_test_context(&result_in(ctx, "tests"), save.path(), &[]);
+
+        assert_eq!(
+            fs::read_to_string(theirs.join("keep.sh")).unwrap(),
+            "precious"
+        );
+        assert!(theirs.join("xtrace.log").exists());
+
+        // Nor is a saved context reached through a symlink: the link is not
+        // the earlier run's directory, and what it points at is not ours.
+        let elsewhere = TempDir::new().unwrap();
+        fs::write(elsewhere.path().join("xtrace.log"), "not ours").unwrap();
+        let link = save.path().join("test_linked");
+        std::os::unix::fs::symlink(elsewhere.path(), &link).unwrap();
+        assert!(remove_saved_context(&link).is_ok());
+        assert!(elsewhere.path().join("xtrace.log").exists());
     }
 
     #[test]

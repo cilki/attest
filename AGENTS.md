@@ -622,7 +622,11 @@ left alone with a warning).
   `/tmp/x` appears at `DIR/<test>/tmp/x`) plus the test's working directory at
   `DIR/<test>/cwd/` (it is live-bound, not part of any overlay),
   `stdout.log`/`xtrace.log` to `DIR/<test>/`, and any `--strace` logs at
-  `DIR/<test>/strace/CMD.log` for debugging
+  `DIR/<test>/strace/CMD.log` for debugging. An earlier run's `DIR/<test>` is
+  removed first (`remove_saved_context`) so the copy does not merge into it —
+  but only when it is a real directory holding a regular `xtrace.log`, since
+  DIR is the user's and `--save-context .` would otherwise put a test named
+  `tests` on top of `./tests`
 - `--repeat N` — run each test N times (default: 1); combine with `--fuzz` to
   shake out flaky tests
 - `--fuzz [VALUE]` — randomly pause and resume each test's descendant processes

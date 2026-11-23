@@ -896,6 +896,11 @@ working directory under `cwd/` (so a scratch file written to `$PWD` shows up at
 out by absolute path (a write to `/tmp/x` shows up at
 `results/<test>/tmp/x`).
 
+Saving into the same directory again replaces each test's earlier copy rather
+than adding to it, so a file the test no longer writes does not linger in its
+delta. Only a directory holding an `xtrace.log` counts as an earlier copy:
+anything else that happens to have a test's name is left in place.
+
 Saved files keep their permissions, minus the set-user-ID, set-group-ID and
 sticky bits: those files are whatever the test chose to write, and the copy is
 owned by whoever ran attest (root, when it runs under `sudo` so that overlays
