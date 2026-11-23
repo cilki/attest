@@ -1007,27 +1007,26 @@ fn spawn_test<'a>(
     }
 
     let start = Instant::now();
-    let spawning = spawn
-        .start()
-        .map_err(|e| anyhow!("spawn failed for {display_name}: {e}"))?;
-    let (child, listener) = spawning.wait_exec().map_err(|e| {
-        // The script rides in the argument vector, and Linux caps how long a
-        // single argument may be — 32 pages classically, a slice of the stack
-        // limit on newer kernels, so half a megabyte of shell either way. Only
-        // a file with more function definitions in it than that can hit this,
-        // and `E2BIG` on its own names neither the argument nor its size.
-        let note = if e.raw_os_error() == Some(libc::E2BIG) {
-            format!(
+    let (child, listener) = spawn.start().map_err(|e| {
+        let note = match e.raw_os_error() {
+            // The script rides in the argument vector, and Linux caps how
+            // long a single argument may be — 32 pages classically, a slice
+            // of the stack limit on newer kernels, so half a megabyte of
+            // shell either way. Only a file with more function definitions
+            // in it than that can hit this, and `E2BIG` on its own names
+            // neither the argument nor its size.
+            Some(libc::E2BIG) => format!(
                 " (the script carrying this file's function definitions is {} bytes, \
                      more than one argument can hold)",
                 runner_content.len()
-            )
-        } else {
-            // The probe passed, so this is a per-test setup failure: the
-            // errno is all that survives the hook, and it belongs to one
-            // of the mounts the ephemeral root is built from — or to the
-            // seccomp filter installed after them.
-            " (while building the test's ephemeral root)".to_string()
+            ),
+            // The child's own errno. The probe passed, so this is a
+            // per-test setup failure: the errno is all that survives the
+            // hook, and it belongs to one of the mounts the ephemeral root
+            // is built from — or to the seccomp filter installed after them.
+            Some(_) => " (while building the test's ephemeral root)".to_string(),
+            // The parent's half, which names its own step.
+            None => String::new(),
         };
         anyhow!("spawn failed for {display_name}: {e}{note}")
     })?;

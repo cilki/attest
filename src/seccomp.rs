@@ -437,7 +437,7 @@ pub fn probe() -> Result<(), String> {
 
 /// Spawn `program` with `argv` under a filter watching `watched`, through
 /// the same [`Spawn::watch`](crate::spawn::Spawn::watch) and
-/// [`wait_exec`](crate::spawn::Spawning::wait_exec) path the runner takes,
+/// [`Spawn::start`](crate::spawn::Spawn::start) path the runner takes,
 /// and answer its notifications until it exits. Its output is discarded.
 fn run_watched(
     watched: &[Sysno],
@@ -456,13 +456,12 @@ fn run_watched(
     spawn
         .watch(filter)
         .map_err(|e| format!("mapping the handoff page: {e}"))?;
-    // A failed install is the hook's errno, which the exec-status pipe
-    // carries to `wait_exec` like any other.
-    let (mut child, listener) = spawn
-        .start()
-        .map_err(|e| format!("starting {program}: {e}"))?
-        .wait_exec()
-        .map_err(|e| format!("seccomp(2) or the exec under the filter: {e}"))?;
+    // A failed install is a bare errno from the child, like a failed exec;
+    // a failure of the parent's half names its own step.
+    let (mut child, listener) = spawn.start().map_err(|e| match e.raw_os_error() {
+        Some(_) => format!("seccomp(2) or the exec under the filter: {e}"),
+        None => format!("starting {program}: {e}"),
+    })?;
     let Some(mut listener) = listener else {
         let _ = child.wait();
         return Err("the child installed no listener".to_string());

@@ -246,7 +246,7 @@
   (`Filter::watching` sorts and dedups it), handed to `Spawn::watch`, which
   installs it after every hook and takes the listener out of the child
   before the exec; the spawn then waits for the exec with that listener in
-  hand (`Spawning::wait_exec`), since the exec may itself be the first
+  hand (`Spawn::start`), since the exec may itself be the first
   syscall notified. Supports `--timeout`,
   `--bail`, `--override`, `--bin-dir`, and `--strace`. With `--save-context`,
   copies each test's filesystem delta plus logs to the output dir. Display
@@ -369,17 +369,21 @@
   marks it dead, which is nobody left behind the filter. `probe` rehearses
   the whole round trip once per run through the runner's own spawn path
   (`run_watched`: `/bin/sh -c :` under a filter watching `execve`, the
-  listener taken with `pidfd_getfd` and answered by `wait_exec`), and where
+  listener taken with `pidfd_getfd` and answered by `Spawn::start`), and where
   it fails the run installs nothing and the condition is `Unmeasured`.
 - `src/spawn.rs` - Fork-and-exec with the parent kept awake. `std::process::
   Command` blocks in `spawn` until the child's `execve` returns — and under
   a filter watching `execve` that return waits on the parent answering the
   notification, so each would wait on the other. `Spawn` does what `std`
   does (hooks in order in the child, a close-on-exec pipe carrying a failing
-  hook's errno, EOF meaning the exec went through) but `Spawning::wait_exec`
+  hook's errno, EOF meaning the exec went through) but `Spawn::start`
   polls that pipe together with the child's seccomp listener, if `Spawn::
   watch` gave it one, answering it until the outcome arrives and then
-  returning it beside the `Child`. The child gets the parent's
+  returning it beside the `Child` — one call, fork to exec. An errno the
+  child reported comes back bare; a failure of the parent's own half
+  (`in_parent`: the pipe, the fork, the handoff, the wait) names its step
+  and carries no raw errno, which is how the runner knows only the former
+  belongs to the test's setup. The child gets the parent's
   environment plus whatever `Spawn::env` set, through `execve`; the runner
   uses that to set `SHELL` to the test's shell when attest's own environment
   has none, since bash otherwise fills it in from the passwd database at
